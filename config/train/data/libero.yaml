@@ -1,0 +1,5 @@
+dataset:
+  name: libero
+  hdf5_dir: ${oc.env:STABLEWM_HOME,~/.stable-wm}/libero
+  max_action_tokens: 35
+  img_size: 224

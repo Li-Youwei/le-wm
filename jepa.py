@@ -10,25 +10,25 @@ def detach_clone(v):
 
 class JEPA(nn.Module):
 
+    # MODIFIED: removed action_encoder (FAST tokens are pre-computed, not encoded here)
     def __init__(
         self,
         encoder,
         predictor,
-        action_encoder,
         projector=None,
         pred_proj=None,
     ):
         super().__init__()
 
         self.encoder = encoder
-        self.predictor = predictor
-        self.action_encoder = action_encoder
+        self.predictor = predictor  # UnifiedPredictor instance
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
 
+    # MODIFIED: removed action encoding (FAST tokens are pre-computed by preprocessing)
     def encode(self, info):
-        """Encode observations and actions into embeddings.
-        info: dict with pixels and action keys
+        """Encode observations into visual embeddings.
+        info: dict with pixels key
         """
 
         pixels = info['pixels'].float()
@@ -39,25 +39,45 @@ class JEPA(nn.Module):
         emb = self.projector(pixels_emb)
         info["emb"] = rearrange(emb, "(b t) d -> b t d", b=b)
 
-        if "action" in info:
-            info["act_emb"] = self.action_encoder(info["action"])
-
         return info
 
-    def predict(self, emb, act_emb):
-        """Predict next state embedding
-        emb: (B, T, D)
-        act_emb: (B, T, A_emb)
+    # MODIFIED: new signature for UnifiedPredictor
+    def predict(self, z_t, action_tokens, action_lengths):
+        """Run unified predictor: action token logits + state prediction.
+
+        Args:
+            z_t: (B, D) single-frame visual latent (after projector).
+            action_tokens: (B, max_action_tokens) padded FAST token ids.
+            action_lengths: (B,) real token count per sample.
+
+        Returns:
+            action_logits: (B, 1+max_action_tokens, 1026)
+            state_pred: (B, D) projected state prediction.
         """
-        preds = self.predictor(emb, act_emb)
-        preds = self.pred_proj(rearrange(preds, "b t d -> (b t) d"))
-        preds = rearrange(preds, "(b t) d -> b t d", b=emb.size(0))
-        return preds
+        action_logits, state_raw = self.predictor(z_t, action_tokens, action_lengths)
+        state_pred = self.pred_proj(state_raw)  # MLP: (B, D) -> (B, D)
+        return action_logits, state_pred
+
+    # NEW: autoregressive action generation for inference
+    def predict_actions(self, z_t, max_len=35, temperature=0.0):
+        """Generate FAST action tokens autoregressively.
+
+        Args:
+            z_t: (B, D) visual latent (after projector).
+            max_len: max tokens to generate.
+            temperature: 0.0=greedy, >0=sampling.
+
+        Returns:
+            tokens: (B, gen_len) generated token ids.
+            lengths: (B,) real token count (EOS exclusive).
+        """
+        return self.predictor.generate(z_t, max_len, temperature)
 
     ####################
     ## Inference only ##
     ####################
 
+    # DEPRECATED: was used for CEM planning, no longer needed with direct action generation
     def rollout(self, info, action_sequence, history_size: int = 3):
         """Rollout the model given an initial info dict and action sequence.
         pixels: (B, S, T, C, H, W)
@@ -109,6 +129,7 @@ class JEPA(nn.Module):
 
         return info
 
+    # DEPRECATED: was used for CEM planning, no longer needed with direct action generation
     def criterion(self, info_dict: dict):
         """Compute the cost between predicted embeddings and goal embeddings."""
         pred_emb = info_dict["predicted_emb"]  # (B,S, T-1, dim)
@@ -125,6 +146,7 @@ class JEPA(nn.Module):
 
         return cost
 
+    # DEPRECATED: was used for CEM planning, no longer needed with direct action generation
     def get_cost(self, info_dict: dict, action_candidates: torch.Tensor):
         """ Compute the cost of action candidates given an info dict with goal and initial state."""
 
