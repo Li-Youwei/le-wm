@@ -1,0 +1,28 @@
+# =============================================================================
+# LeWM + Unified Action Predictor — Dependencies
+# =============================================================================
+# Python 3.10
+#
+# Install ALL:  pip install -r requirements.txt
+# Or with uv:   uv pip install -r requirements.txt
+# =============================================================================
+
+# --- Core (module.py, jepa.py, libero_dataset.py, smoke_test.py) ---
+torch>=2.1
+einops>=0.7
+numpy>=1.24
+h5py>=3.8
+transformers>=4.40          # ViT backbone (ViTModel/ViTConfig) + FAST tokenizer
+
+# --- Preprocessing (preprocess_libero.py) ---
+scipy>=1.10                 # DCT for FAST tokenization
+tokenizers>=0.15            # BPE tokenizer training
+
+# --- Training (train.py) ---
+# stable-worldmodel[train,env] pulls in:
+#   stable-pretraining (spt): training orchestration, ViT backbone, DataModule
+#   lightning (PyTorch Lightning): Trainer
+#   hydra-core + omegaconf: config management
+#   wandb: experiment logging
+#   torchvision, timm, etc.
+stable-worldmodel[train,env]
