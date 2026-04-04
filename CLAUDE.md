@@ -199,7 +199,7 @@ Standard causal: position i attends to positions 0..i **(including itself)**. No
 - `UnifiedPredictor` class: new predictor using `Block` (not `ConditionalBlock`)
   - `action_embedding = nn.Embedding(1027, embed_dim)` (1024 FAST + BOS + EOS + PAD)
   - `type_embedding = nn.Embedding(3, embed_dim)` (0=visual, 1=action, 2=state_query)
-  - `pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, embed_dim))` — learnable positional encoding, where `max_seq_len = 1 + 1 + max_action_tokens + 1` (z_t + BOS + tokens + STATE_QUERY). Set `max_action_tokens=35` as safe upper bound (FAST typically produces ~20-30 tokens for LIBERO). Truncate to actual sequence length per sample: `x = x + pos_embedding[:, :L]` (same pattern as original `ARPredictor`)
+  - `pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, embed_dim))` — learnable positional encoding, where `max_seq_len = 1 + 1 + max_action_tokens + 1` (z_t + BOS + tokens + STATE_QUERY). Set `max_action_tokens=40` as safe upper bound (FAST produces up to ~38 tokens for LIBERO). Truncate to actual sequence length per sample: `x = x + pos_embedding[:, :L]` (same pattern as original `ARPredictor`)
   - `state_query = nn.Parameter(torch.randn(1, 1, embed_dim))` learnable
   - `action_head = nn.Linear(embed_dim, 1026)` classification over vocab (0..1025, PAD excluded from targets)
   - `forward(z_t, action_tokens, action_lengths)` builds unified sequence, applies causal+padding mask
@@ -272,8 +272,8 @@ Standard causal: position i attends to positions 0..i **(including itself)**. No
 | FAST vocab size | 1024 | FAST paper default |
 | FAST rounding scale γ | 10 | FAST paper default |
 | BPE vocab size | 1024 | FAST paper default |
-| max_action_tokens | 35 | Safe upper bound for FAST on LIBERO (~20-30 typical) |
-| max_seq_len | 38 | 1(z_t) + 1(BOS) + 35(tokens) + 1(STATE_QUERY) |
+| max_action_tokens | 40 | Safe upper bound for FAST on LIBERO (up to ~38 observed) |
+| max_seq_len | 43 | 1(z_t) + 1(BOS) + 40(tokens) + 1(STATE_QUERY) |
 | Embed dim | 192 | LeWM default (ViT-Tiny) |
 | Predictor depth | 6 layers | LeWM default |
 | Predictor heads | 16 | LeWM default |

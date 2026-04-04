@@ -74,7 +74,7 @@ def run(cfg):
 
         dataset = LiberoDataset(
             hdf5_dir=cfg.data.dataset.hdf5_dir,
-            max_action_tokens=cfg.data.dataset.get("max_action_tokens", 35),
+            max_action_tokens=cfg.data.dataset.get("max_action_tokens", 40),
             img_size=cfg.data.dataset.get("img_size", cfg.img_size),
         )
 
@@ -127,7 +127,7 @@ def run(cfg):
     # MODIFIED: UnifiedPredictor replaces ARPredictor + Embedder
     predictor = UnifiedPredictor(
         embed_dim=embed_dim,
-        max_action_tokens=cfg.wm.get("max_action_tokens", 35),
+        max_action_tokens=cfg.wm.get("max_action_tokens", 40),
         **cfg.predictor,
     )
 

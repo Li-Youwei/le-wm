@@ -317,7 +317,7 @@ class UnifiedPredictor(nn.Module):
         heads: int = 16,
         dim_head: int = 64,
         mlp_dim: int = 2048,
-        max_action_tokens: int = 35,
+        max_action_tokens: int = 40,
         dropout: float = 0.1,
         emb_dropout: float = 0.0,
     ):
@@ -445,7 +445,7 @@ class UnifiedPredictor(nn.Module):
     def generate(
         self,
         z_t: torch.Tensor,
-        max_len: int = 35,
+        max_len: int = 40,
         temperature: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Autoregressively generate FAST action tokens.

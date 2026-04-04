@@ -53,14 +53,14 @@ class LiberoDataset(Dataset):
 
     Args:
         hdf5_dir: directory containing .hdf5 files.
-        max_action_tokens: pad/truncate FAST tokens to this length. Default 35.
+        max_action_tokens: pad/truncate FAST tokens to this length. Default 40.
         img_size: resize images to this resolution. Default 224.
     """
 
     def __init__(
         self,
         hdf5_dir: str,
-        max_action_tokens: int = 35,
+        max_action_tokens: int = 40,
         img_size: int = 224,
     ):
         self.max_action_tokens = max_action_tokens
