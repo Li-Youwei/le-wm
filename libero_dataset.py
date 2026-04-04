@@ -9,6 +9,7 @@ Expected HDF5 structure (one file per task):
     /continuous_actions:  (N, H, action_dim) float32  [optional, for debug]
 """
 
+import logging
 from pathlib import Path
 
 import h5py
@@ -18,6 +19,8 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 
 from module import PAD_TOKEN_ID
+
+logger = logging.getLogger(__name__)
 
 # ImageNet normalization stats (matches spt.data.dataset_stats.ImageNet / torchvision)
 IMAGENET_MEAN = torch.tensor([0.485, 0.456, 0.406]).view(3, 1, 1)
@@ -104,6 +107,12 @@ class LiberoDataset(Dataset):
         # FAST tokens: variable-length → pad to max_action_tokens
         raw_tokens = f["fast_tokens"][local_idx]  # numpy array, variable length
         raw_tokens = np.array(raw_tokens, dtype=np.int64)
+        if len(raw_tokens) > self.max_action_tokens:
+            logger.warning(
+                "Sample %d (file=%s, local=%d): FAST token length %d exceeds "
+                "max_action_tokens=%d, truncating. Consider increasing max_action_tokens.",
+                idx, fpath.name, local_idx, len(raw_tokens), self.max_action_tokens,
+            )
         token_len = min(len(raw_tokens), self.max_action_tokens)
 
         fast_tokens = np.full(self.max_action_tokens, PAD_TOKEN_ID, dtype=np.int64)

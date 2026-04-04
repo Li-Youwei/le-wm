@@ -505,13 +505,23 @@ class UnifiedPredictor(nn.Module):
             new_emb = self.action_embedding(next_token.unsqueeze(1)) + self.type_embedding.weight[1]
             seq = torch.cat([seq, new_emb], dim=1)
 
-        tokens = torch.stack(generated, dim=1)  # (B, gen_len)
+        raw_tokens = torch.stack(generated, dim=1)  # (B, gen_len)
 
         # Compute lengths: count tokens before first EOS
-        lengths = torch.full((B,), tokens.size(1), dtype=torch.long, device=device)
+        lengths = torch.full((B,), raw_tokens.size(1), dtype=torch.long, device=device)
         for i in range(B):
-            eos_pos = (tokens[i] == EOS_TOKEN_ID).nonzero(as_tuple=True)[0]
+            eos_pos = (raw_tokens[i] == EOS_TOKEN_ID).nonzero(as_tuple=True)[0]
             if len(eos_pos) > 0:
                 lengths[i] = eos_pos[0].item()
+
+        # Strip EOS/PAD: return only real FAST action tokens (vocab 0..1023).
+        # Pad output to max generated length so the tensor is rectangular.
+        max_len_actual = lengths.max().item() if lengths.numel() > 0 else 0
+        max_len_actual = max(max_len_actual, 1)  # at least 1 to avoid empty tensor
+        tokens = torch.full((B, max_len_actual), PAD_TOKEN_ID, dtype=torch.long, device=device)
+        for i in range(B):
+            k = lengths[i].item()
+            if k > 0:
+                tokens[i, :k] = raw_tokens[i, :k]
 
         return tokens, lengths

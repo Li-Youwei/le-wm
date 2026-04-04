@@ -7,6 +7,7 @@ import lightning as pl
 import stable_pretraining as spt
 import stable_worldmodel as swm
 import torch
+import torch.nn.functional as F
 from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
@@ -68,13 +69,17 @@ def run(cfg):
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
     is_libero = cfg.data.dataset.get("name", "") == "libero"
 
+    # Single source of truth for max_action_tokens — used by both dataset and model.
+    # Avoids silent shape mismatch if only one side is updated.
+    max_action_tokens = cfg.data.dataset.get("max_action_tokens", 40)
+
     if is_libero:
         # MODIFIED: LIBERO uses standalone dataset with pre-computed FAST tokens
         from libero_dataset import LiberoDataset
 
         dataset = LiberoDataset(
             hdf5_dir=cfg.data.dataset.hdf5_dir,
-            max_action_tokens=cfg.data.dataset.get("max_action_tokens", 40),
+            max_action_tokens=max_action_tokens,
             img_size=cfg.data.dataset.get("img_size", cfg.img_size),
         )
 
@@ -127,7 +132,7 @@ def run(cfg):
     # MODIFIED: UnifiedPredictor replaces ARPredictor + Embedder
     predictor = UnifiedPredictor(
         embed_dim=embed_dim,
-        max_action_tokens=cfg.wm.get("max_action_tokens", 40),
+        max_action_tokens=max_action_tokens,
         **cfg.predictor,
     )
 
