@@ -3,9 +3,6 @@ from torch import nn
 import torch.nn.functional as F
 from einops import rearrange
 
-def modulate(x, shift, scale):
-    """AdaLN-zero modulation"""
-    return x * (1 + scale) + shift
 
 class SIGReg(torch.nn.Module):
     """Sketch Isotropic Gaussian Regularizer (single-GPU!)"""
@@ -34,7 +31,8 @@ class SIGReg(torch.nn.Module):
         err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
         statistic = (err @ self.weights) * proj.size(-2)
         return statistic.mean() # average over projections and time
-    
+
+
 class FeedForward(nn.Module):
     """FeedForward network used in Transformers"""
 
@@ -90,32 +88,6 @@ class Attention(nn.Module):
         return self.to_out(out)
 
 
-class ConditionalBlock(nn.Module):
-    """Transformer block with AdaLN-zero conditioning"""
-
-    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
-        super().__init__()
-
-        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
-        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
-        self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
-        self.adaLN_modulation = nn.Sequential(
-            nn.SiLU(), nn.Linear(dim, 6 * dim, bias=True)
-        )
-
-        nn.init.constant_(self.adaLN_modulation[-1].weight, 0)
-        nn.init.constant_(self.adaLN_modulation[-1].bias, 0)
-
-    def forward(self, x, c):
-        shift_msa, scale_msa, gate_msa, shift_mlp, scale_mlp, gate_mlp = (
-            self.adaLN_modulation(c).chunk(6, dim=-1)
-        )
-        x = x + gate_msa * self.attn(modulate(self.norm1(x), shift_msa, scale_msa))
-        x = x + gate_mlp * self.mlp(modulate(self.norm2(x), shift_mlp, scale_mlp))
-        return x
-
-
 class Block(nn.Module):
     """Standard Transformer block"""
 
@@ -134,7 +106,7 @@ class Block(nn.Module):
 
 
 class Transformer(nn.Module):
-    """Standard Transformer with support for AdaLN-zero blocks"""
+    """Standard Transformer"""
 
     def __init__(
         self,
@@ -158,12 +130,6 @@ class Transformer(nn.Module):
             else nn.Identity()
         )
 
-        self.cond_proj = (
-            nn.Linear(input_dim, hidden_dim)
-            if input_dim != hidden_dim
-            else nn.Identity()
-        )
-
         self.output_proj = (
             nn.Linear(hidden_dim, output_dim)
             if hidden_dim != output_dim
@@ -175,47 +141,17 @@ class Transformer(nn.Module):
                 block_class(hidden_dim, heads, dim_head, mlp_dim, dropout)
             )
 
-    def forward(self, x, c=None):
+    def forward(self, x):
 
         if hasattr(self, "input_proj"):
             x = self.input_proj(x)
 
-        if c is not None and hasattr(self, "cond_proj"):
-            c = self.cond_proj(c)
-
         for block in self.layers:
-            x = block(x) if isinstance(block, Block) else block(x, c)
+            x = block(x)
         x = self.norm(x)
 
         if hasattr(self, "output_proj"):
             x = self.output_proj(x)
-        return x
-
-class Embedder(nn.Module):
-    def __init__(
-        self,
-        input_dim=10,
-        smoothed_dim=10,
-        emb_dim=10,
-        mlp_scale=4,
-    ):
-        super().__init__()
-        self.patch_embed = nn.Conv1d(input_dim, smoothed_dim, kernel_size=1, stride=1)
-        self.embed = nn.Sequential(
-            nn.Linear(smoothed_dim, mlp_scale * emb_dim),
-            nn.SiLU(),
-            nn.Linear(mlp_scale * emb_dim, emb_dim),
-        )
-
-    def forward(self, x):
-        """
-        x: (B, T, D)
-        """
-        x = x.float()
-        x = x.permute(0, 2, 1)
-        x = self.patch_embed(x)
-        x = x.permute(0, 2, 1)
-        x = self.embed(x)
         return x
 
 
@@ -246,53 +182,8 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-class ARPredictor(nn.Module):
-    """Autoregressive predictor for next-step embedding prediction."""
+# --- FAST token vocabulary constants ---
 
-    def __init__(
-        self,
-        *,
-        num_frames,
-        depth,
-        heads,
-        mlp_dim,
-        input_dim,
-        hidden_dim,
-        output_dim=None,
-        dim_head=64,
-        dropout=0.0,
-        emb_dropout=0.0,
-    ):
-        super().__init__()
-        self.pos_embedding = nn.Parameter(torch.randn(1, num_frames, input_dim))
-        self.dropout = nn.Dropout(emb_dropout)
-        self.transformer = Transformer(
-            input_dim,
-            hidden_dim,
-            output_dim or input_dim,
-            depth,
-            heads,
-            dim_head,
-            mlp_dim,
-            dropout,
-            block_class=ConditionalBlock,
-        )
-
-    def forward(self, x, c):
-        """
-        x: (B, T, d)
-        c: (B, T, act_dim)
-        """
-        T = x.size(1)
-        x = x + self.pos_embedding[:, :T]
-        x = self.dropout(x)
-        x = self.transformer(x, c)
-        return x
-
-
-# --- Unified Predictor for FAST action tokens + world model ---
-
-# FAST token vocabulary
 FAST_VOCAB_SIZE = 1024
 BOS_TOKEN_ID = 1024
 EOS_TOKEN_ID = 1025
@@ -301,12 +192,20 @@ TOTAL_VOCAB_SIZE = FAST_VOCAB_SIZE + 3  # 1027: 0..1023 FAST + BOS + EOS + PAD
 ACTION_HEAD_SIZE = FAST_VOCAB_SIZE + 2  # 1026: predict 0..1025, PAD excluded
 
 
-class UnifiedPredictor(nn.Module):
-    """Unified autoregressive predictor for action token generation + state prediction.
+class ARPredictor(nn.Module):
+    """Autoregressive predictor for FAST action token generation + state prediction.
 
-    Processes a sequence [z_t, BOS, T_1...T_k, PAD..., STATE_QUERY] with causal
-    attention and padding mask. Produces action token logits at BOS/action positions
-    and a state embedding prediction at the STATE_QUERY position.
+    Modified from original LeWM ARPredictor: previously used ConditionalBlock
+    (AdaLN-zero) with external action conditioning via forward(x, c). Now uses
+    a unified sequence [z_t, BOS, T_1...T_k, PAD..., STATE_QUERY] with standard
+    Block (causal self-attention + padding mask).
+
+    Why Block instead of ConditionalBlock: autoregressive generation requires
+    action tokens to be IN the attention sequence (so each token attends to
+    previous tokens). ConditionalBlock's AdaLN-zero modulates LayerNorm from
+    outside — it cannot support sequential generation of the conditioning signal
+    itself. This change is a necessary consequence of the requirement to generate
+    action tokens autoregressively.
     """
 
     def __init__(
@@ -331,7 +230,7 @@ class UnifiedPredictor(nn.Module):
         self.action_embedding = nn.Embedding(TOTAL_VOCAB_SIZE, embed_dim)  # 1027 entries
         self.type_embedding = nn.Embedding(3, embed_dim)  # 0=visual, 1=action, 2=state_query
 
-        # Positional encoding (learnable, same pattern as ARPredictor)
+        # Positional encoding (learnable, same pattern as original ARPredictor)
         self.pos_embedding = nn.Parameter(torch.randn(1, self.max_seq_len, embed_dim))
 
         # Learnable state query token
@@ -340,7 +239,7 @@ class UnifiedPredictor(nn.Module):
         # Action classification head: predict vocab 0..1025 (PAD excluded from targets)
         self.action_head = nn.Linear(embed_dim, ACTION_HEAD_SIZE)
 
-        # Transformer blocks (standard Block, not ConditionalBlock)
+        # Transformer blocks (Block with causal+padding attention mask)
         self.blocks = nn.ModuleList([
             Block(embed_dim, heads, dim_head, mlp_dim, dropout)
             for _ in range(depth)
@@ -385,7 +284,8 @@ class UnifiedPredictor(nn.Module):
         action_tokens: torch.Tensor,
         action_lengths: torch.Tensor,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """
+        """Training forward: teacher forcing with unified sequence.
+
         Args:
             z_t: (B, D) visual latent from encoder (continuous, not a discrete token).
             action_tokens: (B, max_action_tokens) FAST token ids padded with PAD_TOKEN_ID.
@@ -440,7 +340,6 @@ class UnifiedPredictor(nn.Module):
 
         return action_logits, state_pred
 
-    # NEW: autoregressive generation for inference (no STATE_QUERY, no padding)
     @torch.no_grad()
     def generate(
         self,
@@ -459,7 +358,7 @@ class UnifiedPredictor(nn.Module):
             temperature: 0.0 for greedy (argmax), >0 for sampling.
 
         Returns:
-            tokens: (B, gen_len) generated token ids (may include EOS, followed by PAD).
+            tokens: (B, gen_len) clean FAST action token ids (EOS/PAD stripped).
             lengths: (B,) number of real tokens per sample (EOS exclusive).
         """
         B = z_t.size(0)

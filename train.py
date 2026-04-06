@@ -12,7 +12,7 @@ from lightning.pytorch.loggers import WandbLogger
 from omegaconf import OmegaConf, open_dict
 
 from jepa import JEPA
-from module import ARPredictor, Embedder, MLP, SIGReg, UnifiedPredictor, ACTION_HEAD_SIZE  # MODIFIED
+from module import ARPredictor, MLP, SIGReg, ACTION_HEAD_SIZE
 from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
 
 
@@ -129,8 +129,8 @@ def run(cfg):
     hidden_dim = encoder.config.hidden_size
     embed_dim = cfg.wm.get("embed_dim", hidden_dim)
 
-    # MODIFIED: UnifiedPredictor replaces ARPredictor + Embedder
-    predictor = UnifiedPredictor(
+    # MODIFIED: ARPredictor now handles unified sequence (action tokens + state prediction)
+    predictor = ARPredictor(
         embed_dim=embed_dim,
         max_action_tokens=max_action_tokens,
         **cfg.predictor,

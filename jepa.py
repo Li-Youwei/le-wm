@@ -21,7 +21,7 @@ class JEPA(nn.Module):
         super().__init__()
 
         self.encoder = encoder
-        self.predictor = predictor  # UnifiedPredictor instance
+        self.predictor = predictor  # Modified ARPredictor instance
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
 
@@ -41,7 +41,7 @@ class JEPA(nn.Module):
 
         return info
 
-    # MODIFIED: new signature for UnifiedPredictor
+    # MODIFIED: new signature for unified sequence prediction
     def predict(self, z_t, action_tokens, action_lengths):
         """Run unified predictor: action token logits + state prediction.
 

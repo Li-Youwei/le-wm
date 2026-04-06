@@ -1,7 +1,7 @@
 """End-to-end smoke test for the unified action prediction + world model pipeline.
 
 Validates the full pipeline with real preprocessed LIBERO data:
-  LiberoDataset → DataLoader → JEPA(ViT encoder + UnifiedPredictor) → losses → backward
+  LiberoDataset → DataLoader → JEPA(ViT encoder + ARPredictor) → losses → backward
 
 Usage:
     python smoke_test.py --data data/libero_processed/test.h5
@@ -21,10 +21,10 @@ from jepa import JEPA
 from libero_dataset import LiberoDataset
 from module import (
     ACTION_HEAD_SIZE,
+    ARPredictor,
     EOS_TOKEN_ID,
     MLP,
     SIGReg,
-    UnifiedPredictor,
 )
 
 
@@ -45,8 +45,8 @@ def create_model():
     hidden_dim = encoder.config.hidden_size  # 192
     embed_dim = 192
 
-    # UnifiedPredictor (matches cfg.predictor from lewm.yaml)
-    predictor = UnifiedPredictor(
+    # ARPredictor (matches cfg.predictor from lewm.yaml)
+    predictor = ARPredictor(
         embed_dim=embed_dim,
         depth=6,
         heads=16,
