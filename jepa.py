@@ -1,16 +1,12 @@
-"""JEPA Implementation"""
+"""JEPA Implementation — modified for unified action prediction + world model."""
 
 import torch
-import torch.nn.functional as F
 from einops import rearrange
 from torch import nn
 
-def detach_clone(v):
-    return v.detach().clone() if torch.is_tensor(v) else v
 
 class JEPA(nn.Module):
 
-    # MODIFIED: removed action_encoder (FAST tokens are pre-computed, not encoded here)
     def __init__(
         self,
         encoder,
@@ -25,28 +21,24 @@ class JEPA(nn.Module):
         self.projector = projector or nn.Identity()
         self.pred_proj = pred_proj or nn.Identity()
 
-    # MODIFIED: removed action encoding (FAST tokens are pre-computed by preprocessing)
     def encode(self, info):
         """Encode observations into visual embeddings.
-        info: dict with pixels key
+        info: dict with pixels key, shape (B, T, C, H, W)
         """
-
         pixels = info['pixels'].float()
         b = pixels.size(0)
-        pixels = rearrange(pixels, "b t ... -> (b t) ...") # flatten for encoding
+        pixels = rearrange(pixels, "b t ... -> (b t) ...")
         output = self.encoder(pixels, interpolate_pos_encoding=True)
-        pixels_emb = output.last_hidden_state[:, 0]  # cls token
+        pixels_emb = output.last_hidden_state[:, 0]  # CLS token
         emb = self.projector(pixels_emb)
         info["emb"] = rearrange(emb, "(b t) d -> b t d", b=b)
-
         return info
 
-    # MODIFIED: new signature for unified sequence prediction
     def predict(self, z_t, action_tokens, action_lengths):
-        """Run unified predictor: action token logits + state prediction.
+        """Training: run predictor with teacher forcing.
 
         Args:
-            z_t: (B, D) single-frame visual latent (after projector).
+            z_t: (B, D) visual latent from encoder.
             action_tokens: (B, max_action_tokens) padded FAST token ids.
             action_lengths: (B,) real token count per sample.
 
@@ -55,26 +47,24 @@ class JEPA(nn.Module):
             state_pred: (B, D) projected state prediction.
         """
         action_logits, state_raw = self.predictor(z_t, action_tokens, action_lengths)
-        state_pred = self.pred_proj(state_raw)  # MLP: (B, D) -> (B, D)
+        state_pred = self.pred_proj(state_raw)
         return action_logits, state_pred
 
-    # NEW: autoregressive action generation for inference
     def predict_actions(self, z_t, max_len=40, temperature=0.0):
-        """Generate FAST action tokens autoregressively.
+        """Inference: autoregressively generate FAST action tokens.
 
         Args:
-            z_t: (B, D) visual latent (after projector).
+            z_t: (B, D) visual latent from encoder.
             max_len: max tokens to generate.
             temperature: 0.0=greedy, >0=sampling.
 
         Returns:
-            tokens: (B, gen_len) generated token ids.
-            lengths: (B,) real token count (EOS exclusive).
+            tokens: (B, gen_len) clean FAST token ids.
+            lengths: (B,) real token count per sample.
         """
         return self.predictor.generate(z_t, max_len, temperature)
 
     # NOTE: rollout(), criterion(), get_cost() removed.
-    # They were CEM planning methods that called self.action_encoder (now deleted)
-    # and the old predict(emb, act_emb) signature (now changed).
-    # With direct autoregressive action generation, CEM rollout is no longer needed.
-    # See predict_actions() above for the new inference path.
+    # They were CEM planning methods that referenced the deleted action_encoder
+    # and old predict(emb, act_emb) signature. With autoregressive action
+    # generation, CEM rollout is no longer needed.

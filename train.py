@@ -38,7 +38,7 @@ def lejepa_forward(self, batch, stage, cfg):
 
     # 3. Build CE targets (shifted by 1: position j predicts token j+1)
     B = z_t.size(0)
-    num_action_positions = action_logits.size(1)  # 1 + max_action_tokens = 36
+    num_action_positions = action_logits.size(1)  # 1 (BOS) + max_action_tokens
     targets = torch.full((B, num_action_positions), -100, dtype=torch.long, device=z_t.device)
     for i in range(B):
         k = fast_lengths[i].item()
