@@ -13,6 +13,7 @@ einops>=0.7
 numpy>=1.24
 h5py>=3.8
 transformers>=4.40          # ViT backbone (ViTModel/ViTConfig) + FAST tokenizer
+sentencepiece>=0.1.99       # required by transformers tokenizer backend
 
 # --- Preprocessing (preprocess_libero.py) ---
 scipy>=1.10                 # DCT for FAST tokenization
