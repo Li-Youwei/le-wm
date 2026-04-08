@@ -14,11 +14,19 @@ Usage:
 
 from __future__ import annotations
 
+import logging
 from pathlib import Path
 
 import numpy as np
 import torch
+from scipy.fft import idct
 from transformers import AutoProcessor
+
+logger = logging.getLogger(__name__)
+
+# Rate-limit decode warnings: track count to avoid spamming logs
+_decode_warn_count = 0
+_DECODE_WARN_LIMIT = 20
 
 
 def load_fast_processor(tokenizer_path: str | Path) -> AutoProcessor:
@@ -45,10 +53,17 @@ def fast_decode(
 ) -> np.ndarray:
     """Decode FAST token IDs back to continuous action chunks.
 
-    Pipeline: token IDs → BPE decode → inverse rounding → inverse DCT → actions.
+    Pipeline: token IDs → BPE decode → ord() → pad/truncate to H*D → reshape
+    → inverse quantize → inverse DCT → continuous actions.
+
+    Handles the common case where BPE decode produces slightly more or fewer
+    values than time_horizon * action_dim by padding with zeros or truncating.
+    The processor's built-in decode falls back to all-zeros on any mismatch,
+    which makes the robot freeze. This function instead preserves as much of
+    the decoded signal as possible.
 
     Args:
-        token_ids: (B, max_len) FAST token IDs from generate() (PAD-stripped).
+        token_ids: (B, max_len) FAST token IDs from generate().
         lengths: (B,) real token count per sample.
         processor: FAST processor from load_fast_processor().
         time_horizon: action chunk length in raw steps (H=10 for LIBERO).
@@ -56,21 +71,56 @@ def fast_decode(
 
     Returns:
         actions: (B, time_horizon, action_dim) continuous actions in normalized
-            space (approx [-1, 1]). Apply inverse normalization using the
-            action_low/action_high stats from preprocessing to get raw actions.
+            space (approx [-1, 1]).
     """
+    global _decode_warn_count
+
     B = token_ids.size(0)
-    token_lists = []
+    expected_len = time_horizon * action_dim
+    scale = getattr(processor, "scale", 10)
+    min_token = getattr(processor, "min_token", 0)
+    bpe_tokenizer = getattr(processor, "bpe_tokenizer", None)
+
+    decoded_actions = []
     for i in range(B):
         k = lengths[i].item()
         tokens_i = token_ids[i, :k].cpu().tolist()
-        token_lists.append(tokens_i)
 
-    return processor.decode(
-        token_lists,
-        time_horizon=time_horizon,
-        action_dim=action_dim,
-    )
+        try:
+            # BPE decode → string of chars → ord() → quantized DCT coefficients
+            decoded_str = bpe_tokenizer.decode(tokens_i)
+            raw_values = np.array(list(map(ord, decoded_str))) + min_token
+            actual_len = len(raw_values)
+
+            # Pad or truncate to exactly H * D
+            if actual_len != expected_len:
+                if _decode_warn_count < _DECODE_WARN_LIMIT:
+                    logger.warning(
+                        "FAST decode: got %d values, expected %d (H=%d, D=%d). %s.",
+                        actual_len, expected_len, time_horizon, action_dim,
+                        "Truncating" if actual_len > expected_len else "Padding with zeros",
+                    )
+                    _decode_warn_count += 1
+                    if _decode_warn_count == _DECODE_WARN_LIMIT:
+                        logger.warning("FAST decode: suppressing further warnings.")
+
+                if actual_len > expected_len:
+                    raw_values = raw_values[:expected_len]
+                else:
+                    raw_values = np.pad(raw_values, (0, expected_len - actual_len))
+
+            dct_coeff = raw_values.reshape(time_horizon, action_dim).astype(np.float64)
+            actions_i = idct(dct_coeff / scale, axis=0, norm="ortho")
+
+        except Exception:
+            if _decode_warn_count < _DECODE_WARN_LIMIT:
+                logger.warning("FAST decode: failed for sample %d, using zeros.", i)
+                _decode_warn_count += 1
+            actions_i = np.zeros((time_horizon, action_dim))
+
+        decoded_actions.append(actions_i)
+
+    return np.stack(decoded_actions)
 
 
 def denormalize_actions(
@@ -90,6 +140,5 @@ def denormalize_actions(
     """
     mid = (action_high + action_low) / 2.0
     half_range = (action_high - action_low) / 2.0
-    # Avoid division by zero for constant dimensions
     half_range = np.where(half_range < 1e-8, 1.0, half_range)
     return actions * half_range + mid
