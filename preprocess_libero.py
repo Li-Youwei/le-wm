@@ -34,6 +34,8 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import json
+import shutil
 import sys
 from collections import Counter
 from pathlib import Path
@@ -225,6 +227,35 @@ def extract_chunks(
 # Step 4: FAST tokenization
 # ---------------------------------------------------------------------------
 
+def _patch_saved_tokenizer(save_dir: Path) -> None:
+    """Ensure a saved FAST tokenizer can be reloaded via AutoProcessor.
+
+    save_pretrained() writes the BPE vocab and config, but omits:
+    1. The custom processor Python file (processing_action_tokenizer.py)
+    2. The auto_map entry in preprocessor_config.json
+
+    Without these, AutoProcessor.from_pretrained() loads a plain HF tokenizer
+    that can't handle numpy action chunks.
+    """
+    # 1. Copy processing_action_tokenizer.py into the saved directory
+    processor_src = Path(__file__).parent / "data" / "fast_tokenizer" / "processing_action_tokenizer.py"
+    if processor_src.exists():
+        shutil.copy2(processor_src, save_dir / "processing_action_tokenizer.py")
+    else:
+        print(f"  WARNING: {processor_src} not found, skipping processor file copy")
+
+    # 2. Inject auto_map into preprocessor_config.json
+    config_path = save_dir / "preprocessor_config.json"
+    if config_path.exists():
+        config = json.loads(config_path.read_text())
+    else:
+        config = {}
+    config["auto_map"] = {
+        "AutoProcessor": "processing_action_tokenizer.UniversalActionProcessor"
+    }
+    config_path.write_text(json.dumps(config, indent=2) + "\n")
+
+
 def tokenize_actions(
     action_chunks: np.ndarray,
     fit: bool = False,
@@ -276,8 +307,14 @@ def tokenize_actions(
             print("  Fitting complete.")
 
             if save_tokenizer_path is not None:
-                Path(save_tokenizer_path).mkdir(parents=True, exist_ok=True)
+                save_dir = Path(save_tokenizer_path)
+                save_dir.mkdir(parents=True, exist_ok=True)
                 tokenizer.save_pretrained(save_tokenizer_path)
+
+                # save_pretrained() doesn't copy the custom processor code or
+                # the auto_map needed for AutoProcessor.from_pretrained().
+                # Fix both so --load-tokenizer works out of the box.
+                _patch_saved_tokenizer(save_dir)
                 print(f"  Saved fitted tokenizer to: {save_tokenizer_path}")
 
     # Encode all chunks in one call (batched)

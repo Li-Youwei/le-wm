@@ -52,7 +52,7 @@ def create_model():
         heads=16,
         dim_head=64,
         mlp_dim=2048,
-        max_action_tokens=40,
+        max_action_tokens=45,
         dropout=0.1,
         emb_dropout=0.0,
     )
@@ -163,7 +163,7 @@ def main():
     print(f"Loading dataset from {data_path}")
     dataset = LiberoDataset(
         hdf5_dir=str(data_path.parent),
-        max_action_tokens=40,
+        max_action_tokens=45,
         img_size=224,
     )
     print(f"Dataset size: {len(dataset)} samples")
@@ -221,7 +221,7 @@ def main():
         output = model.encode(info)
         z_t = output["emb"][:, 0]  # (B, D)
 
-        tokens, lengths = model.predict_actions(z_t, max_len=40, temperature=0.0)
+        tokens, lengths = model.predict_actions(z_t, max_len=45, temperature=0.0)
         print(f"\n  z_t.shape     = {z_t.shape}")
         print(f"  tokens.shape  = {tokens.shape}")
         print(f"  lengths       = {lengths.tolist()}")

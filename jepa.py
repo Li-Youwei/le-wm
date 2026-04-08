@@ -50,7 +50,7 @@ class JEPA(nn.Module):
         state_pred = self.pred_proj(state_raw)
         return action_logits, state_pred
 
-    def predict_actions(self, z_t, max_len=40, temperature=0.0):
+    def predict_actions(self, z_t, max_len=45, temperature=0.0):
         """Inference: autoregressively generate FAST action tokens.
 
         Args:

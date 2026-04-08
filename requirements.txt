@@ -12,8 +12,9 @@ torch>=2.1
 einops>=0.7
 numpy>=1.24
 h5py>=3.8
-transformers>=4.40          # ViT backbone (ViTModel/ViTConfig) + FAST tokenizer
-sentencepiece>=0.1.99       # required by transformers tokenizer backend
+transformers>=4.48,<5        # pinned: <4.48 missing TimmWrapperModel; >=5 breaks FAST processor
+sentencepiece>=0.1.99       # tokenizer backend for transformers
+tiktoken>=0.7               # tokenizer backend for transformers
 
 # --- Preprocessing (preprocess_libero.py) ---
 scipy>=1.10                 # DCT for FAST tokenization

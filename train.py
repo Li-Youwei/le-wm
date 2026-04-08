@@ -71,7 +71,7 @@ def run(cfg):
 
     # Single source of truth for max_action_tokens — used by both dataset and model.
     # Avoids silent shape mismatch if only one side is updated.
-    max_action_tokens = cfg.data.dataset.get("max_action_tokens", 40)
+    max_action_tokens = cfg.data.dataset.get("max_action_tokens", 45)
 
     if is_libero:
         # MODIFIED: LIBERO uses standalone dataset with pre-computed FAST tokens
