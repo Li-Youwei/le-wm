@@ -372,7 +372,7 @@ class ARPredictor(nn.Module):
         Args:
             z_agent: (B, D) agentview visual latent from encoder.
             z_hand: (B, D) eye-in-hand visual latent from encoder.
-            z_proprio_raw: (B, 8) raw proprioceptive state (ee_pos3 + ee_euler3 + gripper2).
+            z_proprio_raw: (B, 8) raw proprioceptive state (ee_pos3 + ee_quat4 + gripper1).
             lang_embeds: (B, max_lang_tokens, D) projected language embeddings.
             lang_lengths: (B,) real language token count per sample.
             action_tokens: (B, max_action_tokens) FAST token ids padded with PAD_TOKEN_ID.

@@ -15,7 +15,7 @@ This script:
 Output HDF5 layout:
     image_agent        (N, H_img, W_img, 3) uint8   — agentview at chunk start
     image_hand         (N, H_img, W_img, 3) uint8   — eye-in-hand at chunk start
-    proprio            (N, 8) float64                 — ee_pos(3)+ee_ori(3)+gripper(2)
+    proprio            (N, 8) float64                 — ee_pos(3)+ee_quat(4)+gripper(1)
     continuous_actions  (N, chunk_size, 7)  float32   — normalized actions
     fast_tokens        (N,) vlen(int32)               — FAST token IDs per chunk
     fast_length        (N,) int32                     — token count per chunk
@@ -82,10 +82,9 @@ def inspect_hdf5(f: h5py.File, image_key: str, hand_image_key: str, demo_keys: l
             raise ValueError(f"'obs/{image_key}' not found in data/{dk}")
         if "obs" not in demo or hand_image_key not in demo["obs"]:
             raise ValueError(f"'obs/{hand_image_key}' not found in data/{dk}")
-        # Validate proprioceptive keys
-        for obs_key in ("ee_pos", "ee_ori", "gripper_states"):
-            if obs_key not in demo["obs"]:
-                raise ValueError(f"'obs/{obs_key}' not found in data/{dk}")
+        # Validate robot_states for proprio extraction (contains ee_pos, ee_quat, gripper)
+        if "robot_states" not in demo:
+            raise ValueError(f"'robot_states' not found in data/{dk}")
 
     # Print trajectory lengths
     lengths = [f[f"data/{dk}/actions"].shape[0] for dk in demo_keys]
@@ -96,16 +95,35 @@ def inspect_hdf5(f: h5py.File, image_key: str, hand_image_key: str, demo_keys: l
     print(f"  Agentview shape: {img_shape} (key='{image_key}')")
     hand_shape = f[f"data/{demo_keys[0]}/obs/{hand_image_key}"].shape[1:]
     print(f"  Hand image shape: {hand_shape} (key='{hand_image_key}')")
-    # Proprio dims
-    ee_pos_dim = f[f"data/{demo_keys[0]}/obs/ee_pos"].shape[1]
-    ee_ori_dim = f[f"data/{demo_keys[0]}/obs/ee_ori"].shape[1]
-    grip_dim = f[f"data/{demo_keys[0]}/obs/gripper_states"].shape[1]
-    print(f"  Proprio: ee_pos({ee_pos_dim}d) + ee_ori({ee_ori_dim}d) + gripper_states({grip_dim}d) = {ee_pos_dim + ee_ori_dim + grip_dim}d")
+    rs_dim = f[f"data/{demo_keys[0]}/robot_states"].shape[1]
+    print(f"  robot_states: {rs_dim}d → proprio: ee_pos(3) + ee_quat(4) + gripper(1) = 8d")
 
 
 # ---------------------------------------------------------------------------
 # Step 2: Collect actions and compute normalization statistics
 # ---------------------------------------------------------------------------
+
+def normalize_proprio(raw_8d: np.ndarray) -> np.ndarray:
+    """Normalize 8d proprio vector: ee_pos(3) + ee_quat(4) + gripper(1).
+
+    - Quaternion (dims 3:7): re-normalize to unit length as a defensive safeguard.
+    - Position and gripper: passed through unchanged.
+
+    This function is the single source of truth for proprio normalization.
+    Dataset loading and eval must both call this same function.
+
+    Args:
+        raw_8d: (..., 8) array — [ee_pos(3), ee_quat(4), gripper(1)]
+
+    Returns:
+        (..., 8) array with quaternion re-normalized.
+    """
+    out = raw_8d.copy()
+    quat = out[..., 3:7]
+    quat_norm = np.linalg.norm(quat, axis=-1, keepdims=True)
+    out[..., 3:7] = quat / (quat_norm + 1e-8)
+    return out
+
 
 def compute_action_stats(
     f: h5py.File, demo_keys: list[str]
@@ -213,10 +231,8 @@ def extract_chunks(
         agent_imgs = f[f"data/{dk}/obs/{image_key}"][:last_needed_frame + 1]
         hand_imgs = f[f"data/{dk}/obs/{hand_image_key}"][:last_needed_frame + 1]
 
-        # Load proprioceptive state
-        ee_pos = f[f"data/{dk}/obs/ee_pos"][:last_needed_frame + 1]        # (<=T, 3)
-        ee_ori = f[f"data/{dk}/obs/ee_ori"][:last_needed_frame + 1]        # (<=T, 3) euler angles
-        grip_states = f[f"data/{dk}/obs/gripper_states"][:last_needed_frame + 1]  # (<=T, 2)
+        # Load robot_states for proprio: [grip0, grip1, ee_pos(3), ee_quat(4)]
+        robot_states = f[f"data/{dk}/robot_states"][:last_needed_frame + 1]  # (<=T, 9)
 
         # Normalize this demo's actions
         actions_norm = normalize_actions(actions_raw, action_low, action_high)
@@ -228,13 +244,14 @@ def extract_chunks(
             samples["image_agent"].append(agent_imgs[start])   # (H_img, W_img, 3) uint8
             samples["image_hand"].append(hand_imgs[start])     # (H_img, W_img, 3) uint8
 
-            # Proprio: ee_pos(3) + ee_ori(3, euler) + gripper_states(2) = 8d
-            proprio = np.concatenate([
-                ee_pos[start],              # (3,)
-                ee_ori[start],              # (3,) euler angles
-                grip_states[start],         # (2,) both finger widths
+            # Proprio: ee_pos(3) + ee_quat(4) + gripper(1) = 8d from robot_states
+            rs = robot_states[start]
+            proprio_raw = np.concatenate([
+                rs[2:5],    # ee_pos (3d)
+                rs[5:9],    # ee_quat (4d)
+                rs[0:1],    # gripper (1d, first finger width)
             ])
-            samples["proprio"].append(proprio)  # (8,) float64
+            samples["proprio"].append(normalize_proprio(proprio_raw))  # (8,) float64
 
             samples["continuous_actions"].append(actions_norm[start:end])  # (H, 7)
             samples["demo_idx"].append(demo_i)
@@ -514,8 +531,8 @@ def print_statistics(
         proprio_all = np.stack(samples["proprio"], axis=0)  # (N, 8)
         print(f"\n  Proprioception stats (8d):")
         labels = ["ee_pos_x", "ee_pos_y", "ee_pos_z",
-                  "ee_ori_r", "ee_ori_p", "ee_ori_y",
-                  "grip_l", "grip_r"]
+                  "ee_quat_w", "ee_quat_x", "ee_quat_y", "ee_quat_z",
+                  "gripper"]
         for d in range(proprio_all.shape[1]):
             col = proprio_all[:, d]
             lbl = labels[d] if d < len(labels) else f"dim{d}"

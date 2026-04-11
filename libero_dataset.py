@@ -5,7 +5,7 @@ Loads preprocessed HDF5 files produced by preprocess_libero.py.
 Expected HDF5 structure (one file per task):
     /image_agent:         (N, H_img, W_img, 3) uint8 HWC  — agentview at chunk start
     /image_hand:          (N, H_img, W_img, 3) uint8 HWC  — eye-in-hand at chunk start
-    /proprio:             (N, 8) float64                   — ee_pos(3)+ee_euler(3)+gripper(2)
+    /proprio:             (N, 8) float64                   — ee_pos(3)+ee_quat(4)+gripper(1)
     /fast_tokens:         variable-length int32 (h5py vlen_dtype)
     /continuous_actions:  (N, H, action_dim) float32  [optional, for debug]
     attrs:

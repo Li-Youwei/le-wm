@@ -40,6 +40,7 @@ from libero.libero.envs import OffScreenRenderEnv
 
 from fast_utils import denormalize_actions, fast_decode, load_fast_processor
 from libero_dataset import _preprocess_image
+from preprocess_libero import normalize_proprio
 
 
 # ---------------------------------------------------------------------------
@@ -182,12 +183,12 @@ def preprocess_obs(
     img_hand = _preprocess_image(obs["robot0_eye_in_hand_image"], img_size)
     pixels_hand = img_hand.unsqueeze(0).to(device)
 
-    # Proprioception: ee_pos(3) + ee_euler(3) + gripper(2) = 8d
-    # LIBERO env exposes euler angles as robot0_eef_euler, gripper as robot0_gripper_qpos
+    # Proprioception: ee_pos(3) + ee_quat(4) + gripper(1) = 8d
     ee_pos = obs["robot0_eef_pos"]          # (3,)
-    ee_euler = obs["robot0_eef_euler"]      # (3,) euler angles
-    gripper = obs["robot0_gripper_qpos"]    # (2,) both finger widths
-    proprio_np = np.concatenate([ee_pos, ee_euler, gripper])  # (8,)
+    ee_quat = obs["robot0_eef_quat"]        # (4,) quaternion
+    gripper = obs["robot0_gripper_qpos"][:1]  # (1,) first finger width
+    proprio_raw = np.concatenate([ee_pos, ee_quat, gripper])  # (8,)
+    proprio_np = normalize_proprio(proprio_raw)  # re-normalize quaternion
     proprio = torch.from_numpy(proprio_np).float().unsqueeze(0).to(device)
 
     return pixels_agent, pixels_hand, proprio

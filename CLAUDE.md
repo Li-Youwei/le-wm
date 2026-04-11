@@ -23,12 +23,17 @@ Do NOT re-add any of these components unless explicitly instructed. If you find 
 |-------|--------|---------|--------|---------|
 | Agentview image | `agentview_rgb` stored at 128×128 | ViT (LeWM encoder, patch_size=14) | `z_agent` (D,) | No, end-to-end |
 | Eye-in-hand image | `eye_in_hand_rgb` stored at 128×128 | Same ViT (shared weights) | `z_hand` (D,) | No, end-to-end |
-| Proprioception | Base-frame EE position(3) + EE euler orientation(3) + gripper states(2) = 8d | MLP → D | `z_proprio` (D,) | No |
+| Proprioception | Base-frame EE position(3) + base-frame EE orientation quaternion(4) + gripper state(1) = 8d | MLP → D | `z_proprio` (D,) | No |
 | Language instruction | Task description string | T5-small encoder | `l_1...l_n` (n, D) | **Yes, frozen** |
 
 `D` = embed_dim = 192 (LeWM default for ViT-Tiny). Two image views share the same ViT encoder (weight sharing). T5-small outputs are projected to D via a learned linear layer.
 
 **Image resolution chain**: Raw LIBERO images are 128×128. The ViT uses `patch_size=14`, which requires the input to be divisible by 14. The dataset transform must **resize 128→224** (matching LeWM's original training resolution of 224×224, where 224/14=16 patches per side). Do NOT feed 128×128 directly to the ViT — it won't divide evenly.
+
+**Proprioception normalization rules:**
+- **Quaternion**: Re-normalize `ee_ori` to unit length before feeding to MLP: `q = q / (||q|| + 1e-8)`. LIBERO simulator outputs should already be unit quaternions, but this is a defensive safeguard against numerical drift.
+- **Gripper state**: LIBERO/robosuite uses `[-1, 1]` convention (-1=open, 1=closed). Verify by printing `gripper_states.min()` and `gripper_states.max()` during preprocessing. If the actual range differs, document it and adjust.
+- **Consistency rule**: Define a single `normalize_proprio(raw_8d)` function in preprocessing. Dataset loading and eval must both call this same function — do NOT re-implement normalization logic separately in each file.
 
 ### Unified Transformer Sequence
 
@@ -44,11 +49,17 @@ Inference:
 → FAST decode → continuous action chunk (H=10 steps × 7 dims) → execute on robot
 ```
 
+**Inference decoding rules (must be followed exactly):**
+1. **Stop generation** when either `<EOS>` (id=1025) is sampled OR `max_action_tokens` tokens have been generated, whichever comes first.
+2. **Post-process before FAST decode**: strip `<BOS>` from the beginning, truncate at `<EOS>` (discard EOS itself and anything after), discard any trailing tokens beyond `max_action_tokens`.
+3. **Only token IDs 0..1023** (real FAST vocab) go into the FAST decoder. Never pass BOS/EOS/PAD to FAST decode.
+4. Note: `action_head` outputs 1026 logits (0..1025), so PAD (id=1026) **cannot** be sampled by design — do NOT add extra masking for PAD during generation.
+
 Where:
 - `l_1...l_n`: language token embeddings from frozen T5-small (variable length, typically 5-15 tokens)
 - `z_agent`: CLS token from ViT encoding of agentview image
 - `z_hand`: CLS token from ViT encoding of eye-in-hand image
-- `z_proprio`: MLP encoding of 8d proprioceptive state: base-frame EE position(3) + EE euler orientation(3) + gripper states(2)
+- `z_proprio`: MLP encoding of 8d proprioceptive state: base-frame EE position(3) + base-frame EE orientation quaternion(4) + gripper state(1)
 - `BOS`: beginning-of-action token (id=1024)
 - `T_1...T_k`: FAST action tokens (discrete, vocab=0..1023, variable-length ~20-40 tokens)
 - `PAD`: padding token (id=1026) for variable-length batching
@@ -165,7 +176,7 @@ There are no tests, linting, or CI pipelines in this repository.
 Four Python files implement the original core:
 
 - **`jepa.py`** — `JEPA` class. Key methods: `encode()`, `predict()`, `rollout()`, `criterion()` (planning-time latent cost, NOT training loss), `get_cost()`.
-- **`module.py`** — Building blocks: `SIGReg`, `Attention`, `Block`, `Transformer`, `MLP`, `ARPredictor` (modified for VLA baseline with dual-view, language, proprioception).
+- **`module.py`** — Building blocks: `SIGReg`, `Attention`, `Block`, `ConditionalBlock` (AdaLN-zero), `Transformer`, `ARPredictor`, `Embedder`, `MLP`. Also contains the already-added `UnifiedPredictor` from the previous phase.
 - **`train.py`** — Training entry point. Contains `lejepa_forward()` (training step and loss). Hydra config, PyTorch Lightning.
 - **`eval.py`** — Evaluation/planning (original CEM-based, to be replaced).
 - **`utils.py`** — Image preprocessing, StandardScaler, checkpoint callback.
@@ -174,7 +185,7 @@ Four Python files implement the original core:
 
 The following modifications were made in the first iteration (unified predictor with world model co-training). These will be **further modified** for the new baseline:
 
-- `module.py`: Added `ARPredictor`, modified `Attention.forward` and `Block.forward` to accept `attn_mask`
+- `module.py`: Added `UnifiedPredictor`, modified `Attention.forward` and `Block.forward` to accept `attn_mask`
 - `jepa.py`: Modified `JEPA.__init__`, `encode()`, `predict()`, added `predict_actions()`
 - `train.py`: Modified `lejepa_forward()`, model assembly, added `LiberoDataset` import
 - `libero_dataset.py`: New file for LIBERO HDF5 data loading
@@ -199,9 +210,9 @@ The following modifications were made in the first iteration (unified predictor 
 
 ### File-by-File Modification Plan
 
-#### `module.py` — Modify ARPredictor
+#### `module.py` — Modify UnifiedPredictor
 
-**Modify `ARPredictor`:**
+**Modify `UnifiedPredictor`:**
 - Remove `state_query` parameter and all state prediction logic
 - Remove state prediction output from `forward()` — return only `action_logits`
 - Add `proprio_encoder = MLP(8, hidden, embed_dim)` for proprioceptive state encoding
@@ -232,7 +243,7 @@ The following modifications were made in the first iteration (unified predictor 
 - Encode both views through shared ViT → `z_agent`, `z_hand`
 - Encode language via frozen T5 → project via `lang_proj` → `lang_embeds`
 - Return `z_agent`, `z_hand`, `lang_embeds`, `lang_lengths`
-- **Proprio is NOT encoded in `encode()`.** Raw 8d proprio vector is passed directly from the batch to `predict()`, which forwards it to `ARPredictor` where the MLP encoding happens. This keeps the MLP inside the predictor module.
+- **Proprio is NOT encoded in `encode()`.** Raw 8d proprio vector is passed directly from the batch to `predict()`, which forwards it to `UnifiedPredictor` where the MLP encoding happens. This keeps the MLP inside the predictor module.
 
 **Modify `predict()`:**
 - New signature: `predict(z_agent, z_hand, proprio, lang_embeds, lang_lengths, action_tokens, action_lengths)`
@@ -270,17 +281,18 @@ The following modifications were made in the first iteration (unified predictor 
 #### `libero_dataset.py` — Update dataset
 
 - Add second image view (`eye_in_hand_rgb`)
-- Add proprioception: `ee_pos` (3d) + `ee_ori` (3d, euler) + `gripper_states` (2d) = 8d vector
-- Add language instruction (from HDF5 task name or stored attribute)
+- Add proprioception: `ee_pos` (3d) + `ee_ori` (4d) + `gripper_states` (1d) = 8d vector
+- Add language instruction: use the `language_instruction` attribute stored in each LIBERO HDF5 demo (this is a natural-language sentence, e.g. "pick up the red mug and place it on the plate"). Do NOT use the HDF5 filename, task ID, or internal key name as the language input — these are formatted strings (e.g. `KITCHEN_SCENE10_close_the_top_drawer...`) that T5 was not trained on, and will degrade language encoding quality. If `language_instruction` is not available, construct the canonical sentence manually (strip scene prefix, replace underscores with spaces, verify readability).
 - Remove `image_future` (no longer needed)
 
 #### `preprocess_libero.py` — Update preprocessing
 
 - Add extraction of `eye_in_hand_rgb` alongside `agentview_rgb`
-- Add extraction of proprioceptive state (8d): `ee_pos` (3) + `ee_ori` (3, euler) + `gripper_states` (2)
-- Add language instruction per task (stored as string attribute)
+- Add extraction of proprioceptive state (8d): `ee_pos` (3) + `ee_ori` (4) + `gripper_states` (1)
+- Add language instruction per task (stored as string attribute). Use the `language_instruction` attribute from the HDF5, NOT the filename or task ID. Store one canonical instruction string per task in the output HDF5.
 - Remove `image_future` from output
 - **FAST preprocessing rule**: actions MUST be quantile-normalized to [-1, 1] (1st/99th percentile per dim) BEFORE DCT/BPE (FAST paper Section V-B). Verify this is correctly implemented in the preprocessing script. Baseline uses `--fit-tokenizer` to train a LIBERO-Spatial-specific BPE vocabulary (not FAST+ universal).
+- **Token length assertion (CRITICAL)**: After preprocessing the full training set, `assert max(fast_length) <= max_action_tokens`. If this fails, the script must raise an error and print the actual max length — then `max_action_tokens` and `pos_embedding` `max_seq_len` must be increased accordingly. Do NOT silently truncate sequences that exceed the limit. Silent truncation causes training to appear normal while quietly destroying action quality — this is the hardest kind of bug to find.
 
 #### `eval.py` — Rewrite for direct inference
 
@@ -312,7 +324,7 @@ Do NOT reuse any of the original `eval.py` planning logic (CEM, Adam solver, lat
 | Predictor heads | 16 | LeWM default |
 | T5 variant | t5-small (60M params, frozen) | Standard for VLA |
 | T5 hidden dim | 512 | t5-small config |
-| Proprio input dim | 8 (pos3 + euler_ori3 + gripper2) | LIBERO EE state |
+| Proprio input dim | 8 (pos3 + ori4 + grip1) | LIBERO EE state |
 | Learning rate | From LeWM config | Keep original schedule |
 | Batch size | 128 | LeWM default |
 | Logging | TensorBoard | Advisor requirement |
@@ -326,7 +338,7 @@ Do NOT reuse any of the original `eval.py` planning logic (CEM, Adam solver, lat
   3. Wrap forward pass in `with torch.no_grad():` — saves GPU memory by not storing activations
   4. Only `lang_proj` (the linear projection layer) is trained
 - **ViT encoder is shared** between agentview and eye_in_hand. Both views go through the same encoder with the same weights.
-- **Proprioception MLP is inside ARPredictor**, not a separate encoder in JEPA. It takes raw 8d input and outputs D-dim embedding.
+- **Proprioception MLP is inside UnifiedPredictor**, not a separate encoder in JEPA. It takes raw 8d input and outputs D-dim embedding.
 - **Attention mask is NOT pure causal.** It is a hybrid prefix-bidirectional + action-causal mask. Must be constructed explicitly as a `(B, 1, L, L)` bool tensor.
 - **Config naming**: Use `chunk_horizon_raw_steps = 10` for the action chunk length. Do NOT overload the original `frameskip` variable.
 - **Single-task training**: One model per LIBERO-Spatial task. Language input is the same for all samples within a task, but the architecture supports multi-task for future extension.
