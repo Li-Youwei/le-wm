@@ -1,7 +1,8 @@
-"""LIBERO evaluation: autoregressive action generation → environment execution.
+"""LIBERO evaluation: VLA baseline — autoregressive action generation → environment execution.
 
 Loads a trained checkpoint, runs the model in LIBERO environments, and
-measures task success rate.
+measures task success rate. The model takes dual-view images, proprioception,
+and language instruction as input.
 
 Usage:
     # Single task
@@ -30,6 +31,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import torch
+from transformers import T5EncoderModel, T5Tokenizer
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
@@ -58,15 +60,25 @@ def build_model(device: torch.device) -> torch.nn.Module:
     embed_dim = 192
 
     predictor = ARPredictor(
-        embed_dim=embed_dim, max_action_tokens=45,
+        embed_dim=embed_dim, max_action_tokens=45, max_lang_tokens=25,
+        proprio_dim=8,
         depth=6, heads=16, dim_head=64, mlp_dim=2048, dropout=0.1, emb_dropout=0.0,
     )
     projector = MLP(input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048,
                     norm_fn=torch.nn.BatchNorm1d)
-    pred_proj = MLP(input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048,
-                    norm_fn=torch.nn.BatchNorm1d)
 
-    model = JEPA(encoder=encoder, predictor=predictor, projector=projector, pred_proj=pred_proj)
+    # T5-small (frozen)
+    lang_encoder = T5EncoderModel.from_pretrained("t5-small")
+    lang_encoder.eval()
+    for p in lang_encoder.parameters():
+        p.requires_grad_(False)
+
+    lang_proj = torch.nn.Linear(lang_encoder.config.d_model, embed_dim)
+
+    model = JEPA(
+        encoder=encoder, predictor=predictor, projector=projector,
+        lang_encoder=lang_encoder, lang_proj=lang_proj,
+    )
     return model.to(device)
 
 
@@ -75,6 +87,7 @@ def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device
 
     spt.Module stores the JEPA as self.model, so checkpoint keys are
     prefixed with "model." (e.g. "model.encoder.xxx"). We strip that prefix.
+    T5 encoder is loaded separately (from pretrained), so we skip those keys.
     """
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
     state_dict = ckpt["state_dict"]
@@ -83,11 +96,17 @@ def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device
     model_sd = {}
     for k, v in state_dict.items():
         if k.startswith("model."):
-            model_sd[k.removeprefix("model.")] = v
+            new_key = k.removeprefix("model.")
+            # Skip T5 encoder keys (loaded from pretrained)
+            if new_key.startswith("lang_encoder."):
+                continue
+            model_sd[new_key] = v
 
     missing, unexpected = model.load_state_dict(model_sd, strict=False)
-    if missing:
-        print(f"WARNING: missing keys: {missing}")
+    # Filter expected missing keys (T5 encoder)
+    real_missing = [k for k in missing if not k.startswith("lang_encoder.")]
+    if real_missing:
+        print(f"WARNING: missing keys: {real_missing}")
     if unexpected:
         print(f"WARNING: unexpected keys: {unexpected}")
     print(f"Loaded checkpoint from {ckpt_path} ({len(model_sd)} keys)")
@@ -98,38 +117,28 @@ def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device
 # ---------------------------------------------------------------------------
 
 def find_processed_h5(processed_dir: str, task_name: str) -> Path | None:
-    """Find the preprocessed H5 file matching a LIBERO task name.
-
-    Matching strategy (in order):
-    1. Filename contains the task name (lowercased, underscored)
-    2. HDF5 source_file attr contains the task name
-    """
+    """Find the preprocessed H5 file matching a LIBERO task name."""
     processed_dir = Path(processed_dir)
     task_key = task_name.lower().replace(" ", "_")
 
-    # Strategy 1: filename match
-    for h5_path in sorted(processed_dir.glob("*.h5")):
-        if task_key in h5_path.stem.lower():
-            return h5_path
-    for h5_path in sorted(processed_dir.glob("*.hdf5")):
-        if task_key in h5_path.stem.lower():
-            return h5_path
-
-    # Strategy 2: check source_file attr
-    for h5_path in sorted(processed_dir.glob("*.h5")) + sorted(processed_dir.glob("*.hdf5")):
-        with h5py.File(h5_path, "r") as f:
-            source = f.attrs.get("source_file", "")
-            if task_key in str(source).lower():
+    for ext in ("*.h5", "*.hdf5"):
+        for h5_path in sorted(processed_dir.glob(ext)):
+            if task_key in h5_path.stem.lower():
                 return h5_path
+
+    # Fallback: check source_file attr
+    for ext in ("*.h5", "*.hdf5"):
+        for h5_path in sorted(processed_dir.glob(ext)):
+            with h5py.File(h5_path, "r") as f:
+                source = f.attrs.get("source_file", "")
+                if task_key in str(source).lower():
+                    return h5_path
 
     return None
 
 
 def load_action_stats(h5_path: Path) -> tuple[np.ndarray, np.ndarray, int, int]:
-    """Read action normalization stats and chunk_size from preprocessed HDF5.
-
-    Returns: (action_low, action_high, chunk_size, action_dim)
-    """
+    """Read action normalization stats and chunk_size from preprocessed HDF5."""
     with h5py.File(h5_path, "r") as f:
         action_low = np.array(f.attrs["action_low"])
         action_high = np.array(f.attrs["action_high"])
@@ -138,25 +147,72 @@ def load_action_stats(h5_path: Path) -> tuple[np.ndarray, np.ndarray, int, int]:
     return action_low, action_high, chunk_size, action_dim
 
 
+def load_language_instruction(h5_path: Path) -> str:
+    """Read language instruction from preprocessed HDF5."""
+    with h5py.File(h5_path, "r") as f:
+        return f.attrs.get("language_instruction", "")
+
+
 # ---------------------------------------------------------------------------
 # Observation preprocessing
 # ---------------------------------------------------------------------------
 
-def preprocess_obs(obs: dict, image_key: str, img_size: int, device: torch.device) -> torch.Tensor:
-    """Extract and preprocess observation image for the model.
+def preprocess_obs(
+    obs: dict,
+    img_size: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Extract dual-view images and proprio from LIBERO env observation.
 
     Args:
-        obs: LIBERO observation dict with image arrays.
-        image_key: key for the camera image (e.g. "agentview_image").
+        obs: LIBERO observation dict.
         img_size: target image size (224).
         device: target device.
 
     Returns:
-        (1, 1, 3, img_size, img_size) tensor ready for model.encode().
+        pixels_agent: (1, 3, img_size, img_size) agentview tensor.
+        pixels_hand: (1, 3, img_size, img_size) hand tensor.
+        proprio: (1, 8) proprioceptive state tensor.
     """
-    img = obs[image_key]  # (H, W, 3) uint8
-    img_tensor = _preprocess_image(img, img_size)  # (3, H, W) float32
-    return img_tensor.unsqueeze(0).unsqueeze(0).to(device)  # (1, 1, 3, H, W)
+    # Agentview image
+    img_agent = _preprocess_image(obs["agentview_image"], img_size)
+    pixels_agent = img_agent.unsqueeze(0).to(device)
+
+    # Eye-in-hand image
+    img_hand = _preprocess_image(obs["robot0_eye_in_hand_image"], img_size)
+    pixels_hand = img_hand.unsqueeze(0).to(device)
+
+    # Proprioception: ee_pos(3) + ee_euler(3) + gripper(2) = 8d
+    # LIBERO env exposes euler angles as robot0_eef_euler, gripper as robot0_gripper_qpos
+    ee_pos = obs["robot0_eef_pos"]          # (3,)
+    ee_euler = obs["robot0_eef_euler"]      # (3,) euler angles
+    gripper = obs["robot0_gripper_qpos"]    # (2,) both finger widths
+    proprio_np = np.concatenate([ee_pos, ee_euler, gripper])  # (8,)
+    proprio = torch.from_numpy(proprio_np).float().unsqueeze(0).to(device)
+
+    return pixels_agent, pixels_hand, proprio
+
+
+def tokenize_language(
+    instruction: str,
+    t5_tokenizer: T5Tokenizer,
+    max_lang_tokens: int,
+    device: torch.device,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Tokenize language instruction for model input.
+
+    Returns:
+        lang_ids: (1, max_lang_tokens) token IDs.
+        lang_mask: (1, max_lang_tokens) attention mask.
+    """
+    tok_out = t5_tokenizer(
+        instruction,
+        max_length=max_lang_tokens,
+        padding="max_length",
+        truncation=True,
+        return_tensors="pt",
+    )
+    return tok_out["input_ids"].to(device), tok_out["attention_mask"].to(device)
 
 
 # ---------------------------------------------------------------------------
@@ -167,26 +223,30 @@ def preprocess_obs(obs: dict, image_key: str, img_size: int, device: torch.devic
 def evaluate_task(
     model: torch.nn.Module,
     processor,
+    t5_tokenizer: T5Tokenizer,
     env: OffScreenRenderEnv,
     init_states: list,
     action_low: np.ndarray,
     action_high: np.ndarray,
     chunk_size: int,
     action_dim: int,
+    language_instruction: str,
     *,
     num_episodes: int = 20,
     max_steps: int = 300,
-    image_key: str = "agentview_image",
     img_size: int = 224,
+    max_lang_tokens: int = 25,
     device: torch.device = torch.device("cuda"),
     temperature: float = 0.0,
 ) -> tuple[int, int]:
-    """Run episodes and count successes.
-
-    Returns: (num_successes, num_episodes)
-    """
+    """Run episodes and count successes."""
     successes = 0
     max_chunks = max_steps // chunk_size
+
+    # Pre-tokenize language instruction (same for all episodes)
+    lang_ids, lang_mask = tokenize_language(
+        language_instruction, t5_tokenizer, max_lang_tokens, device,
+    )
 
     for ep in range(num_episodes):
         # Reset with deterministic initial state
@@ -194,15 +254,22 @@ def evaluate_task(
         init_idx = ep % len(init_states)
         obs = env.set_init_state(init_states[init_idx])
 
+        reward = 0
         done = False
         for _ in range(max_chunks):
-            # Encode observation
-            pixels = preprocess_obs(obs, image_key, img_size, device)
-            info = model.encode({"pixels": pixels})
-            z_t = info["emb"][:, 0]  # (1, D)
+            # Preprocess observation (dual-view + proprio)
+            pixels_agent, pixels_hand, proprio = preprocess_obs(obs, img_size, device)
+
+            # Encode visual + language
+            z_agent, z_hand, lang_embeds, lang_lengths = model.encode(
+                pixels_agent, pixels_hand, lang_ids, lang_mask,
+            )
 
             # Generate FAST action tokens
-            tokens, lengths = model.predict_actions(z_t, temperature=temperature)
+            tokens, lengths = model.predict_actions(
+                z_agent, z_hand, proprio, lang_embeds, lang_lengths,
+                temperature=temperature,
+            )
 
             # Decode to continuous actions
             actions_norm = fast_decode(tokens, lengths, processor,
@@ -229,7 +296,7 @@ def evaluate_task(
 # ---------------------------------------------------------------------------
 
 def main():
-    parser = argparse.ArgumentParser(description="LIBERO evaluation with autoregressive FAST action generation")
+    parser = argparse.ArgumentParser(description="LIBERO VLA baseline evaluation")
     parser.add_argument("--checkpoint", type=str, required=True, help="Path to _weights.ckpt")
     parser.add_argument("--tokenizer", type=str, required=True, help="Path to saved FAST tokenizer directory")
     parser.add_argument("--processed-dir", type=str, required=True,
@@ -241,8 +308,6 @@ def main():
                         help="Single task index (0-9). Omit to run all tasks in suite")
     parser.add_argument("--num-episodes", type=int, default=20, help="Episodes per task")
     parser.add_argument("--max-steps", type=int, default=300, help="Max raw steps per episode")
-    parser.add_argument("--image-key", type=str, default="agentview_image",
-                        help="Observation image key in LIBERO env")
     parser.add_argument("--camera-size", type=int, default=256,
                         help="LIBERO camera resolution (env render size)")
     parser.add_argument("--device", type=str, default="cuda")
@@ -262,6 +327,9 @@ def main():
     # Load FAST tokenizer
     print(f"Loading FAST tokenizer from {args.tokenizer}")
     processor = load_fast_processor(args.tokenizer)
+
+    # Load T5 tokenizer for language
+    t5_tokenizer = T5Tokenizer.from_pretrained("t5-small")
 
     # Get task suite
     task_suite = benchmark.get_benchmark_dict()[args.suite]()
@@ -292,6 +360,8 @@ def main():
         print(f"  Preprocessed data: {h5_path}")
 
         action_low, action_high, chunk_size, action_dim = load_action_stats(h5_path)
+        language_instruction = load_language_instruction(h5_path)
+        print(f"  Language: '{language_instruction}'")
 
         # Create environment
         env = OffScreenRenderEnv(
@@ -302,11 +372,11 @@ def main():
         init_states = task_suite.get_task_init_states(task_id)
 
         successes, n_eps = evaluate_task(
-            model, processor, env, init_states,
+            model, processor, t5_tokenizer, env, init_states,
             action_low, action_high, chunk_size, action_dim,
+            language_instruction,
             num_episodes=args.num_episodes,
             max_steps=args.max_steps,
-            image_key=args.image_key,
             device=device,
             temperature=args.temperature,
         )

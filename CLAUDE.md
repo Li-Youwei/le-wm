@@ -4,50 +4,138 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## Project Overview
 
-LeWorldModel (LeWM) modified for **unified action prediction + world model co-training** on LIBERO. The original LeWM is a JEPA world model that predicts future latent states conditioned on actions. We modify it to: (1) predict actions from visual features via FAST tokenization, and (2) use world model prediction as training-time auxiliary supervision.
+VLA (Vision-Language-Action) baseline built on top of the LeWorldModel (LeWM) codebase. The model takes dual-view images, proprioceptive state, and a language instruction as input, and autoregressively predicts FAST action tokens. Trained on LIBERO-Spatial (single-task per model).
 
-## Current Modification Goal
+**This is a pure action prediction baseline, NOT original LeWM training, NOT Fast-WAM.**
+- No `L_pred` (next-embedding prediction loss) — this is LeWM's core training signal, we explicitly remove it
+- No `L_sigreg` (anti-collapse regularizer) — only needed when encoder is trained via prediction loss
+- No `rollout()`, `CEM`, or latent planning — actions are directly generated, not searched
+- No video co-training — Fast-WAM keeps video prediction during training; we don't
+- **The only training loss is `L_CE` (cross-entropy on FAST action tokens)**
 
-Convert LeWM's Predictor from action-conditioned next-latent prediction into a **unified autoregressive sequence model**.
+Do NOT re-add any of these components unless explicitly instructed. If you find yourself writing `SIGReg`, `pred_loss`, `state_query`, `criterion`, `rollout`, or `CEM` in new code, stop — you are reverting to the old architecture.
 
-Training-time input sequence fed to Transformer:
+## Current Architecture
+
+### Input Encoders
+
+| Input | Source | Encoder | Output | Frozen? |
+|-------|--------|---------|--------|---------|
+| Agentview image | `agentview_rgb` stored at 128×128 | ViT (LeWM encoder, patch_size=14) | `z_agent` (D,) | No, end-to-end |
+| Eye-in-hand image | `eye_in_hand_rgb` stored at 128×128 | Same ViT (shared weights) | `z_hand` (D,) | No, end-to-end |
+| Proprioception | Base-frame EE position(3) + EE euler orientation(3) + gripper states(2) = 8d | MLP → D | `z_proprio` (D,) | No |
+| Language instruction | Task description string | T5-small encoder | `l_1...l_n` (n, D) | **Yes, frozen** |
+
+`D` = embed_dim = 192 (LeWM default for ViT-Tiny). Two image views share the same ViT encoder (weight sharing). T5-small outputs are projected to D via a learned linear layer.
+
+**Image resolution chain**: Raw LIBERO images are 128×128. The ViT uses `patch_size=14`, which requires the input to be divisible by 14. The dataset transform must **resize 128→224** (matching LeWM's original training resolution of 224×224, where 224/14=16 patches per side). Do NOT feed 128×128 directly to the ViT — it won't divide evenly.
+
+### Unified Transformer Sequence
+
+Training-time input sequence:
 ```
-[z_t, <BOS>, T_1^GT, T_2^GT, ..., T_k^GT, [STATE_QUERY]]
+[l_1, l_2, ..., l_n, z_agent, z_hand, z_proprio, BOS, T_1^GT, T_2^GT, ..., T_k^GT, PAD, ..., PAD]
+ ←── perception prefix (bidirectional) ──→       ←── action tokens (causal) + padding ──→
 ```
-
-Targets (what we supervise):
-- Action positions: next FAST token via shifted teacher forcing (CE loss)
-- `[STATE_QUERY]` position: `z_{t+1}` from encoder (MSE loss). Under chunk-level indexing, `t+1` = one full chunk later = H=10 raw steps. See Temporal Indexing Convention below.
 
 Inference:
 ```
-[z_t, <BOS>] → autoregressively generate T_1, ..., T_k, <EOS>
-→ FAST decode → continuous action chunk → execute on robot
+[l_1, ..., l_n, z_agent, z_hand, z_proprio, BOS] → autoregressively generate T_1, ..., T_k, <EOS>
+→ FAST decode → continuous action chunk (H=10 steps × 7 dims) → execute on robot
 ```
 
 Where:
-- `z_t`: visual latent from encoder (192-dim continuous vector, not a discrete token)
-- `<BOS>`: beginning-of-action-sequence token (id=1024)
-- `T_1...T_k`: FAST action tokens (discrete, vocab=0..1023, variable-length ~20-30 tokens)
-- `<EOS>`: end-of-action-sequence token (id=1025)
-- `[STATE_QUERY]`: learnable embedding, its output is projected to predict `ẑ_{t+1}` (the latent state one chunk = H raw steps later)
+- `l_1...l_n`: language token embeddings from frozen T5-small (variable length, typically 5-15 tokens)
+- `z_agent`: CLS token from ViT encoding of agentview image
+- `z_hand`: CLS token from ViT encoding of eye-in-hand image
+- `z_proprio`: MLP encoding of 8d proprioceptive state: base-frame EE position(3) + EE euler orientation(3) + gripper states(2)
+- `BOS`: beginning-of-action token (id=1024)
+- `T_1...T_k`: FAST action tokens (discrete, vocab=0..1023, variable-length ~20-40 tokens)
+- `PAD`: padding token (id=1026) for variable-length batching
 
-Standard causal mask: each position attends to itself and all positions to its left. Training uses teacher forcing on action token positions.
+### Attention Mask (Training)
+
+**Prefix-bidirectional + action-causal hybrid mask.** Three zones:
+
+```
+           lang  z_ag  z_hd  z_pr  BOS   T_i   PAD
+lang     [  Y     Y     Y     Y     -     -     -  ]
+z_ag     [  Y     Y     Y     Y     -     -     -  ]
+z_hd     [  Y     Y     Y     Y     -     -     -  ]
+z_pr     [  Y     Y     Y     Y     -     -     -  ]
+BOS      [  Y     Y     Y     Y     Y     -     -  ]
+T_i      [  Y     Y     Y     Y     Y    csl    -  ]
+PAD      [  -     -     -     -     -     -     -  ]
+```
+
+Y = can attend, - = blocked, csl = causal (attend to left only within action group)
+
+Rules:
+- **Perception prefix** (lang + z_ag + z_hd + z_pr): fully bidirectional among themselves, cannot see action tokens or PAD
+- **Action tokens** (BOS + T_1...T_k): can see all real prefix tokens, causal within action group (each T_i sees BOS, T_1...T_i but not T_{i+1}...T_k), cannot see PAD
+- **PAD tokens** (both action PAD and language PAD): attend to nothing, no other token attends to them
+- **Language padding**: T5 tokenizer produces variable-length output. Shorter instructions are padded. Language PAD tokens must also be masked out — no real token should attend to them. Use `lang_lengths` to determine which language positions are real.
+
+**Implementation**: Construct explicit `attn_mask = (B, 1, L, L)` bool tensor combining prefix-bidir, action-causal, language-padding, and action-padding rules. Do NOT use `is_causal=True` — it only supports pure causal masks.
+
+Standard causal teacher forcing within action zone: position i's target is the next token (i+1). Each position sees itself (no leak because target is shifted).
+
+### Targets and Loss
+
+**Output and target shapes — read carefully:**
+
+`action_logits` is extracted **only from action-zone positions** (BOS + T_1...T_k + PAD positions), NOT from the full sequence. The prefix positions (lang, z_ag, z_hd, z_pr) do NOT go through `action_head` and do NOT produce logits.
+
+```
+action_logits shape: (B, 1 + max_action_tokens, 1026)
+                          ^ BOS + T_1...T_k + PAD positions only
+
+targets shape:       (B, 1 + max_action_tokens)
+  BOS position:      target = T_1    (first real action token)
+  T_1^GT position:   target = T_2
+  ...
+  T_k^GT position:   target = <EOS>  (id=1025)
+  PAD positions:     target = -100   (ignored by cross_entropy)
+```
+
+Both tensors have the same first two dimensions. No prefix positions appear in either tensor.
+
+**Loss = L_CE only.**
+```python
+L_CE = F.cross_entropy(action_logits.reshape(-1, 1026), targets.reshape(-1), ignore_index=-100)
+```
+
+No L_pred (world model prediction loss). No L_sigreg (anti-collapse regularizer). These may be added back as ablations later.
+
+### Special Tokens
+
+- Vocab 0..1023: FAST action tokens
+- Token 1024: `<BOS>` — beginning of action sequence
+- Token 1025: `<EOS>` — end of action sequence (target for last real action position)
+- Token 1026: `<PAD>` — padding for variable-length batching
+
+`nn.Embedding` size = 1027 (0..1026). `action_head` output size = 1026 (predict 0..1025; PAD is never a prediction target).
 
 ### Temporal Indexing Convention
 
 **CRITICAL — read this before implementing anything.**
 
-All timestep indices in this document use **chunk-level** indexing, not raw environment steps:
+All timestep indices use **chunk-level** indexing, not raw environment steps:
 - `t` = chunk index (NOT raw environment step)
 - `H` = action chunk length in raw environment steps = 10 (1 second at LIBERO's 10Hz)
 - Observation `o_t` = frame at raw step `t * H`
 - Action chunk `a_t` = `[a_{t*H}, a_{t*H+1}, ..., a_{t*H+H-1}]` (10 consecutive raw actions)
 - FAST tokens: `[T_1...T_k]` = `FAST_encode(a_t)` — tokenization of the entire chunk
-- Next observation: `o_{t+1}` = frame at raw step `(t+1) * H` — this is **H=10 raw steps** after `o_t`
-- `[STATE_QUERY]` target: `z_{t+1} = Encoder(o_{t+1})`
 
-**In chunk-level indexing, `z_{t+1}` is NOT one raw control step later — it is one full chunk (H=10 raw steps) later.** The data pipeline must pair each `o_t` with `o_{t+1}` (i.e., raw frames that are H=10 steps apart), not consecutive raw frames.
+Since this baseline has no world model prediction (no STATE_QUERY, no L_pred), we do NOT need a future observation `o_{t+1}`. Each training sample only needs `o_t` (two views + proprio) + `a_t` (action chunk) + language instruction.
+
+### Scope: What This Baseline Does NOT Include
+
+- **No world model prediction**: no STATE_QUERY, no L_pred, no future frame encoding
+- **No SIGReg**: no anti-collapse regularization
+- **No CEM planning**: actions are directly generated via autoregressive decoding
+- **No multi-task training**: one model per LIBERO-Spatial task (language is still used as input, but all samples within a task share the same instruction)
+- **No history context**: single-frame input per view. The original LeWM uses `history_size=3` — do NOT copy this. Each observation is a single timestep (one agentview + one eye_in_hand + one proprio reading). Multi-frame history is a potential follow-up.
 
 ## Development Environment
 
@@ -59,210 +147,157 @@ All timestep indices in this document use **chunk-level** indexing, not raw envi
 # Activate environment
 conda activate vla
 
-# Install LeWM dependencies
+# Install dependencies
 pip install stable-worldmodel[train,env]
+pip install transformers  # for FAST tokenizer + T5-small
 
-# Install FAST tokenizer
-pip install transformers  # for AutoProcessor.from_pretrained("physical-intelligence/fast")
-
-# Train (will be modified)
+# Train
 python train.py data=libero
 
 # Data location
-export STABLEWM_HOME=/path/to/storage  # defaults to ~/.stable-wm/
+export STABLEWM_HOME=/path/to/storage
 ```
-
-**Note on macOS**: `decord` (video decoding library) may not work on macOS. Mac is for development and debugging only — actual training runs on Linux GPU servers.
 
 There are no tests, linting, or CI pipelines in this repository.
 
-## Architecture (Original)
+## Architecture (Original LeWM — for reference)
 
-Four Python files implement the core:
+Four Python files implement the original core:
 
-- **`jepa.py`** — `JEPA` class: full model (encoder, predictor, projectors, action embedder). Key methods: `encode()`, `predict()`, `rollout()`, `criterion()` (planning-time latent cost, NOT training loss), `get_cost()`.
-- **`module.py`** — Neural network building blocks: `SIGReg`, `Attention`, `Block`, `ConditionalBlock` (AdaLN-zero), `Transformer`, `ARPredictor`, `Embedder`, `MLP`.
-- **`train.py`** — Training entry point. Contains `lejepa_forward()` (the actual training step and loss computation). Uses Hydra config, PyTorch Lightning, WandB.
-- **`eval.py`** — Evaluation/planning. CEM or Adam solver in latent space.
+- **`jepa.py`** — `JEPA` class. Key methods: `encode()`, `predict()`, `rollout()`, `criterion()` (planning-time latent cost, NOT training loss), `get_cost()`.
+- **`module.py`** — Building blocks: `SIGReg`, `Attention`, `Block`, `Transformer`, `MLP`, `ARPredictor` (modified for VLA baseline with dual-view, language, proprioception).
+- **`train.py`** — Training entry point. Contains `lejepa_forward()` (training step and loss). Hydra config, PyTorch Lightning.
+- **`eval.py`** — Evaluation/planning (original CEM-based, to be replaced).
 - **`utils.py`** — Image preprocessing, StandardScaler, checkpoint callback.
 
-### Original Data Flow (Training)
+### Already Modified Files (from previous phase)
 
-```
-batch["obs"]    → encoder(ViT) → emb (B, T=4, 192)
-batch["action"] → Embedder     → act_emb (B, T=4, 192)
+The following modifications were made in the first iteration (unified predictor with world model co-training). These will be **further modified** for the new baseline:
 
-ctx_emb = emb[:, :3]       # frames 0,1,2
-ctx_act = act_emb[:, :3]   # actions 0,1,2
-tgt_emb = emb[:, 1:]       # frames 1,2,3
+- `module.py`: Added `ARPredictor`, modified `Attention.forward` and `Block.forward` to accept `attn_mask`
+- `jepa.py`: Modified `JEPA.__init__`, `encode()`, `predict()`, added `predict_actions()`
+- `train.py`: Modified `lejepa_forward()`, model assembly, added `LiberoDataset` import
+- `libero_dataset.py`: New file for LIBERO HDF5 data loading
+- `preprocess_libero.py`: New file for data preprocessing + FAST tokenization
 
-pred_emb = predictor(ctx_emb, ctx_act)  # ARPredictor with ConditionalBlock
+## Modification Plan (New Baseline)
 
-loss = MSE(pred_emb, tgt_emb) + λ * SIGReg(emb)
-```
+### What Changes from Previous Iteration
 
-### Original Action Injection
-
-Action is injected as **external conditioning** via AdaLN-zero in `ConditionalBlock`:
-- `action → Embedder → (B,T,192)` passed as `c` to each ConditionalBlock
-- Each layer: `c → adaLN_modulation → 6 params (shift/scale/gate × attn/mlp)`
-- This modulates LayerNorm outputs, NOT part of the attention sequence
-
-### Original Predictor (ARPredictor)
-
-- Uses `ConditionalBlock` (AdaLN) — action is external conditioning, not in the sequence
-- Causal self-attention (`is_causal=True` in `F.scaled_dot_product_attention`)
-- Input: `x=(B,T,192)` observation embeddings, `c=(B,T,192)` action embeddings
-- Output: `(B,T,192)` predicted next-state embeddings
-
-## Modification Plan
-
-### What Changes
-
-| Component | Original | Modified |
-|-----------|----------|----------|
-| Predictor block | `ConditionalBlock` (AdaLN) | `Block` (standard self-attention) |
-| Action representation | Continuous → `Embedder` → 192d | FAST discrete tokens → `nn.Embedding(1027, 192)` (1024 FAST + BOS + EOS + PAD) |
-| Predictor input | Two separate inputs `(x, c)` | One unified sequence `[z_t, <BOS>, T_1...T_k, STATE_QUERY]` |
-| Action output | None (actions found via CEM) | Classification head `nn.Linear(192, 1026)` on action positions |
-| State output | `pred_proj` on all positions | `pred_proj` on last position only |
-| Training loss | `L_pred + λ*L_sigreg` | `L_CE + α*L_pred + λ*L_sigreg` |
-| Inference | CEM rollout (300 samples × 30 iters) | Autoregressive token generation → FAST decode |
-
-### Special Tokens
-
-- Vocab 0..1023: FAST action tokens
-- Token 1024: `<BOS>` — beginning of action sequence (prepended before T_1)
-- Token 1025: `<EOS>` — end of action sequence (appended after T_k as target for last action position)
-- Token 1026: `<PAD>` — padding token for variable-length batching
-
-`nn.Embedding` size = 1027 (0..1026). `action_head` output size = 1026 (predict 0..1025; PAD is never a prediction target).
-
-### Temporal Indexing Convention
-
-**CRITICAL: `t` is a chunk-level index, NOT a raw environment step.**
-
-LIBERO runs at 10Hz. One action chunk = H=10 raw steps = 1 second. We index by chunks:
-
-```
-Chunk t:
-  observation: o_t          = frame at raw step t*H     (e.g., step 0)
-  action chunk: a_t         = [a_{t*H}, a_{t*H+1}, ..., a_{t*H+H-1}]  (10 raw actions)
-  FAST tokens: T_1...T_k   = FAST(a_t)                 (encodes all 10 raw steps)
-  next observation: o_{t+1} = frame at raw step (t+1)*H (e.g., step 10)
-```
-
-So `z_t = Enc(o_t)` and `z_{t+1} = Enc(o_{t+1})` are **H=10 raw steps apart**. The `[STATE_QUERY]` predicts the latent of the frame AFTER executing the entire action chunk, not just 1 raw control step.
-
-Dataset construction: from a LIBERO trajectory of N raw steps, extract non-overlapping chunk-aligned samples:
-- Chunk t=0: `(frame at raw step 0, actions raw steps 0-9, frame at raw step 10)`
-- Chunk t=1: `(frame at raw step 10, actions raw steps 10-19, frame at raw step 20)`
-- ...
-
-### Unified Sequence Structure (Training)
-
-```
-Position:  0      1      2      ...  k      k+1
-Token:    z_t   <BOS>   T_1^GT ...  T_{k-1}^GT  T_k^GT
-Target:    -     T_1    T_2    ...  T_k     <EOS>     ← CE loss on these
-                                                       
-Position: k+2
-Token:    [STATE_QUERY]    ← learnable embedding
-Target:   z_{t+1}          ← MSE loss (world model: state after executing full chunk)
-         (= Enc(o_{t+1}), one chunk = H=10 raw steps after o_t)
-```
-
-Note: z_t is a continuous 192-dim vector (from encoder), not a discrete token. It gets a type embedding to distinguish it from action tokens.
-
-Note on history context: Original LeWM uses `history_size=3` (encodes frames t-2, t-1, t and feeds all 3 to the predictor). For the initial implementation we start with **single-frame `z_t`** to keep things simple. Extending to multi-frame `z_{t-h+1:t}` (multiple visual tokens at the start of the sequence) is a natural follow-up — the architecture supports it by just prepending more visual tokens with `type_embedding[0]`.
-
-### Attention Mask (Training)
-
-Standard causal: position i attends to positions 0..i **(including itself)**. No information leak because the supervision target at each position is the *next* token (shifted by 1). Concretely:
-- `<BOS>` (pos 1) sees `z_t, <BOS>` → target is `T_1` (next token, not visible)
-- `T_1^GT` (pos 2) sees `z_t, <BOS>, T_1^GT` → target is `T_2` (next token, not visible)
-- `T_i^GT` (pos i+1) sees `z_t, <BOS>, T_1^GT...T_i^GT` → target is `T_{i+1}`
-- `[STATE_QUERY]` (last pos) sees all preceding tokens including all GT action tokens → target is `z_{t+1}`
-
-**Do NOT implement a custom "cannot see self" mask.** Standard causal mask lets each position see itself. When there is NO padding (all sequences same length), use `is_causal=True` in `scaled_dot_product_attention`. When batches have padding, construct an explicit `attn_mask = causal_mask & non_padding_mask` and pass it via the `attn_mask` parameter instead of `is_causal`.
-
-**Padding handling:** Since FAST token sequences are variable-length within a batch, the actual mask is `causal_mask AND non_padding_mask`. Implementation details:
-- `pad_token_id = 1026` (as defined in Special Tokens above)
-- Padding tokens must be masked out in attention so no real token attends to them (including `[STATE_QUERY]`)
-- For CE loss targets, set non-action positions (z_t, STATE_QUERY, padding) to `-100` and use `F.cross_entropy(..., ignore_index=-100)` — this is PyTorch's standard convention
+| Component | Previous | New Baseline |
+|-----------|----------|--------------|
+| Visual input | Single view (agentview only) | **Dual view** (agentview + eye_in_hand), shared ViT |
+| Proprioception | None | **EE pose + ori + gripper (8d) → MLP → D** |
+| Language | None | **T5-small frozen → prefix tokens** |
+| STATE_QUERY | Yes (at end of sequence) | **Removed** |
+| L_pred (MSE) | Yes | **Removed** |
+| L_sigreg | Yes | **Removed** |
+| Loss | L_CE + α*L_pred + λ*L_sigreg | **L_CE only** |
+| Attention mask | Pure causal + padding | **Prefix-bidirectional + action-causal + padding** |
+| Future frame | Encoded for L_pred target | **Not needed** |
+| Logging | WandB | **TensorBoard** |
 
 ### File-by-File Modification Plan
 
-#### `module.py` — Add new components, keep originals
+#### `module.py` — Modify ARPredictor
 
-**Add:**
-- `UnifiedPredictor` class: new predictor using `Block` (not `ConditionalBlock`)
-  - `action_embedding = nn.Embedding(1027, embed_dim)` (1024 FAST + BOS + EOS + PAD)
-  - `type_embedding = nn.Embedding(3, embed_dim)` (0=visual, 1=action, 2=state_query)
-  - `pos_embedding = nn.Parameter(torch.randn(1, max_seq_len, embed_dim))` — learnable positional encoding, where `max_seq_len = 1 + 1 + max_action_tokens + 1` (z_t + BOS + tokens + STATE_QUERY). Set `max_action_tokens=40` as safe upper bound (FAST produces up to ~38 tokens for LIBERO). Truncate to actual sequence length per sample: `x = x + pos_embedding[:, :L]` (same pattern as original `ARPredictor`)
-  - `state_query = nn.Parameter(torch.randn(1, 1, embed_dim))` learnable
-  - `action_head = nn.Linear(embed_dim, 1026)` classification over vocab (0..1025, PAD excluded from targets)
-  - `forward(z_t, action_tokens, action_lengths)` builds unified sequence, applies causal+padding mask
-- Helper: `build_unified_sequence()` — assembles [z_t, BOS, T_1...T_k, STATE_QUERY] with proper embeddings
-- Helper: `build_causal_mask()` — standard causal mask for the unified sequence
+**Modify `ARPredictor`:**
+- Remove `state_query` parameter and all state prediction logic
+- Remove state prediction output from `forward()` — return only `action_logits`
+- Add `proprio_encoder = MLP(8, hidden, embed_dim)` for proprioceptive state encoding
+- Change `type_embedding` from `nn.Embedding(3, D)` to `nn.Embedding(4, D)`: 0=language, 1=visual, 2=proprioception, 3=action
+- Update `pos_embedding` max_seq_len: `max_lang_tokens + 3 + 1 + max_action_tokens` (lang + z_ag/z_hd/z_pr + BOS + tokens). `max_lang_tokens` must be determined by scanning all LIBERO-Spatial instructions through T5 tokenizer first — do NOT hardcode without checking.
+- Modify `forward()` signature: `forward(z_agent, z_hand, z_proprio_raw, lang_embeds, lang_lengths, action_tokens, action_lengths)`
+  1. Encode proprio: `z_proprio = self.proprio_encoder(z_proprio_raw)` → (B, D)
+  2. Build prefix: concat `[lang_embeds + type[0], z_agent + type[1], z_hand + type[1], z_proprio + type[2]]`
+  3. Build action part: `[BOS + type[3], T_1 + type[3], ..., PAD...]`
+  4. Concat prefix + action → full sequence
+  5. Add pos_embedding
+  6. Build hybrid attention mask (prefix-bidir + action-causal + non-padding)
+  7. Run through transformer blocks with attn_mask
+  8. Extract action_logits from BOS+T positions → through action_head
+  9. Return action_logits only
+- Modify `generate()`: start with `[prefix..., BOS]`, autoregressive from there. Prefix uses bidirectional attention, action tokens use causal.
 
-**Keep unchanged:** `SIGReg`, `Attention`, `Block`, `MLP`, `Transformer`, `Embedder` (may be needed for reference or fallback)
+**Keep unchanged:** `Attention` (already supports attn_mask), `Block` (already supports attn_mask), `SIGReg` (keep for potential future ablation), `MLP`, etc.
 
 #### `jepa.py` — Modify JEPA class
 
 **Modify `__init__`:**
-- Replace `action_encoder` (Embedder) with reference to `UnifiedPredictor`'s internal `action_embedding`
-- Add `action_head` reference
-- Keep `encoder`, `projector`, `pred_proj`
-
-**Modify `predict()`:**
-- New signature: `predict(z_t, action_tokens, action_lengths)`
-- Calls `UnifiedPredictor` which returns `(action_logits, state_pred)`
-
-**Add `predict_actions()`:**
-- Autoregressive generation for inference
-- Loop: start with `[z_t, BOS]`, predict T_1, append, predict T_2, ... until EOS or max_len
+- Add `lang_encoder` (T5EncoderModel, frozen)
+- Add `lang_proj = nn.Linear(T5_hidden_dim, embed_dim)` to project T5 outputs to D
+- Remove `pred_proj` (no state prediction)
 
 **Modify `encode()`:**
-- Keep visual encoding unchanged
-- Remove action encoding (no longer done here — action tokens are pre-computed by FAST)
+- Encode both views through shared ViT → `z_agent`, `z_hand`
+- Encode language via frozen T5 → project via `lang_proj` → `lang_embeds`
+- Return `z_agent`, `z_hand`, `lang_embeds`, `lang_lengths`
+- **Proprio is NOT encoded in `encode()`.** Raw 8d proprio vector is passed directly from the batch to `predict()`, which forwards it to `ARPredictor` where the MLP encoding happens. This keeps the MLP inside the predictor module.
 
-**Remove/deprecate:** `rollout()`, `criterion()`, `get_cost()` — these are CEM planning-time components (criterion() computes latent goal-matching cost for MPC, NOT training loss). No longer needed since we use direct autoregressive action generation instead of search-based planning.
+**Modify `predict()`:**
+- New signature: `predict(z_agent, z_hand, proprio, lang_embeds, lang_lengths, action_tokens, action_lengths)`
+- Returns `action_logits` only
+
+**Modify `predict_actions()`:**
+- Include full prefix (lang + visual + proprio) in initial sequence for autoregressive generation
 
 #### `train.py` — Modify training loop
 
 **Modify `lejepa_forward()`:**
-- Load pre-computed FAST tokens from batch: `batch["fast_tokens"]`, `batch["fast_lengths"]`
-- Encode current frame: `z_t = encode(o_t)`, encode next-chunk frame: `z_{t+1} = encode(o_{t+1})` — reminder: `o_{t+1}` is the frame H=10 raw steps after `o_t` (chunk-level indexing, see Temporal Indexing Convention)
-- Call unified predictor: `action_logits, state_pred = model.predict(z_t, fast_tokens_gt, fast_lengths)`
-- Compute losses:
-  - `L_CE = CrossEntropyLoss(action_logits, target_tokens)` (shifted by 1)
-  - `L_pred = MSE(state_pred, z_{t+1})` — NO detach, keep end-to-end gradient flow through encoder (this is core to LeWM's design)
-  - `L_sigreg = SIGReg(embeddings)`
-  - `L_total = L_CE + α * L_pred + λ * L_sigreg`
+- Read from batch: `pixels_agent`, `pixels_hand`, `proprio`, `language`, `fast_tokens`, `fast_lengths`
+- Encode: `z_agent, z_hand, lang_embeds, lang_lengths = model.encode(...)`
+- Call: `action_logits = model.predict(z_agent, z_hand, proprio, lang_embeds, lang_lengths, fast_tokens, fast_lengths)`
+- Build CE targets: shape `(B, 1 + max_action_tokens)` — only action-zone positions. BOS→T_1, T_1→T_2, ..., T_k→EOS, PAD→-100. No prefix positions in this tensor (see "Targets and Loss" section).
+- `L_total = L_CE`
 
-**Add LIBERO data config:** New Hydra YAML for LIBERO dataset with FAST token fields.
+**Remove:** L_pred computation, L_sigreg computation, future frame encoding, SIGReg instance
+
+**TensorBoard logging:**
+- Replace WandB with TensorBoard. Use PyTorch Lightning's built-in `TensorBoardLogger`:
+  ```python
+  from pytorch_lightning.loggers import TensorBoardLogger
+  logger = TensorBoardLogger("tb_logs", name="vla_baseline")
+  ```
+- Log at minimum these scalars per step:
+  - `train/ce_loss` — action token cross-entropy (the only loss)
+  - `train/total_loss` — same as ce_loss in baseline (but separate key for when ablations add more losses)
+  - `train/lr` — learning rate (for schedule debugging)
+  - `train/token_accuracy` — fraction of correctly predicted action tokens (excluding PAD/prefix, useful diagnostic)
+- Log per epoch:
+  - `epoch/ce_loss` — epoch-averaged CE loss
+- View with: `tensorboard --logdir tb_logs`
+
+#### `libero_dataset.py` — Update dataset
+
+- Add second image view (`eye_in_hand_rgb`)
+- Add proprioception: `ee_pos` (3d) + `ee_ori` (3d, euler) + `gripper_states` (2d) = 8d vector
+- Add language instruction (from HDF5 task name or stored attribute)
+- Remove `image_future` (no longer needed)
+
+#### `preprocess_libero.py` — Update preprocessing
+
+- Add extraction of `eye_in_hand_rgb` alongside `agentview_rgb`
+- Add extraction of proprioceptive state (8d): `ee_pos` (3) + `ee_ori` (3, euler) + `gripper_states` (2)
+- Add language instruction per task (stored as string attribute)
+- Remove `image_future` from output
+- **FAST preprocessing rule**: actions MUST be quantile-normalized to [-1, 1] (1st/99th percentile per dim) BEFORE DCT/BPE (FAST paper Section V-B). Verify this is correctly implemented in the preprocessing script. Baseline uses `--fit-tokenizer` to train a LIBERO-Spatial-specific BPE vocabulary (not FAST+ universal).
 
 #### `eval.py` — Rewrite for direct inference
 
-**Replace CEM planning with autoregressive generation:**
-- Load model, encode observation
-- Call `predict_actions(z_t)` → FAST tokens → FAST decode → continuous actions
-- Execute actions in environment
+**The original `eval.py` uses CEM/Adam rollout planning in latent space. This is completely replaced.**
 
-#### New file: `preprocess_libero.py`
+New evaluation flow:
+1. Load trained checkpoint
+2. For each test episode:
+   - Get observation (two views + proprio) + language instruction
+   - Encode all inputs → prefix tokens
+   - Call `model.predict_actions(prefix)` → autoregressive FAST token generation
+   - FAST decode tokens → continuous action chunk (H=10 steps × 7d)
+   - Execute action chunk in LIBERO environment
+   - Repeat until episode ends or max steps
+3. Report success rate per task
 
-**Standalone script (not part of model code):**
-- Load LIBERO demonstrations
-- Normalize actions (1st/99th percentile per dimension)
-- Train FAST BPE tokenizer on LIBERO actions (or use FAST+ universal)
-- Extract chunk-aligned samples from each trajectory (using raw-step indices here for clarity):
-  - `image_current`: observation at raw step `i`
-  - `actions`: H=10 consecutive actions `a_{i}, a_{i+1}, ..., a_{i+H-1}`
-  - `image_future`: observation at raw step `i + H` (10 steps later)
-  - Slide window by H steps: `i = 0, H, 2H, ...` (non-overlapping chunks)
-- Tokenize each action chunk with FAST → save alongside observations in HDF5
-- Each HDF5 sample contains: `image_current`, `image_future`, `fast_tokens` (variable-length), `fast_length`, `continuous_actions` (for reference/debugging)
+Do NOT reuse any of the original `eval.py` planning logic (CEM, Adam solver, latent rollout, goal embedding). The evaluation is now a simple forward-pass policy, not a search-based planner.
 
 ### Hyperparameters (Starting Point)
 
@@ -270,47 +305,45 @@ Standard causal: position i attends to positions 0..i **(including itself)**. No
 |-----------|-------|--------|
 | Action chunk H | 10 steps (1 sec @ 10Hz) | FAST paper recommendation |
 | FAST vocab size | 1024 | FAST paper default |
-| FAST rounding scale γ | 10 | FAST paper default |
-| BPE vocab size | 1024 | FAST paper default |
-| max_action_tokens | 40 | Safe upper bound for FAST on LIBERO (up to ~38 observed) |
-| max_seq_len | 43 | 1(z_t) + 1(BOS) + 40(tokens) + 1(STATE_QUERY) |
-| Embed dim | 192 | LeWM default (ViT-Tiny) |
+| max_action_tokens | 40 | Safe upper bound (up to ~38 observed) |
+| max_lang_tokens | Determine by scanning dataset | Tokenize all LIBERO-Spatial instructions with T5 tokenizer, take max length + small margin. Do NOT hardcode 20 without checking. |
+| Embed dim D | 192 | LeWM default (ViT-Tiny) |
 | Predictor depth | 6 layers | LeWM default |
 | Predictor heads | 16 | LeWM default |
-| L_sigreg weight λ | 0.09 | LeWM default |
-| L_pred weight α | 1.0 | Start here, tune later |
+| T5 variant | t5-small (60M params, frozen) | Standard for VLA |
+| T5 hidden dim | 512 | t5-small config |
+| Proprio input dim | 8 (pos3 + euler_ori3 + gripper2) | LIBERO EE state |
 | Learning rate | From LeWM config | Keep original schedule |
 | Batch size | 128 | LeWM default |
+| Logging | TensorBoard | Advisor requirement |
 
 ### Key Constraints
 
-- **Do NOT detach encoder gradients for L_pred.** Original LeWM trains encoder end-to-end through prediction loss. Keep this behavior — it's core to LeWM's design.
-- **SIGReg applies to encoder outputs (z_t, z_{t+1}), NOT to action token embeddings.** Action tokens are discrete and don't risk collapse.
-- **Action token positions use CE loss; state prediction position uses MSE loss.** These are different heads on the same transformer output.
-- **`criterion()` in original `jepa.py` is the planning-time latent cost (for CEM/MPC), NOT the training loss.** The training loss is computed in `lejepa_forward()` in `train.py`. Do not confuse these two.
-- **Config naming**: Use `chunk_horizon_raw_steps = 10` in new configs for the action chunk length. Do NOT overload the original `frameskip` variable — in the original LeWM code, `frameskip` means "skip N raw frames between encoder observations", which is a different concept from the FAST action chunk length. Keep these two separate to avoid confusion.
-
-### Scope: Language Conditioning
-
-**This version does NOT include language/task conditioning.** LIBERO is a multi-task benchmark with language instructions (e.g. "pick up the red cup"), and standard VLA/WAM formulations condition on language: `p(a_{1:H} | o, l)`. However:
-
-- LeWM is task-agnostic by design — no language input
-- The advisor's requirement is to modify LeWM's predictor, not to build a full VLA
-- Adding language conditioning requires a text encoder + cross-attention or prefix tokens, which is out of scope for the initial implementation
-
-**Initial approach**: Train one model per LIBERO task (single-task), same as how LeWM trains one model per environment (PushT, OGBench, etc.). Language integration (`l` as additional conditioning prefix in the unified sequence) is a natural follow-up after the single-task pipeline is validated. Do NOT add any language/text processing in this phase.
+- **Only L_CE for the baseline.** No world model prediction loss, no SIGReg. These may be added back as ablation experiments later.
+- **T5-small is fully frozen.** Operational rules:
+  1. `lang_encoder.eval()` — always in eval mode, even during training (prevents dropout from firing)
+  2. `for p in lang_encoder.parameters(): p.requires_grad_(False)` — no gradient computation
+  3. Wrap forward pass in `with torch.no_grad():` — saves GPU memory by not storing activations
+  4. Only `lang_proj` (the linear projection layer) is trained
+- **ViT encoder is shared** between agentview and eye_in_hand. Both views go through the same encoder with the same weights.
+- **Proprioception MLP is inside ARPredictor**, not a separate encoder in JEPA. It takes raw 8d input and outputs D-dim embedding.
+- **Attention mask is NOT pure causal.** It is a hybrid prefix-bidirectional + action-causal mask. Must be constructed explicitly as a `(B, 1, L, L)` bool tensor.
+- **Config naming**: Use `chunk_horizon_raw_steps = 10` for the action chunk length. Do NOT overload the original `frameskip` variable.
+- **Single-task training**: One model per LIBERO-Spatial task. Language input is the same for all samples within a task, but the architecture supports multi-task for future extension.
+- **`criterion()` in original `jepa.py` is the planning-time latent cost (for CEM/MPC), NOT the training loss.** The training loss is in `lejepa_forward()` in `train.py`.
 
 ## External Libraries
 
-- **`stable-worldmodel` (`swm`)** — Environment wrappers, planning solvers, evaluation APIs
+- **`stable-worldmodel` (`swm`)** — Environment wrappers, evaluation APIs
 - **`stable-pretraining` (`spt`)** — Training orchestration, dataset loading, ViT backbone
-- **`transformers`** — FAST tokenizer via `AutoProcessor.from_pretrained("physical-intelligence/fast")`
+- **`transformers`** — FAST tokenizer (`AutoProcessor`), T5-small encoder (`T5EncoderModel`)
+- **`torch.utils.tensorboard`** — Loss curve visualization
 
 ## Configuration
 
 Hydra YAML files under `config/`:
 - `config/train/lewm.yaml` — Main training config
-- `config/train/data/*.yaml` — Dataset configs (add `libero.yaml`)
+- `config/train/data/libero.yaml` — LIBERO dataset config
 - `config/eval/*.yaml` — Evaluation configs
 
 ## Key Details
@@ -318,4 +351,4 @@ Hydra YAML files under `config/`:
 - **Data format**: HDF5 files stored under `$STABLEWM_HOME`
 - **FAST tokens**: Pre-computed during preprocessing, stored as variable-length integer sequences in HDF5
 - **Device handling**: Uses `proj.device` (not hardcoded `cuda`)
-- **WandB**: Set `entity` and `project` in config before training
+- **Logging**: TensorBoard (not WandB)

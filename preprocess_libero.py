@@ -13,13 +13,16 @@ This script:
   5. Saves chunk-level samples to a new HDF5 with variable-length token arrays
 
 Output HDF5 layout:
-    image_current      (N, H_img, W_img, 3) uint8   — observation at chunk start
-    image_future       (N, H_img, W_img, 3) uint8   — observation one chunk later
+    image_agent        (N, H_img, W_img, 3) uint8   — agentview at chunk start
+    image_hand         (N, H_img, W_img, 3) uint8   — eye-in-hand at chunk start
+    proprio            (N, 8) float64                 — ee_pos(3)+ee_ori(3)+gripper(2)
     continuous_actions  (N, chunk_size, 7)  float32   — normalized actions
     fast_tokens        (N,) vlen(int32)               — FAST token IDs per chunk
     fast_length        (N,) int32                     — token count per chunk
     demo_idx           (N,) int32                     — source demo index
     chunk_idx          (N,) int32                     — chunk index within demo
+    attrs:
+        language_instruction  str                     — task language description
 
 Usage:
     python preprocess_libero.py \
@@ -27,6 +30,7 @@ Usage:
         --output /path/to/output.h5 \
         --chunk-size 10 \
         --image-key agentview_rgb \
+        --hand-image-key eye_in_hand_rgb \
         --fit-tokenizer \
         --save-tokenizer /path/to/save/dir
 """
@@ -59,7 +63,7 @@ def load_demo_keys(f: h5py.File) -> list[str]:
     return keys
 
 
-def inspect_hdf5(f: h5py.File, image_key: str, demo_keys: list[str]) -> None:
+def inspect_hdf5(f: h5py.File, image_key: str, hand_image_key: str, demo_keys: list[str]) -> None:
     """Print summary of the input HDF5 file and validate required keys."""
     print(f"[Step 1] Inspecting input HDF5 — {len(demo_keys)} demos found")
 
@@ -76,6 +80,12 @@ def inspect_hdf5(f: h5py.File, image_key: str, demo_keys: list[str]) -> None:
             raise ValueError(f"'actions' not found in data/{dk}")
         if "obs" not in demo or image_key not in demo["obs"]:
             raise ValueError(f"'obs/{image_key}' not found in data/{dk}")
+        if "obs" not in demo or hand_image_key not in demo["obs"]:
+            raise ValueError(f"'obs/{hand_image_key}' not found in data/{dk}")
+        # Validate proprioceptive keys
+        for obs_key in ("ee_pos", "ee_ori", "gripper_states"):
+            if obs_key not in demo["obs"]:
+                raise ValueError(f"'obs/{obs_key}' not found in data/{dk}")
 
     # Print trajectory lengths
     lengths = [f[f"data/{dk}/actions"].shape[0] for dk in demo_keys]
@@ -83,7 +93,14 @@ def inspect_hdf5(f: h5py.File, image_key: str, demo_keys: list[str]) -> None:
           f"mean={np.mean(lengths):.1f}, total_steps={sum(lengths)}")
     print(f"  Action dim: {f[f'data/{demo_keys[0]}/actions'].shape[1]}")
     img_shape = f[f"data/{demo_keys[0]}/obs/{image_key}"].shape[1:]
-    print(f"  Image shape: {img_shape} (key='{image_key}')")
+    print(f"  Agentview shape: {img_shape} (key='{image_key}')")
+    hand_shape = f[f"data/{demo_keys[0]}/obs/{hand_image_key}"].shape[1:]
+    print(f"  Hand image shape: {hand_shape} (key='{hand_image_key}')")
+    # Proprio dims
+    ee_pos_dim = f[f"data/{demo_keys[0]}/obs/ee_pos"].shape[1]
+    ee_ori_dim = f[f"data/{demo_keys[0]}/obs/ee_ori"].shape[1]
+    grip_dim = f[f"data/{demo_keys[0]}/obs/gripper_states"].shape[1]
+    print(f"  Proprio: ee_pos({ee_pos_dim}d) + ee_ori({ee_ori_dim}d) + gripper_states({grip_dim}d) = {ee_pos_dim + ee_ori_dim + grip_dim}d")
 
 
 # ---------------------------------------------------------------------------
@@ -149,6 +166,7 @@ def extract_chunks(
     f: h5py.File,
     demo_keys: list[str],
     image_key: str,
+    hand_image_key: str,
     chunk_size: int,
     action_low: np.ndarray,
     action_high: np.ndarray,
@@ -157,9 +175,10 @@ def extract_chunks(
 
     Chunk-level indexing (see CLAUDE.md "Temporal Indexing Convention"):
       - Chunk i uses raw steps [i*H, (i+1)*H - 1] for actions
-      - image_current = frame at raw step i*H
-      - image_future  = frame at raw step (i+1)*H
-      - We need (i+1)*H ≤ T-1, so n_chunks = (T - 1) // H
+      - image_agent = frame at raw step i*H
+      - image_hand  = frame at raw step i*H
+      - proprio     = state at raw step i*H
+      - n_chunks = T // H (no future frame needed)
 
     Returns dict of lists (one entry per chunk sample).
     """
@@ -167,8 +186,9 @@ def extract_chunks(
     print(f"[Step 3] Extracting chunk-aligned samples (H={H}) ...")
 
     samples: dict[str, list] = {
-        "image_current": [],
-        "image_future": [],
+        "image_agent": [],
+        "image_hand": [],
+        "proprio": [],
         "continuous_actions": [],
         "demo_idx": [],
         "chunk_idx": [],
@@ -181,24 +201,22 @@ def extract_chunks(
         actions_raw = f[f"data/{dk}/actions"][()]    # (T, 7)
         T = actions_raw.shape[0]
 
-        # Need at least H+1 steps: H for actions, +1 for the future frame
-        if T < H + 1:
-            print(f"  Skipping {dk}: T={T} < H+1={H + 1}")
-            skipped_demos += 1
-            continue
-
-        # Number of complete chunks: need raw step (i+1)*H to exist (0-indexed),
-        # so (i+1)*H ≤ T-1, giving i ≤ (T-1)/H - 1, hence n_chunks = (T-1)//H
-        n_chunks = (T - 1) // H
+        # Need at least H steps for one complete action chunk
+        n_chunks = T // H
         if n_chunks == 0:
             print(f"  Skipping {dk}: T={T}, yields 0 chunks with H={H}")
             skipped_demos += 1
             continue
 
-        # Load all images for this demo at once (faster than per-frame h5py reads)
-        # Memory: one demo at a time, not all demos simultaneously
-        last_needed_frame = (n_chunks) * H  # highest frame index we'll access
-        images_np = f[f"data/{dk}/obs/{image_key}"][:last_needed_frame + 1]  # (<=T, H_img, W_img, 3)
+        # Load images for this demo (only frames we need)
+        last_needed_frame = (n_chunks - 1) * H  # highest frame index we'll access
+        agent_imgs = f[f"data/{dk}/obs/{image_key}"][:last_needed_frame + 1]
+        hand_imgs = f[f"data/{dk}/obs/{hand_image_key}"][:last_needed_frame + 1]
+
+        # Load proprioceptive state
+        ee_pos = f[f"data/{dk}/obs/ee_pos"][:last_needed_frame + 1]        # (<=T, 3)
+        ee_ori = f[f"data/{dk}/obs/ee_ori"][:last_needed_frame + 1]        # (<=T, 3) euler angles
+        grip_states = f[f"data/{dk}/obs/gripper_states"][:last_needed_frame + 1]  # (<=T, 2)
 
         # Normalize this demo's actions
         actions_norm = normalize_actions(actions_raw, action_low, action_high)
@@ -206,10 +224,18 @@ def extract_chunks(
         for ci in range(n_chunks):
             start = ci * H
             end = start + H           # exclusive for action slice
-            future = (ci + 1) * H     # index of the future frame
 
-            samples["image_current"].append(images_np[start])     # (H_img, W_img, 3) uint8
-            samples["image_future"].append(images_np[future])     # (H_img, W_img, 3) uint8
+            samples["image_agent"].append(agent_imgs[start])   # (H_img, W_img, 3) uint8
+            samples["image_hand"].append(hand_imgs[start])     # (H_img, W_img, 3) uint8
+
+            # Proprio: ee_pos(3) + ee_ori(3, euler) + gripper_states(2) = 8d
+            proprio = np.concatenate([
+                ee_pos[start],              # (3,)
+                ee_ori[start],              # (3,) euler angles
+                grip_states[start],         # (2,) both finger widths
+            ])
+            samples["proprio"].append(proprio)  # (8,) float64
+
             samples["continuous_actions"].append(actions_norm[start:end])  # (H, 7)
             samples["demo_idx"].append(demo_i)
             samples["chunk_idx"].append(ci)
@@ -346,6 +372,22 @@ def tokenize_actions(
 # Step 5: Save to output HDF5
 # ---------------------------------------------------------------------------
 
+def extract_language_instruction(f: h5py.File) -> str:
+    """Extract language instruction from LIBERO HDF5 data attributes.
+
+    Looks for the instruction in data attrs 'problem_info' (JSON with
+    'language_instruction' key), falling back to empty string.
+    """
+    data_attrs = f["data"].attrs
+    if "problem_info" in data_attrs:
+        try:
+            info = json.loads(data_attrs["problem_info"])
+            return info.get("language_instruction", "")
+        except (json.JSONDecodeError, TypeError):
+            pass
+    return ""
+
+
 def save_hdf5(
     output_path: str,
     samples: dict[str, list],
@@ -357,6 +399,7 @@ def save_hdf5(
     image_key: str,
     source_file: str,
     num_demos: int,
+    language_instruction: str = "",
     save_tokenizer_path: str | None = None,
     load_tokenizer_path: str | None = None,
 ) -> None:
@@ -370,18 +413,19 @@ def save_hdf5(
 
     with h5py.File(output_path, "w") as out:
 
-        # --- Images (chunked + compressed) ---
-        img_shape = samples["image_current"][0].shape  # (H_img, W_img, 3)
-        img_current = out.create_dataset(
-            "image_current",
+        # --- Agentview images (chunked + compressed) ---
+        img_shape = samples["image_agent"][0].shape  # (H_img, W_img, 3)
+        ds_agent = out.create_dataset(
+            "image_agent",
             shape=(N, *img_shape),
             dtype=np.uint8,
             chunks=(1, *img_shape),
             compression="gzip",
             compression_opts=4,
         )
-        img_future = out.create_dataset(
-            "image_future",
+        # --- Hand images (chunked + compressed) ---
+        ds_hand = out.create_dataset(
+            "image_hand",
             shape=(N, *img_shape),
             dtype=np.uint8,
             chunks=(1, *img_shape),
@@ -389,8 +433,15 @@ def save_hdf5(
             compression_opts=4,
         )
         for i in range(N):
-            img_current[i] = samples["image_current"][i]
-            img_future[i] = samples["image_future"][i]
+            ds_agent[i] = samples["image_agent"][i]
+            ds_hand[i] = samples["image_hand"][i]
+
+        # --- Proprioception ---
+        out.create_dataset(
+            "proprio",
+            data=np.stack(samples["proprio"], axis=0),  # (N, 8)
+            dtype=np.float64,
+        )
 
         # --- Continuous actions ---
         action_dim = samples["continuous_actions"][0].shape[1]
@@ -423,6 +474,7 @@ def save_hdf5(
         out.attrs["num_demos"] = num_demos
         out.attrs["num_samples"] = N
         out.attrs["action_dim"] = action_dim
+        out.attrs["language_instruction"] = language_instruction
         # Store tokenizer paths separately to avoid overwrite
         if save_tokenizer_path is not None:
             out.attrs["tokenizer_save_path"] = str(Path(save_tokenizer_path).resolve())
@@ -456,6 +508,19 @@ def print_statistics(
     chunks_per_demo = [np.sum(demo_indices == d) for d in unique_demos]
     print(f"  Chunks per demo: min={min(chunks_per_demo)}, max={max(chunks_per_demo)}, "
           f"mean={np.mean(chunks_per_demo):.1f}")
+
+    # --- Proprio stats ---
+    if samples["proprio"]:
+        proprio_all = np.stack(samples["proprio"], axis=0)  # (N, 8)
+        print(f"\n  Proprioception stats (8d):")
+        labels = ["ee_pos_x", "ee_pos_y", "ee_pos_z",
+                  "ee_ori_r", "ee_ori_p", "ee_ori_y",
+                  "grip_l", "grip_r"]
+        for d in range(proprio_all.shape[1]):
+            col = proprio_all[:, d]
+            lbl = labels[d] if d < len(labels) else f"dim{d}"
+            print(f"    {lbl}: min={col.min():.4f}, max={col.max():.4f}, "
+                  f"mean={col.mean():.4f}, std={col.std():.4f}")
 
     # --- Action stats (after normalization) ---
     all_actions = np.stack(samples["continuous_actions"], axis=0)  # (N, H, 7)
@@ -512,7 +577,11 @@ def parse_args() -> argparse.Namespace:
     )
     parser.add_argument(
         "--image-key", default="agentview_rgb",
-        help="Observation image key in the HDF5 (default: agentview_rgb).",
+        help="Agentview image key in the HDF5 (default: agentview_rgb).",
+    )
+    parser.add_argument(
+        "--hand-image-key", default="eye_in_hand_rgb",
+        help="Eye-in-hand image key in the HDF5 (default: eye_in_hand_rgb).",
     )
     parser.add_argument(
         "--fit-tokenizer", action="store_true",
@@ -538,14 +607,19 @@ def main() -> None:
         demo_keys = load_demo_keys(f)
         if not demo_keys:
             sys.exit("ERROR: No demo_* groups found under data/")
-        inspect_hdf5(f, args.image_key, demo_keys)
+        inspect_hdf5(f, args.image_key, args.hand_image_key, demo_keys)
+
+        # Extract language instruction
+        language_instruction = extract_language_instruction(f)
+        print(f"  Language instruction: '{language_instruction}'")
 
         # Step 2: Action normalization stats
         action_low, action_high = compute_action_stats(f, demo_keys)
 
-        # Step 3: Extract chunk-aligned samples
+        # Step 3: Extract chunk-aligned samples (dual-view + proprio)
         samples = extract_chunks(
-            f, demo_keys, args.image_key, args.chunk_size, action_low, action_high,
+            f, demo_keys, args.image_key, args.hand_image_key,
+            args.chunk_size, action_low, action_high,
         )
 
     if not samples["continuous_actions"]:
@@ -569,6 +643,7 @@ def main() -> None:
         image_key=args.image_key,
         source_file=args.input,
         num_demos=len(demo_keys),
+        language_instruction=language_instruction,
         save_tokenizer_path=args.save_tokenizer,
         load_tokenizer_path=args.load_tokenizer,
     )

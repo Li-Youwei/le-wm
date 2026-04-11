@@ -95,6 +95,8 @@ for SUITE in "${SUITES[@]}"; do
                 --input "$hdf5_file" \
                 --output "$out" \
                 --chunk-size "$CHUNK_SIZE" \
+                --image-key agentview_rgb \
+                --hand-image-key eye_in_hand_rgb \
                 --load-tokenizer "$TOKENIZER"
         done
         log "[$SUITE] Preprocessing done"
@@ -110,9 +112,7 @@ for SUITE in "${SUITES[@]}"; do
             data.dataset.hdf5_dir="$PROC_DIR" \
             subdir="" \
             output_model_name=lewm \
-            trainer.max_epochs="$MAX_EPOCHS" \
-            wandb.config.name="lewm_${SUITE}" \
-            wandb.config.project="lewm_libero"
+            trainer.max_epochs="$MAX_EPOCHS"
 
         log "[$SUITE] Training done — checkpoint: $CKPT_PATH"
     fi

@@ -1,5 +1,5 @@
 # =============================================================================
-# LeWM + Unified Action Predictor — Dependencies
+# VLA Baseline (LeWM + Dual-View + T5 Language + Proprio) — Dependencies
 # =============================================================================
 # Python 3.10
 #
@@ -25,6 +25,6 @@ tokenizers>=0.15            # BPE tokenizer training
 #   stable-pretraining (spt): training orchestration, ViT backbone, DataModule
 #   lightning (PyTorch Lightning): Trainer
 #   hydra-core + omegaconf: config management
-#   wandb: experiment logging
 #   torchvision, timm, etc.
 stable-worldmodel[train,env]
+tensorboard>=2.12              # TensorBoard logging (replaces WandB)

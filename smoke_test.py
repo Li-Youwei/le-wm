@@ -1,7 +1,7 @@
-"""End-to-end smoke test for the unified action prediction + world model pipeline.
+"""End-to-end smoke test for the VLA baseline pipeline.
 
 Validates the full pipeline with real preprocessed LIBERO data:
-  LiberoDataset → DataLoader → JEPA(ViT encoder + ARPredictor) → losses → backward
+  LiberoDataset → DataLoader → JEPA(ViT + T5 + ARPredictor) → L_CE → backward
 
 Usage:
     python smoke_test.py --data data/libero_processed/test.h5
@@ -15,7 +15,7 @@ from pathlib import Path
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-from transformers import ViTConfig, ViTModel
+from transformers import T5EncoderModel, ViTConfig, ViTModel
 
 from jepa import JEPA
 from libero_dataset import LiberoDataset
@@ -24,12 +24,11 @@ from module import (
     ARPredictor,
     EOS_TOKEN_ID,
     MLP,
-    SIGReg,
 )
 
 
 def create_model():
-    """Create the full model stack matching train.py / lewm.yaml config."""
+    """Create the full VLA model stack matching train.py config."""
 
     # ViT-Tiny encoder (replaces spt.backbone.utils.vit_hf('tiny', ...))
     vit_config = ViTConfig(
@@ -45,7 +44,7 @@ def create_model():
     hidden_dim = encoder.config.hidden_size  # 192
     embed_dim = 192
 
-    # ARPredictor (matches cfg.predictor from lewm.yaml)
+    # ARPredictor with language + proprio support
     predictor = ARPredictor(
         embed_dim=embed_dim,
         depth=6,
@@ -53,6 +52,8 @@ def create_model():
         dim_head=64,
         mlp_dim=2048,
         max_action_tokens=45,
+        max_lang_tokens=25,
+        proprio_dim=8,
         dropout=0.1,
         emb_dropout=0.0,
     )
@@ -64,48 +65,54 @@ def create_model():
         norm_fn=nn.BatchNorm1d,
     )
 
-    pred_proj = MLP(
-        input_dim=hidden_dim,
-        output_dim=embed_dim,
-        hidden_dim=2048,
-        norm_fn=nn.BatchNorm1d,
-    )
+    # T5-small (frozen)
+    lang_encoder = T5EncoderModel.from_pretrained("t5-small")
+    lang_encoder.eval()
+    for p in lang_encoder.parameters():
+        p.requires_grad_(False)
+
+    lang_proj = nn.Linear(lang_encoder.config.d_model, embed_dim)
 
     model = JEPA(
         encoder=encoder,
         predictor=predictor,
         projector=projector,
-        pred_proj=pred_proj,
+        lang_encoder=lang_encoder,
+        lang_proj=lang_proj,
     )
 
     return model
 
 
-def training_step(model, sigreg, batch, step_idx):
-    """Replicate lejepa_forward logic from train.py."""
-    alpha = 1.0   # pred_weight
-    lambd = 0.09  # sigreg weight
+def training_step(model, batch, step_idx):
+    """Replicate lejepa_forward logic from train.py — L_CE only."""
 
-    # 1. Encode two frames
-    pixels = torch.stack([batch["pixels_current"], batch["pixels_future"]], dim=1)
-    info = {"pixels": pixels}
-    output = model.encode(info)
-    emb = output["emb"]       # (B, 2, D)
-    z_t = emb[:, 0]           # (B, D)
-    z_t1 = emb[:, 1]          # (B, D)
-
-    print(f"  emb.shape           = {emb.shape}")
-
-    # 2. Predict
+    pixels_agent = batch["pixels_agent"]
+    pixels_hand = batch["pixels_hand"]
+    proprio = batch["proprio"]
+    lang_ids = batch["lang_input_ids"]
+    lang_mask = batch["lang_attention_mask"]
     fast_tokens = batch["fast_tokens"]
     fast_lengths = batch["fast_lengths"]
-    action_logits, state_pred = model.predict(z_t, fast_tokens, fast_lengths)
 
+    # 1. Encode
+    z_agent, z_hand, lang_embeds, lang_lengths = model.encode(
+        pixels_agent, pixels_hand, lang_ids, lang_mask,
+    )
+    print(f"  z_agent.shape    = {z_agent.shape}")
+    print(f"  z_hand.shape     = {z_hand.shape}")
+    print(f"  lang_embeds.shape = {lang_embeds.shape}")
+    print(f"  lang_lengths     = {lang_lengths.tolist()}")
+
+    # 2. Predict
+    action_logits = model.predict(
+        z_agent, z_hand, proprio, lang_embeds, lang_lengths,
+        fast_tokens, fast_lengths,
+    )
     print(f"  action_logits.shape = {action_logits.shape}")
-    print(f"  state_pred.shape    = {state_pred.shape}")
 
     # 3. Build CE targets
-    B = z_t.size(0)
+    B = z_agent.size(0)
     num_pos = action_logits.size(1)
     targets = torch.full((B, num_pos), -100, dtype=torch.long)
     for i in range(B):
@@ -113,19 +120,15 @@ def training_step(model, sigreg, batch, step_idx):
         targets[i, :k] = fast_tokens[i, :k]
         targets[i, k] = EOS_TOKEN_ID
 
-    # 4. Losses
+    # 4. L_CE only
     ce_loss = F.cross_entropy(
         action_logits.reshape(-1, ACTION_HEAD_SIZE),
         targets.reshape(-1),
         ignore_index=-100,
     )
-    pred_loss = F.mse_loss(state_pred, z_t1)
-    sigreg_loss = sigreg(emb.transpose(0, 1))
-    total_loss = ce_loss + alpha * pred_loss + lambd * sigreg_loss
+    total_loss = ce_loss
 
     print(f"  ce_loss     = {ce_loss.item():.4f}")
-    print(f"  pred_loss   = {pred_loss.item():.4f}")
-    print(f"  sigreg_loss = {sigreg_loss.item():.4f}")
     print(f"  total_loss  = {total_loss.item():.4f}")
 
     assert torch.isfinite(total_loss), "Loss is not finite!"
@@ -134,23 +137,28 @@ def training_step(model, sigreg, batch, step_idx):
     # 5. Backward
     total_loss.backward()
 
-    # Verify gradients
+    # Verify gradients — trained components should have grads
     grad_checks = {
-        "encoder": model.encoder.embeddings.patch_embeddings.projection.weight,
+        "encoder.patch_embed": model.encoder.embeddings.patch_embeddings.projection.weight,
         "predictor.action_head": model.predictor.action_head.weight,
-        "predictor.state_query": model.predictor.state_query,
+        "predictor.proprio_encoder": model.predictor.proprio_encoder.net[0].weight,
         "projector": model.projector.net[0].weight,
-        "pred_proj": model.pred_proj.net[0].weight,
+        "lang_proj": model.lang_proj.weight,
     }
     for name, param in grad_checks.items():
         assert param.grad is not None, f"No gradient for {name}"
-    print(f"  gradients: all {len(grad_checks)} components OK")
+    print(f"  gradients: all {len(grad_checks)} trained components OK")
+
+    # Verify T5 is frozen — should NOT have gradients
+    for name, param in model.lang_encoder.named_parameters():
+        assert param.grad is None, f"T5 param {name} has gradient (should be frozen)!"
+    print(f"  T5 encoder: confirmed frozen (no gradients)")
 
     return total_loss.item()
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Smoke test for unified LeWM pipeline")
+    parser = argparse.ArgumentParser(description="Smoke test for VLA baseline pipeline")
     parser.add_argument("--data", type=str, required=True, help="Path to preprocessed HDF5 file")
     parser.add_argument("--batch-size", type=int, default=4)
     parser.add_argument("--num-batches", type=int, default=2)
@@ -164,6 +172,7 @@ def main():
     dataset = LiberoDataset(
         hdf5_dir=str(data_path.parent),
         max_action_tokens=45,
+        max_lang_tokens=25,
         img_size=224,
     )
     print(f"Dataset size: {len(dataset)} samples")
@@ -177,16 +186,21 @@ def main():
 
     # Inspect first sample
     sample = dataset[0]
-    print(f"Sample 0: pixels_current={sample['pixels_current'].shape}, "
+    print(f"Sample 0: pixels_agent={sample['pixels_agent'].shape}, "
+          f"pixels_hand={sample['pixels_hand'].shape}, "
+          f"proprio={sample['proprio'].shape}, "
+          f"lang_input_ids={sample['lang_input_ids'].shape}, "
           f"fast_tokens={sample['fast_tokens'].shape}, "
           f"fast_lengths={sample['fast_lengths'].item()}")
 
     # Model
     print("\nCreating model...")
     model = create_model()
-    sigreg = SIGReg()
     total_params = sum(p.numel() for p in model.parameters())
+    trainable_params = sum(p.numel() for p in model.parameters() if p.requires_grad)
     print(f"Total parameters: {total_params:,}")
+    print(f"Trainable parameters: {trainable_params:,}")
+    print(f"Frozen T5 parameters: {total_params - trainable_params:,}")
 
     # ==============================
     # Training forward + backward
@@ -195,15 +209,17 @@ def main():
     print("TRAINING SMOKE TEST")
     print("=" * 60)
     model.train()
+    # Keep T5 in eval mode even during training
+    model.lang_encoder.eval()
 
     for i, batch in enumerate(loader):
         if i >= args.num_batches:
             break
-        print(f"\n--- Batch {i} (B={batch['pixels_current'].size(0)}) ---")
+        print(f"\n--- Batch {i} (B={batch['pixels_agent'].size(0)}) ---")
         print(f"  fast_lengths = {batch['fast_lengths'].tolist()}")
 
         model.zero_grad()
-        training_step(model, sigreg, batch, i)
+        training_step(model, batch, i)
 
     # ==============================
     # Inference (autoregressive)
@@ -214,18 +230,24 @@ def main():
     model.eval()
 
     with torch.no_grad():
-        # Encode a single batch for inference
         batch = next(iter(loader))
-        pixels = batch["pixels_current"]
-        info = {"pixels": pixels.unsqueeze(1)}  # (B, 1, C, H, W) — single frame
-        output = model.encode(info)
-        z_t = output["emb"][:, 0]  # (B, D)
 
-        tokens, lengths = model.predict_actions(z_t, max_len=45, temperature=0.0)
-        print(f"\n  z_t.shape     = {z_t.shape}")
+        # Encode
+        z_agent, z_hand, lang_embeds, lang_lengths = model.encode(
+            batch["pixels_agent"], batch["pixels_hand"],
+            batch["lang_input_ids"], batch["lang_attention_mask"],
+        )
+
+        # Generate actions
+        tokens, lengths = model.predict_actions(
+            z_agent, z_hand, batch["proprio"], lang_embeds, lang_lengths,
+            max_len=45, temperature=0.0,
+        )
+        print(f"\n  z_agent.shape = {z_agent.shape}")
         print(f"  tokens.shape  = {tokens.shape}")
         print(f"  lengths       = {lengths.tolist()}")
-        print(f"  tokens[0,:10] = {tokens[0, :10].tolist()}")
+        if tokens.size(1) > 0:
+            print(f"  tokens[0,:10] = {tokens[0, :min(10, tokens.size(1))].tolist()}")
 
     print("\n" + "=" * 60)
     print("ALL SMOKE TESTS PASSED")
