@@ -253,7 +253,7 @@ def main():
         # Generate actions
         tokens, lengths = model.predict_actions(
             z_agent, z_hand, batch["proprio"], lang_embeds, lang_lengths,
-            max_len=45, temperature=0.0,
+            max_len=100, temperature=0.0,
         )
         print(f"\n  z_agent.shape = {z_agent.shape}")
         print(f"  tokens.shape  = {tokens.shape}")

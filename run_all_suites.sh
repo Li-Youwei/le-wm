@@ -1,6 +1,9 @@
 #!/usr/bin/env bash
 # =============================================================================
-# run_all_suites.sh — Preprocess, train, and evaluate on 4 LIBERO suites
+# run_all_suites.sh — Preprocess, train (per-task), and evaluate on LIBERO suites
+#
+# Single-task training: one model per task (10 models per suite).
+# Each task gets its own checkpoint and is evaluated independently.
 #
 # Usage:
 #   bash run_all_suites.sh                    # run all 4 suites
@@ -68,21 +71,18 @@ for SUITE in "${SUITES[@]}"; do
 
     RAW_DIR="${RAW_ROOT}/${SUITE}"
     PROC_DIR="${PROCESSED_ROOT}/${SUITE}"
-    CKPT_DIR="${DATA_ROOT}/stable-wm/${SUITE}"
-    CKPT_PATH="${CKPT_DIR}/lewm_weights.ckpt"
     EVAL_LOG="${RESULTS_ROOT}/${SUITE}.txt"
 
-    # ---- Step 1: Preprocess ----
+    # ---- Step 1: Preprocess all tasks in this suite ----
     if [ "$EVAL_ONLY" = false ]; then
         log "[$SUITE] Step 1/3: Preprocessing"
         mkdir -p "$PROC_DIR"
 
         for hdf5_file in "${RAW_DIR}"/*.hdf5; do
-            [ -f "$hdf5_file" ] || continue  # skip if no files match
+            [ -f "$hdf5_file" ] || continue
 
-            # Output filename: strip _demo.hdf5 suffix, use .h5
             base=$(basename "$hdf5_file" .hdf5)
-            base="${base%_demo}"  # remove _demo suffix if present
+            base="${base%_demo}"
             out="${PROC_DIR}/${base}.h5"
 
             if [ -f "$out" ]; then
@@ -101,39 +101,81 @@ for SUITE in "${SUITES[@]}"; do
         done
         log "[$SUITE] Preprocessing done"
 
-        # ---- Step 2: Train ----
-        log "[$SUITE] Step 2/3: Training (${MAX_EPOCHS} epochs)"
+        # ---- Step 2: Train per-task (one model per H5 file) ----
+        log "[$SUITE] Step 2/3: Training per-task (${MAX_EPOCHS} epochs each)"
 
-        export STABLEWM_HOME="$CKPT_DIR"
-        mkdir -p "$CKPT_DIR"
+        for h5_file in "${PROC_DIR}"/*.h5; do
+            [ -f "$h5_file" ] || continue
 
-        python train.py \
-            data=libero \
-            data.dataset.hdf5_dir="$PROC_DIR" \
-            subdir="" \
-            output_model_name=lewm \
-            trainer.max_epochs="$MAX_EPOCHS"
+            task_name=$(basename "$h5_file" .h5)
+            task_ckpt_dir="${DATA_ROOT}/stable-wm/${SUITE}/${task_name}"
+            task_ckpt="${task_ckpt_dir}/lewm_weights.ckpt"
 
-        log "[$SUITE] Training done — checkpoint: $CKPT_PATH"
+            if [ -f "$task_ckpt" ]; then
+                log "  Skip (checkpoint exists): ${task_name}"
+                continue
+            fi
+
+            log "  Training: ${task_name}"
+
+            # Create a temp dir with only this one H5 so LiberoDataset loads single task
+            task_data_dir=$(mktemp -d "${PROC_DIR}/.train_${task_name}_XXXXXX")
+            ln -s "$(realpath "$h5_file")" "${task_data_dir}/$(basename "$h5_file")"
+
+            export STABLEWM_HOME="$task_ckpt_dir"
+            mkdir -p "$task_ckpt_dir"
+
+            python train.py \
+                data=libero \
+                data.dataset.hdf5_dir="$task_data_dir" \
+                subdir="" \
+                output_model_name=lewm \
+                trainer.max_epochs="$MAX_EPOCHS" \
+            || err "  Training failed for ${task_name}"
+
+            # Clean up temp dir
+            rm -rf "$task_data_dir"
+
+            log "  Done: ${task_name} → ${task_ckpt}"
+        done
+
+        log "[$SUITE] Per-task training done"
     fi
 
-    # ---- Step 3: Evaluate ----
-    log "[$SUITE] Step 3/3: Evaluating (${NUM_EPISODES} episodes × 10 tasks)"
+    # ---- Step 3: Evaluate per-task ----
+    log "[$SUITE] Step 3/3: Evaluating (${NUM_EPISODES} episodes per task)"
 
-    if [ ! -f "$CKPT_PATH" ]; then
-        err "[$SUITE] Checkpoint not found: $CKPT_PATH — skipping eval"
-        continue
-    fi
+    suite_results=""
+    for h5_file in "${PROC_DIR}"/*.h5; do
+        [ -f "$h5_file" ] || continue
 
-    python eval_libero.py \
-        --checkpoint "$CKPT_PATH" \
-        --tokenizer "$TOKENIZER" \
-        --processed-dir "$PROC_DIR" \
-        --suite "$SUITE" \
-        --num-episodes "$NUM_EPISODES" \
-        --max-steps "$MAX_STEPS" \
-        --device "$DEVICE" \
-        2>&1 | tee "$EVAL_LOG"
+        task_name=$(basename "$h5_file" .h5)
+        task_ckpt="${DATA_ROOT}/stable-wm/${SUITE}/${task_name}/lewm_weights.ckpt"
+
+        if [ ! -f "$task_ckpt" ]; then
+            err "  Checkpoint not found for ${task_name}: ${task_ckpt} — skipping"
+            continue
+        fi
+
+        log "  Evaluating: ${task_name}"
+
+        # eval_libero.py with --processed-dir pointing to a temp dir with one H5
+        task_eval_dir=$(mktemp -d "${PROC_DIR}/.eval_${task_name}_XXXXXX")
+        ln -s "$(realpath "$h5_file")" "${task_eval_dir}/$(basename "$h5_file")"
+
+        python eval_libero.py \
+            --checkpoint "$task_ckpt" \
+            --tokenizer "$TOKENIZER" \
+            --processed-dir "$task_eval_dir" \
+            --suite "$SUITE" \
+            --num-episodes "$NUM_EPISODES" \
+            --max-steps "$MAX_STEPS" \
+            --device "$DEVICE" \
+            2>&1 | tee -a "$EVAL_LOG" \
+        || err "  Eval failed for ${task_name}"
+
+        rm -rf "$task_eval_dir"
+    done
 
     log "[$SUITE] Eval results saved to: $EVAL_LOG"
 done
@@ -143,7 +185,6 @@ log "Results:"
 for SUITE in "${SUITES[@]}"; do
     log_file="${RESULTS_ROOT}/${SUITE}.txt"
     if [ -f "$log_file" ]; then
-        # Print the last "Overall:" line from each log
         overall=$(grep "Overall:" "$log_file" 2>/dev/null | tail -1)
         log "  $SUITE: ${overall:-no results}"
     fi
