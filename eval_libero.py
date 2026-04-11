@@ -90,7 +90,7 @@ def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device
     prefixed with "model." (e.g. "model.encoder.xxx"). We strip that prefix.
     T5 encoder is loaded separately (from pretrained), so we skip those keys.
     """
-    ckpt = torch.load(ckpt_path, map_location=device, weights_only=False)
+    ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     state_dict = ckpt["state_dict"]
 
     # Strip "model." prefix from spt.Module wrapper
@@ -373,16 +373,18 @@ def main():
         )
         init_states = task_suite.get_task_init_states(task_id)
 
-        successes, n_eps = evaluate_task(
-            model, processor, t5_tokenizer, env, init_states,
-            action_low, action_high, chunk_size, action_dim,
-            language_instruction,
-            num_episodes=args.num_episodes,
-            max_steps=args.max_steps,
-            device=device,
-            temperature=args.temperature,
-        )
-        env.close()
+        try:
+            successes, n_eps = evaluate_task(
+                model, processor, t5_tokenizer, env, init_states,
+                action_low, action_high, chunk_size, action_dim,
+                language_instruction,
+                num_episodes=args.num_episodes,
+                max_steps=args.max_steps,
+                device=device,
+                temperature=args.temperature,
+            )
+        finally:
+            env.close()
 
         rate = successes / n_eps * 100
         results[task_id] = {"name": task_name, "success": successes, "total": n_eps, "rate": rate}

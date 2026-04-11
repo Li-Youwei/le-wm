@@ -170,8 +170,9 @@ def main():
     # If user passed a file, create a temp symlink dir so LiberoDataset loads only that file.
     # LiberoDataset expects a directory and loads ALL .h5/.hdf5 inside it.
     if data_path.is_file():
-        import tempfile
+        import atexit, shutil, tempfile
         tmp_dir = tempfile.mkdtemp(prefix="smoke_test_")
+        atexit.register(shutil.rmtree, tmp_dir, ignore_errors=True)
         link_path = Path(tmp_dir) / data_path.name
         link_path.symlink_to(data_path.resolve())
         hdf5_dir = tmp_dir

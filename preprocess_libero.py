@@ -664,8 +664,7 @@ def main() -> None:
     # Do NOT silently truncate; raise an error so max_action_tokens can be increased.
     max_observed = max(len(t) for t in tokens_list)
     print(f"  Max observed token length: {max_observed}")
-    if hasattr(args, "max_action_tokens") and args.max_action_tokens is not None:
-        if max_observed > args.max_action_tokens:
+    if args.max_action_tokens is not None and max_observed > args.max_action_tokens:
             sys.exit(
                 f"ERROR: max observed FAST token length ({max_observed}) exceeds "
                 f"max_action_tokens ({args.max_action_tokens}). Increase max_action_tokens "
