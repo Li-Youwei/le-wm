@@ -25,7 +25,7 @@ RESULTS_ROOT="${DATA_ROOT}/eval_results"
 SUITES=("libero_spatial" "libero_object" "libero_goal" "libero_10")
 NUM_EPISODES=20
 MAX_STEPS=300
-CHUNK_SIZE=10
+CHUNK_SIZE=20
 MAX_EPOCHS=100
 DEVICE="cuda"
 

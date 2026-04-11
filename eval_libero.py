@@ -61,7 +61,7 @@ def build_model(device: torch.device) -> torch.nn.Module:
     embed_dim = 192
 
     predictor = ARPredictor(
-        embed_dim=embed_dim, max_action_tokens=45, max_lang_tokens=25,
+        embed_dim=embed_dim, max_action_tokens=100, max_lang_tokens=25,
         proprio_dim=8,
         depth=6, heads=16, dim_head=64, mlp_dim=2048, dropout=0.1, emb_dropout=0.0,
     )
@@ -186,7 +186,8 @@ def preprocess_obs(
     # Proprioception: ee_pos(3) + ee_quat(4) + gripper(1) = 8d
     ee_pos = obs["robot0_eef_pos"]          # (3,)
     ee_quat = obs["robot0_eef_quat"]        # (4,) quaternion
-    gripper = obs["robot0_gripper_qpos"][:1]  # (1,) first finger width
+    grip_2d = obs["robot0_gripper_qpos"]    # (2,) two finger widths
+    gripper = np.array([np.mean(np.abs(grip_2d))])  # (1,) mean of 2 fingers
     proprio_raw = np.concatenate([ee_pos, ee_quat, gripper])  # (8,)
     proprio_np = normalize_proprio(proprio_raw)  # re-normalize quaternion
     proprio = torch.from_numpy(proprio_np).float().unsqueeze(0).to(device)

@@ -69,7 +69,7 @@ class LiberoDataset(Dataset):
     def __init__(
         self,
         hdf5_dir: str,
-        max_action_tokens: int = 45,
+        max_action_tokens: int = 100,
         max_lang_tokens: int = 25,
         img_size: int = 224,
     ):

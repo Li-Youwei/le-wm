@@ -212,7 +212,7 @@ class ARPredictor(nn.Module):
         heads: int = 16,
         dim_head: int = 64,
         mlp_dim: int = 2048,
-        max_action_tokens: int = 45,
+        max_action_tokens: int = 100,
         max_lang_tokens: int = 25,
         proprio_dim: int = 8,
         dropout: float = 0.1,

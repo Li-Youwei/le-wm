@@ -28,7 +28,7 @@ Usage:
     python preprocess_libero.py \
         --input /path/to/LIBERO_task_demo.hdf5 \
         --output /path/to/output.h5 \
-        --chunk-size 10 \
+        --chunk-size 20 \
         --image-key agentview_rgb \
         --hand-image-key eye_in_hand_rgb \
         --fit-tokenizer \
@@ -231,8 +231,13 @@ def extract_chunks(
         agent_imgs = f[f"data/{dk}/obs/{image_key}"][:last_needed_frame + 1]
         hand_imgs = f[f"data/{dk}/obs/{hand_image_key}"][:last_needed_frame + 1]
 
-        # Load robot_states for proprio: [grip0, grip1, ee_pos(3), ee_quat(4)]
+        # Load proprio sources:
+        #   ee_pos from obs/ee_pos (3d)
+        #   ee_quat from robot_states[5:9] (4d) — NOT obs/ee_ori which is euler
+        #   gripper from mean(obs/gripper_states) (1d) — mean of 2 symmetric fingers
+        ee_pos = f[f"data/{dk}/obs/ee_pos"][:last_needed_frame + 1]          # (<=T, 3)
         robot_states = f[f"data/{dk}/robot_states"][:last_needed_frame + 1]  # (<=T, 9)
+        grip_states = f[f"data/{dk}/obs/gripper_states"][:last_needed_frame + 1]  # (<=T, 2)
 
         # Normalize this demo's actions
         actions_norm = normalize_actions(actions_raw, action_low, action_high)
@@ -244,12 +249,11 @@ def extract_chunks(
             samples["image_agent"].append(agent_imgs[start])   # (H_img, W_img, 3) uint8
             samples["image_hand"].append(hand_imgs[start])     # (H_img, W_img, 3) uint8
 
-            # Proprio: ee_pos(3) + ee_quat(4) + gripper(1) = 8d from robot_states
-            rs = robot_states[start]
+            # Proprio: obs/ee_pos(3) + robot_states[5:9] quat(4) + mean(gripper_states)(1) = 8d
             proprio_raw = np.concatenate([
-                rs[2:5],    # ee_pos (3d)
-                rs[5:9],    # ee_quat (4d)
-                rs[0:1],    # gripper (1d, first finger width)
+                ee_pos[start],                                    # (3,) from obs/ee_pos
+                robot_states[start, 5:9],                         # (4,) quaternion from robot_states
+                [np.mean(np.abs(grip_states[start]))],            # (1,) mean of 2 finger widths
             ])
             samples["proprio"].append(normalize_proprio(proprio_raw))  # (8,) float64
 
@@ -589,8 +593,8 @@ def parse_args() -> argparse.Namespace:
         help="Path for the output HDF5 file.",
     )
     parser.add_argument(
-        "--chunk-size", type=int, default=10,
-        help="Action chunk length H in raw env steps (default: 10 = 1s at 10Hz).",
+        "--chunk-size", type=int, default=20,
+        help="Action chunk length H in raw env steps (default: 20 = 1s at 20Hz).",
     )
     parser.add_argument(
         "--image-key", default="agentview_rgb",
@@ -599,6 +603,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--hand-image-key", default="eye_in_hand_rgb",
         help="Eye-in-hand image key in the HDF5 (default: eye_in_hand_rgb).",
+    )
+    parser.add_argument(
+        "--max-action-tokens", type=int, default=None,
+        help="Assert that no token sequence exceeds this length. If None, skip assertion.",
     )
     parser.add_argument(
         "--fit-tokenizer", action="store_true",
@@ -651,6 +659,18 @@ def main() -> None:
         save_tokenizer_path=args.save_tokenizer,
         load_tokenizer_path=args.load_tokenizer,
     )
+
+    # Token length assertion (CRITICAL — see CLAUDE.md)
+    # Do NOT silently truncate; raise an error so max_action_tokens can be increased.
+    max_observed = max(len(t) for t in tokens_list)
+    print(f"  Max observed token length: {max_observed}")
+    if hasattr(args, "max_action_tokens") and args.max_action_tokens is not None:
+        if max_observed > args.max_action_tokens:
+            sys.exit(
+                f"ERROR: max observed FAST token length ({max_observed}) exceeds "
+                f"max_action_tokens ({args.max_action_tokens}). Increase max_action_tokens "
+                f"in config and rerun."
+            )
 
     # Step 5: Save output HDF5
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)

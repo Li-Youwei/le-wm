@@ -51,7 +51,7 @@ def create_model():
         heads=16,
         dim_head=64,
         mlp_dim=2048,
-        max_action_tokens=45,
+        max_action_tokens=100,
         max_lang_tokens=25,
         proprio_dim=8,
         dropout=0.1,
@@ -182,7 +182,7 @@ def main():
 
     dataset = LiberoDataset(
         hdf5_dir=hdf5_dir,
-        max_action_tokens=45,
+        max_action_tokens=100,
         max_lang_tokens=25,
         img_size=224,
     )

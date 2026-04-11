@@ -31,8 +31,9 @@ Do NOT re-add any of these components unless explicitly instructed. If you find 
 **Image resolution chain**: Raw LIBERO images are 128×128. The ViT uses `patch_size=14`, which requires the input to be divisible by 14. The dataset transform must **resize 128→224** (matching LeWM's original training resolution of 224×224, where 224/14=16 patches per side). Do NOT feed 128×128 directly to the ViT — it won't divide evenly.
 
 **Proprioception normalization rules:**
-- **Quaternion**: Re-normalize `ee_ori` to unit length before feeding to MLP: `q = q / (||q|| + 1e-8)`. LIBERO simulator outputs should already be unit quaternions, but this is a defensive safeguard against numerical drift.
-- **Gripper state**: LIBERO/robosuite uses `[-1, 1]` convention (-1=open, 1=closed). Verify by printing `gripper_states.min()` and `gripper_states.max()` during preprocessing. If the actual range differs, document it and adjust.
+- **Source keys**: `obs/ee_pos` (3d position) + `robot_states[5:9]` (4d quaternion) + `mean(obs/gripper_states)` (1d, average of two symmetric fingers). Do NOT use `obs/ee_ori` — that is Euler angles (3d), not quaternion.
+- **Quaternion**: Re-normalize to unit length before feeding to MLP: `q = q / (||q|| + 1e-8)`. LIBERO simulator outputs should already be unit quaternions, but this is a defensive safeguard against numerical drift.
+- **Gripper state**: `obs/gripper_states` is (T, 2) — two symmetric finger positions (positive and negative). Take `mean(abs(gripper_states), dim=-1)` or just `gripper_states[:, 0]` to get a single scalar. The range is approximately [0.002, 0.04] (finger joint position), NOT [-1, 1]. Verify during preprocessing and document the actual range.
 - **Consistency rule**: Define a single `normalize_proprio(raw_8d)` function in preprocessing. Dataset loading and eval must both call this same function — do NOT re-implement normalization logic separately in each file.
 
 ### Unified Transformer Sequence
@@ -46,7 +47,7 @@ Training-time input sequence:
 Inference:
 ```
 [l_1, ..., l_n, z_agent, z_hand, z_proprio, BOS] → autoregressively generate T_1, ..., T_k, <EOS>
-→ FAST decode → continuous action chunk (H=10 steps × 7 dims) → execute on robot
+→ FAST decode → continuous action chunk (H=20 steps × 7 dims) → execute on robot
 ```
 
 **Inference decoding rules (must be followed exactly):**
@@ -61,7 +62,7 @@ Where:
 - `z_hand`: CLS token from ViT encoding of eye-in-hand image
 - `z_proprio`: MLP encoding of 8d proprioceptive state: base-frame EE position(3) + base-frame EE orientation quaternion(4) + gripper state(1)
 - `BOS`: beginning-of-action token (id=1024)
-- `T_1...T_k`: FAST action tokens (discrete, vocab=0..1023, variable-length ~20-40 tokens)
+- `T_1...T_k`: FAST action tokens (discrete, vocab=0..1023, variable-length. With H=20, token count is TBD — must be determined by preprocessing. Previous H=10 produced ~20-40 tokens; H=20 will likely produce significantly more)
 - `PAD`: padding token (id=1026) for variable-length batching
 
 ### Attention Mask (Training)
@@ -133,9 +134,9 @@ No L_pred (world model prediction loss). No L_sigreg (anti-collapse regularizer)
 
 All timestep indices use **chunk-level** indexing, not raw environment steps:
 - `t` = chunk index (NOT raw environment step)
-- `H` = action chunk length in raw environment steps = 10 (1 second at LIBERO's 10Hz)
+- `H` = action chunk length in raw environment steps = 20 (1 second at LIBERO's 20Hz control frequency)
 - Observation `o_t` = frame at raw step `t * H`
-- Action chunk `a_t` = `[a_{t*H}, a_{t*H+1}, ..., a_{t*H+H-1}]` (10 consecutive raw actions)
+- Action chunk `a_t` = `[a_{t*H}, a_{t*H+1}, ..., a_{t*H+H-1}]` (20 consecutive raw actions)
 - FAST tokens: `[T_1...T_k]` = `FAST_encode(a_t)` — tokenization of the entire chunk
 
 Since this baseline has no world model prediction (no STATE_QUERY, no L_pred), we do NOT need a future observation `o_{t+1}`. Each training sample only needs `o_t` (two views + proprio) + `a_t` (action chunk) + language instruction.
@@ -281,15 +282,15 @@ The following modifications were made in the first iteration (unified predictor 
 #### `libero_dataset.py` — Update dataset
 
 - Add second image view (`eye_in_hand_rgb`)
-- Add proprioception: `ee_pos` (3d) + `ee_ori` (4d) + `gripper_states` (1d) = 8d vector
-- Add language instruction: use the `language_instruction` attribute stored in each LIBERO HDF5 demo (this is a natural-language sentence, e.g. "pick up the red mug and place it on the plate"). Do NOT use the HDF5 filename, task ID, or internal key name as the language input — these are formatted strings (e.g. `KITCHEN_SCENE10_close_the_top_drawer...`) that T5 was not trained on, and will degrade language encoding quality. If `language_instruction` is not available, construct the canonical sentence manually (strip scene prefix, replace underscores with spaces, verify readability).
+- Add proprioception: `obs/ee_pos` (3d) + `robot_states[5:9]` (4d quaternion) + `mean(obs/gripper_states)` (1d) = 8d vector. Do NOT use `obs/ee_ori` (that is Euler, not quaternion).
+- Add language instruction: extract from `data.attrs["problem_info"]` (JSON string, parse and read the `"language_instruction"` key). Example: `"pick up the black bowl in the top drawer of the wooden cabinet and place it on the plate"`. Do NOT use the HDF5 filename, task ID, or internal key name as the language input — these are formatted strings (e.g. `KITCHEN_SCENE10_close_the_top_drawer...`) that T5 was not trained on, and will degrade language encoding quality.
 - Remove `image_future` (no longer needed)
 
 #### `preprocess_libero.py` — Update preprocessing
 
 - Add extraction of `eye_in_hand_rgb` alongside `agentview_rgb`
-- Add extraction of proprioceptive state (8d): `ee_pos` (3) + `ee_ori` (4) + `gripper_states` (1)
-- Add language instruction per task (stored as string attribute). Use the `language_instruction` attribute from the HDF5, NOT the filename or task ID. Store one canonical instruction string per task in the output HDF5.
+- Add extraction of proprioceptive state (8d): `obs/ee_pos` (3) + `robot_states[5:9]` quaternion (4) + `mean(obs/gripper_states)` (1). Do NOT use `obs/ee_ori` (Euler angles).
+- Add language instruction per task: parse `data.attrs["problem_info"]` JSON, extract `"language_instruction"` value. Store one canonical instruction string per task in the output HDF5.
 - Remove `image_future` from output
 - **FAST preprocessing rule**: actions MUST be quantile-normalized to [-1, 1] (1st/99th percentile per dim) BEFORE DCT/BPE (FAST paper Section V-B). Verify this is correctly implemented in the preprocessing script. Baseline uses `--fit-tokenizer` to train a LIBERO-Spatial-specific BPE vocabulary (not FAST+ universal).
 - **Token length assertion (CRITICAL)**: After preprocessing the full training set, `assert max(fast_length) <= max_action_tokens`. If this fails, the script must raise an error and print the actual max length — then `max_action_tokens` and `pos_embedding` `max_seq_len` must be increased accordingly. Do NOT silently truncate sequences that exceed the limit. Silent truncation causes training to appear normal while quietly destroying action quality — this is the hardest kind of bug to find.
@@ -304,7 +305,7 @@ New evaluation flow:
    - Get observation (two views + proprio) + language instruction
    - Encode all inputs → prefix tokens
    - Call `model.predict_actions(prefix)` → autoregressive FAST token generation
-   - FAST decode tokens → continuous action chunk (H=10 steps × 7d)
+   - FAST decode tokens → continuous action chunk (H=20 steps × 7d)
    - Execute action chunk in LIBERO environment
    - Repeat until episode ends or max steps
 3. Report success rate per task
@@ -315,9 +316,9 @@ Do NOT reuse any of the original `eval.py` planning logic (CEM, Adam solver, lat
 
 | Parameter | Value | Source |
 |-----------|-------|--------|
-| Action chunk H | 10 steps (1 sec @ 10Hz) | FAST paper recommendation |
+| Action chunk H | 20 steps (1 sec @ 20Hz) | FAST paper recommends 1 sec; LIBERO control_freq=20Hz |
 | FAST vocab size | 1024 | FAST paper default |
-| max_action_tokens | 40 | Safe upper bound (up to ~38 observed) |
+| max_action_tokens | TBD after preprocessing | H=20 produces longer token sequences than H=10. Run preprocessing on full dataset, take max observed length + small margin. The token length assertion in preprocessing will catch if this is set too low. |
 | max_lang_tokens | Determine by scanning dataset | Tokenize all LIBERO-Spatial instructions with T5 tokenizer, take max length + small margin. Do NOT hardcode 20 without checking. |
 | Embed dim D | 192 | LeWM default (ViT-Tiny) |
 | Predictor depth | 6 layers | LeWM default |
@@ -340,7 +341,7 @@ Do NOT reuse any of the original `eval.py` planning logic (CEM, Adam solver, lat
 - **ViT encoder is shared** between agentview and eye_in_hand. Both views go through the same encoder with the same weights.
 - **Proprioception MLP is inside UnifiedPredictor**, not a separate encoder in JEPA. It takes raw 8d input and outputs D-dim embedding.
 - **Attention mask is NOT pure causal.** It is a hybrid prefix-bidirectional + action-causal mask. Must be constructed explicitly as a `(B, 1, L, L)` bool tensor.
-- **Config naming**: Use `chunk_horizon_raw_steps = 10` for the action chunk length. Do NOT overload the original `frameskip` variable.
+- **Config naming**: Use `chunk_horizon_raw_steps = 20` for the action chunk length (1 second at LIBERO's 20Hz). Do NOT overload the original `frameskip` variable.
 - **Single-task training**: One model per LIBERO-Spatial task. Language input is the same for all samples within a task, but the architecture supports multi-task for future extension.
 - **`criterion()` in original `jepa.py` is the planning-time latent cost (for CEM/MPC), NOT the training loss.** The training loss is in `lejepa_forward()` in `train.py`.
 

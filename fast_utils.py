@@ -66,7 +66,7 @@ def fast_decode(
         token_ids: (B, max_len) FAST token IDs from generate().
         lengths: (B,) real token count per sample.
         processor: FAST processor from load_fast_processor().
-        time_horizon: action chunk length in raw steps (H=10 for LIBERO).
+        time_horizon: action chunk length in raw steps (H=20 for LIBERO at 20Hz).
         action_dim: action dimensionality (7 for LIBERO: 6D EE + gripper).
 
     Returns:
