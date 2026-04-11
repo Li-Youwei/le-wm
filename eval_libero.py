@@ -104,12 +104,18 @@ def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device
             model_sd[new_key] = v
 
     missing, unexpected = model.load_state_dict(model_sd, strict=False)
-    # Filter expected missing keys (T5 encoder)
+    # T5 encoder keys are expected to be missing (loaded from pretrained)
     real_missing = [k for k in missing if not k.startswith("lang_encoder.")]
     if real_missing:
-        print(f"WARNING: missing keys: {real_missing}")
+        raise RuntimeError(
+            f"Checkpoint missing {len(real_missing)} non-T5 keys — model architecture "
+            f"likely does not match checkpoint. Missing: {real_missing[:10]}"
+        )
     if unexpected:
-        print(f"WARNING: unexpected keys: {unexpected}")
+        raise RuntimeError(
+            f"Checkpoint has {len(unexpected)} unexpected keys — model architecture "
+            f"likely does not match checkpoint. Unexpected: {unexpected[:10]}"
+        )
     print(f"Loaded checkpoint from {ckpt_path} ({len(model_sd)} keys)")
 
 

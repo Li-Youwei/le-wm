@@ -103,11 +103,29 @@ def run(cfg):
         img_size=cfg.data.dataset.get("img_size", cfg.img_size),
     )
 
-    n_train = int(len(dataset) * cfg.train_split)
-    n_val = len(dataset) - n_train
-    train_set, val_set = torch.utils.data.random_split(
-        dataset, [n_train, n_val], generator=rnd_gen,
-    )
+    # Demo-level split: avoid leaking chunks from the same demo into both train and val.
+    # Read demo_idx per file (not per sample) for efficiency.
+    import h5py as _h5py
+    demo_ids = []
+    prev_file = None
+    _demo_arr = None
+    for fpath, local_idx in dataset._index:
+        if fpath != prev_file:
+            with _h5py.File(fpath, "r") as _f:
+                _demo_arr = _f["demo_idx"][()]
+            prev_file = fpath
+        demo_ids.append(int(_demo_arr[local_idx]))
+
+    unique_demos = sorted(set(demo_ids))
+    n_train_demos = int(len(unique_demos) * cfg.train_split)
+    perm = torch.randperm(len(unique_demos), generator=rnd_gen).tolist()
+    train_demo_set = set(unique_demos[perm[i]] for i in range(n_train_demos))
+
+    train_indices = [i for i, d in enumerate(demo_ids) if d in train_demo_set]
+    val_indices = [i for i, d in enumerate(demo_ids) if d not in train_demo_set]
+
+    train_set = torch.utils.data.Subset(dataset, train_indices)
+    val_set = torch.utils.data.Subset(dataset, val_indices)
 
     train = torch.utils.data.DataLoader(train_set, **cfg.loader, shuffle=True, drop_last=True, generator=rnd_gen)
     val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
