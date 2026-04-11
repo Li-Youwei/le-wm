@@ -167,10 +167,21 @@ def main():
     data_path = Path(args.data)
     assert data_path.exists(), f"Data file not found: {data_path}"
 
-    # Dataset & DataLoader
-    print(f"Loading dataset from {data_path}")
+    # If user passed a file, create a temp symlink dir so LiberoDataset loads only that file.
+    # LiberoDataset expects a directory and loads ALL .h5/.hdf5 inside it.
+    if data_path.is_file():
+        import tempfile
+        tmp_dir = tempfile.mkdtemp(prefix="smoke_test_")
+        link_path = Path(tmp_dir) / data_path.name
+        link_path.symlink_to(data_path.resolve())
+        hdf5_dir = tmp_dir
+        print(f"Loading single file: {data_path} (via temp dir)")
+    else:
+        hdf5_dir = str(data_path)
+        print(f"Loading all files from directory: {data_path}")
+
     dataset = LiberoDataset(
-        hdf5_dir=str(data_path.parent),
+        hdf5_dir=hdf5_dir,
         max_action_tokens=45,
         max_lang_tokens=25,
         img_size=224,

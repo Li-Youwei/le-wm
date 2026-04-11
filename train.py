@@ -1,4 +1,3 @@
-import os
 from functools import partial
 from pathlib import Path
 
@@ -9,12 +8,12 @@ import stable_worldmodel as swm
 import torch
 import torch.nn.functional as F
 from lightning.pytorch.loggers import TensorBoardLogger
-from omegaconf import OmegaConf, open_dict
+from omegaconf import OmegaConf
 from transformers import T5EncoderModel
 
 from jepa import JEPA
 from module import ARPredictor, MLP, ACTION_HEAD_SIZE, EOS_TOKEN_ID
-from utils import get_column_normalizer, get_img_preprocessor, ModelObjectCallBack
+from utils import ModelObjectCallBack
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -89,50 +88,26 @@ def run(cfg):
     #########################
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
-    is_libero = cfg.data.dataset.get("name", "") == "libero"
 
     # Single source of truth for max_action_tokens and max_lang_tokens
     max_action_tokens = cfg.data.dataset.get("max_action_tokens", 45)
     max_lang_tokens = cfg.data.dataset.get("max_lang_tokens", 25)
     proprio_dim = cfg.data.dataset.get("proprio_dim", 8)
 
-    if is_libero:
-        from libero_dataset import LiberoDataset
+    from libero_dataset import LiberoDataset
 
-        dataset = LiberoDataset(
-            hdf5_dir=cfg.data.dataset.hdf5_dir,
-            max_action_tokens=max_action_tokens,
-            max_lang_tokens=max_lang_tokens,
-            img_size=cfg.data.dataset.get("img_size", cfg.img_size),
-        )
+    dataset = LiberoDataset(
+        hdf5_dir=cfg.data.dataset.hdf5_dir,
+        max_action_tokens=max_action_tokens,
+        max_lang_tokens=max_lang_tokens,
+        img_size=cfg.data.dataset.get("img_size", cfg.img_size),
+    )
 
-        n_train = int(len(dataset) * cfg.train_split)
-        n_val = len(dataset) - n_train
-        train_set, val_set = torch.utils.data.random_split(
-            dataset, [n_train, n_val], generator=rnd_gen,
-        )
-
-    else:
-        # Original path for PushT, OGBench, etc.
-        dataset = swm.data.HDF5Dataset(**cfg.data.dataset, transform=None)
-        transforms = [get_img_preprocessor(source='pixels', target='pixels', img_size=cfg.img_size)]
-
-        with open_dict(cfg):
-            for col in cfg.data.dataset.keys_to_load:
-                if col.startswith("pixels"):
-                    continue
-
-                normalizer = get_column_normalizer(dataset, col, col)
-                transforms.append(normalizer)
-
-                setattr(cfg.wm, f"{col}_dim", dataset.get_dim(col))
-
-        transform = spt.data.transforms.Compose(*transforms)
-        dataset.transform = transform
-
-        train_set, val_set = spt.data.random_split(
-            dataset, lengths=[cfg.train_split, 1 - cfg.train_split], generator=rnd_gen
-        )
+    n_train = int(len(dataset) * cfg.train_split)
+    n_val = len(dataset) - n_train
+    train_set, val_set = torch.utils.data.random_split(
+        dataset, [n_train, n_val], generator=rnd_gen,
+    )
 
     train = torch.utils.data.DataLoader(train_set, **cfg.loader, shuffle=True, drop_last=True, generator=rnd_gen)
     val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)

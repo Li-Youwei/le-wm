@@ -180,5 +180,5 @@ class LiberoDataset(Dataset):
         }
 
     def __del__(self):
-        for f in self._open_files.values():
+        for f in getattr(self, "_open_files", {}).values():
             f.close()
