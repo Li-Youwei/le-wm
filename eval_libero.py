@@ -7,17 +7,17 @@ and language instruction as input.
 Usage:
     # Single task
     python eval_libero.py \
-        --checkpoint /data/lyl/stable-wm/lewm_weights.ckpt \
-        --tokenizer /data/lyl/fast_tokenizer \
-        --processed-dir /data/lyl/libero_processed/libero_90 \
+        --checkpoint /Data/lyw/stable-wm/lewm_weights.ckpt \
+        --tokenizer /Data/lyw/fast_tokenizer \
+        --processed-dir /Data/lyw/libero_processed/libero_90 \
         --suite libero_spatial --task-id 0 \
         --num-episodes 20
 
     # All tasks in a suite
     python eval_libero.py \
-        --checkpoint /data/lyl/stable-wm/lewm_weights.ckpt \
-        --tokenizer /data/lyl/fast_tokenizer \
-        --processed-dir /data/lyl/libero_processed/libero_90 \
+        --checkpoint /Data/lyw/stable-wm/lewm_weights.ckpt \
+        --tokenizer /Data/lyw/fast_tokenizer \
+        --processed-dir /Data/lyw/libero_processed/libero_90 \
         --suite libero_spatial \
         --num-episodes 20
 """

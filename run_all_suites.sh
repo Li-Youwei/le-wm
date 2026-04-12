@@ -19,7 +19,7 @@ set -euo pipefail
 
 # ----------------------------- Configuration ---------------------------------
 RAW_ROOT="/nas_data_new/caz/data_ssd/libero"
-DATA_ROOT="/data/lyl"
+DATA_ROOT="/Data/lyw"
 TOKENIZER="${DATA_ROOT}/fast_tokenizer"
 
 PROCESSED_ROOT="${DATA_ROOT}/libero_processed"
