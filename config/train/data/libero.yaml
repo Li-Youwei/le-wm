@@ -1,6 +1,6 @@
 dataset:
   name: libero
-  hdf5_dir: ${oc.env:STABLEWM_HOME,~/.stable-wm}/libero
+  hdf5_dir: ${oc.env:STABLEWM_HOME}/libero
   max_action_tokens: 80
   max_lang_tokens: 25
   img_size: 224
