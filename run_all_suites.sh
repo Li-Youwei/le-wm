@@ -97,7 +97,7 @@ for SUITE in "${SUITES[@]}"; do
                 --chunk-size "$CHUNK_SIZE" \
                 --image-key agentview_rgb \
                 --hand-image-key eye_in_hand_rgb \
-                --max-action-tokens 100 \
+                --max-action-tokens 80 \
                 --load-tokenizer "$TOKENIZER"
         done
         log "[$SUITE] Preprocessing done"

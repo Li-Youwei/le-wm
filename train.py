@@ -90,7 +90,7 @@ def run(cfg):
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
 
     # Single source of truth for max_action_tokens and max_lang_tokens
-    max_action_tokens = cfg.data.dataset.get("max_action_tokens", 100)
+    max_action_tokens = cfg.data.dataset.get("max_action_tokens", 80)
     max_lang_tokens = cfg.data.dataset.get("max_lang_tokens", 25)
     proprio_dim = cfg.data.dataset.get("proprio_dim", 8)
 

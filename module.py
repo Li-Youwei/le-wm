@@ -212,7 +212,7 @@ class ARPredictor(nn.Module):
         heads: int = 16,
         dim_head: int = 64,
         mlp_dim: int = 2048,
-        max_action_tokens: int = 100,
+        max_action_tokens: int = 80,
         max_lang_tokens: int = 25,
         proprio_dim: int = 8,
         dropout: float = 0.1,
@@ -432,7 +432,7 @@ class ARPredictor(nn.Module):
         z_proprio_raw: torch.Tensor,
         lang_embeds: torch.Tensor,
         lang_lengths: torch.Tensor,
-        max_len: int = 100,
+        max_len: int = 80,
         temperature: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Autoregressively generate FAST action tokens.

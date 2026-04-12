@@ -61,7 +61,7 @@ def build_model(device: torch.device) -> torch.nn.Module:
     embed_dim = 192
 
     predictor = ARPredictor(
-        embed_dim=embed_dim, max_action_tokens=100, max_lang_tokens=25,
+        embed_dim=embed_dim, max_action_tokens=80, max_lang_tokens=25,
         proprio_dim=8,
         depth=6, heads=16, dim_head=64, mlp_dim=2048, dropout=0.1, emb_dropout=0.0,
     )

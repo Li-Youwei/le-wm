@@ -51,7 +51,7 @@ def create_model():
         heads=16,
         dim_head=64,
         mlp_dim=2048,
-        max_action_tokens=100,
+        max_action_tokens=80,
         max_lang_tokens=25,
         proprio_dim=8,
         dropout=0.1,
@@ -183,7 +183,7 @@ def main():
 
     dataset = LiberoDataset(
         hdf5_dir=hdf5_dir,
-        max_action_tokens=100,
+        max_action_tokens=80,
         max_lang_tokens=25,
         img_size=224,
     )
@@ -253,7 +253,7 @@ def main():
         # Generate actions
         tokens, lengths = model.predict_actions(
             z_agent, z_hand, batch["proprio"], lang_embeds, lang_lengths,
-            max_len=100, temperature=0.0,
+            max_len=80, temperature=0.0,
         )
         print(f"\n  z_agent.shape = {z_agent.shape}")
         print(f"  tokens.shape  = {tokens.shape}")

@@ -91,7 +91,7 @@ class JEPA(nn.Module):
         )
 
     def predict_actions(self, z_agent, z_hand, proprio, lang_embeds, lang_lengths,
-                        max_len=100, temperature=0.0):
+                        max_len=80, temperature=0.0):
         """Inference: autoregressively generate FAST action tokens.
 
         Returns:
