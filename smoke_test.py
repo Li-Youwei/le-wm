@@ -110,7 +110,7 @@ def print_vram(tag: str) -> None:
         return
     alloc = torch.cuda.memory_allocated() / 1024**3
     reserved = torch.cuda.memory_reserved() / 1024**3
-    total = torch.cuda.get_device_properties(0).total_mem / 1024**3
+    total = torch.cuda.get_device_properties(0).total_memory / 1024**3
     print(f"  [VRAM {tag}] allocated={alloc:.2f}GB, reserved={reserved:.2f}GB, total={total:.2f}GB")
 
 
@@ -279,7 +279,7 @@ def vram_profile(model: JEPA, dataset: LiberoDataset, device: torch.device) -> N
             loss.backward()
 
             peak = torch.cuda.max_memory_allocated() / 1024**3
-            total = torch.cuda.get_device_properties(0).total_mem / 1024**3
+            total = torch.cuda.get_device_properties(0).total_memory / 1024**3
             status = "OK" if peak < total * 0.95 else "TIGHT"
             print(f"  batch_size={bs:>4d}: peak VRAM = {peak:.2f}GB / {total:.2f}GB  [{status}]")
 
@@ -307,7 +307,7 @@ def main() -> None:
     print(f"Device: {device}")
     if device.type == "cuda":
         gpu_name = torch.cuda.get_device_name(0)
-        total_gb = torch.cuda.get_device_properties(0).total_mem / 1024**3
+        total_gb = torch.cuda.get_device_properties(0).total_memory / 1024**3
         print(f"GPU: {gpu_name} ({total_gb:.1f}GB)")
 
     data_path = Path(args.data)
