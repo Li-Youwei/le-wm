@@ -33,6 +33,11 @@ import numpy as np
 import torch
 from transformers import T5EncoderModel, T5Tokenizer
 
+try:
+    import imageio.v3 as iio
+except ImportError:
+    iio = None
+
 os.environ.setdefault("MUJOCO_GL", "egl")
 
 from libero.libero import benchmark, get_libero_path
@@ -246,6 +251,10 @@ def evaluate_task(
     max_lang_tokens: int = 25,
     device: torch.device = torch.device("cuda"),
     temperature: float = 0.0,
+    save_videos: bool = False,
+    video_dir: str | None = None,
+    task_name: str = "",
+    max_video_episodes: int = 3,
 ) -> tuple[int, int]:
     """Run episodes and count successes."""
     successes = 0
@@ -261,6 +270,12 @@ def evaluate_task(
         env.reset()
         init_idx = ep % len(init_states)
         obs = env.set_init_state(init_states[init_idx])
+
+        # Collect frames for video (first N episodes only)
+        recording = save_videos and ep < max_video_episodes
+        frames: list[np.ndarray] = []
+        if recording:
+            frames.append(obs["agentview_image"])
 
         reward = 0
         done = False
@@ -287,16 +302,48 @@ def evaluate_task(
             # Execute chunk (H steps)
             for h in range(chunk_size):
                 obs, reward, done, info_env = env.step(actions_raw[0, h])
+                if recording:
+                    frames.append(obs["agentview_image"])
                 if done:
                     break
             if done:
                 break
 
-        if reward > 0:
+        success = reward > 0
+        if success:
             successes += 1
-        print(f"  Episode {ep}: {'SUCCESS' if reward > 0 else 'FAIL'}")
+        print(f"  Episode {ep}: {'SUCCESS' if success else 'FAIL'}")
+
+        # Save video
+        if recording and frames and video_dir is not None:
+            _save_video(frames, video_dir, task_name, ep, success)
 
     return successes, num_episodes
+
+
+def _save_video(
+    frames: list[np.ndarray],
+    video_dir: str,
+    task_name: str,
+    episode_id: int,
+    success: bool,
+) -> None:
+    """Save collected frames as an mp4 video."""
+    if iio is None:
+        print("    [WARN] imageio not installed, skipping video save")
+        return
+
+    os.makedirs(video_dir, exist_ok=True)
+    # Sanitize task name for filename
+    safe_name = task_name.replace(" ", "_").replace("/", "_")
+    tag = "success" if success else "fail"
+    filename = f"{safe_name}_ep{episode_id}_{tag}.mp4"
+    filepath = os.path.join(video_dir, filename)
+
+    # Stack frames: LIBERO obs images are (H, W, 3) uint8
+    video = np.stack(frames, axis=0)
+    iio.imwrite(filepath, video, fps=20, codec="h264")
+    print(f"    Saved video: {filepath} ({len(frames)} frames)")
 
 
 # ---------------------------------------------------------------------------
@@ -321,7 +368,13 @@ def main():
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--temperature", type=float, default=0.0, help="0=greedy, >0=sampling")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--save-videos", action="store_true", help="Save rollout videos for first 3 episodes per task")
+    parser.add_argument("--video-dir", type=str, default="/Data/lyw/eval_videos", help="Directory to save videos")
+    parser.add_argument("--max-video-episodes", type=int, default=3, help="Max episodes per task to record")
     args = parser.parse_args()
+
+    if args.save_videos and iio is None:
+        raise ImportError("imageio required for --save-videos: pip install imageio imageio-ffmpeg")
 
     device = torch.device(args.device)
     np.random.seed(args.seed)
@@ -391,6 +444,10 @@ def main():
                 max_steps=args.max_steps,
                 device=device,
                 temperature=args.temperature,
+                save_videos=args.save_videos,
+                video_dir=args.video_dir,
+                task_name=task_name,
+                max_video_episodes=args.max_video_episodes,
             )
         finally:
             env.close()
