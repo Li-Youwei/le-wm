@@ -35,7 +35,7 @@ from transformers import T5EncoderModel, T5Tokenizer
 
 os.environ.setdefault("MUJOCO_GL", "egl")
 
-from libero.libero import benchmark
+from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
 from fast_utils import denormalize_actions, fast_decode, load_fast_processor
@@ -371,9 +371,12 @@ def main():
         language_instruction = load_language_instruction(h5_path)
         print(f"  Language: '{language_instruction}'")
 
-        # Create environment
+        # Create environment — task.bddl_file is just a filename, need full path
+        bddl_path = os.path.join(
+            get_libero_path("bddl_files"), args.suite, task.bddl_file,
+        )
         env = OffScreenRenderEnv(
-            bddl_file_name=task.bddl_file,
+            bddl_file_name=bddl_path,
             camera_heights=args.camera_size,
             camera_widths=args.camera_size,
         )
