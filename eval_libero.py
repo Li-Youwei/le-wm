@@ -52,8 +52,15 @@ from preprocess_libero import normalize_proprio
 # Model loading
 # ---------------------------------------------------------------------------
 
-def build_model(device: torch.device) -> torch.nn.Module:
-    """Build the JEPA model with the same architecture as train.py."""
+def build_model(device: torch.device, use_language: bool = True) -> torch.nn.Module:
+    """Build the JEPA model with the same architecture as train.py.
+
+    Args:
+        device: target device.
+        use_language: must match the training-time setting. When False, the
+            T5 encoder and language projection are omitted, and the predictor
+            runs on a vision+proprio-only prefix.
+    """
     import stable_pretraining as spt
 
     from jepa import JEPA
@@ -73,13 +80,17 @@ def build_model(device: torch.device) -> torch.nn.Module:
     projector = MLP(input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048,
                     norm_fn=torch.nn.BatchNorm1d)
 
-    # T5-small (frozen)
-    lang_encoder = T5EncoderModel.from_pretrained("t5-small")
-    lang_encoder.eval()
-    for p in lang_encoder.parameters():
-        p.requires_grad_(False)
-
-    lang_proj = torch.nn.Linear(lang_encoder.config.d_model, embed_dim)
+    if use_language:
+        # T5-small (frozen)
+        lang_encoder = T5EncoderModel.from_pretrained("t5-small")
+        lang_encoder.eval()
+        for p in lang_encoder.parameters():
+            p.requires_grad_(False)
+        lang_proj = torch.nn.Linear(lang_encoder.config.d_model, embed_dim)
+    else:
+        print("[Ablation] use_language=False — evaluating with vision+proprio only.")
+        lang_encoder = None
+        lang_proj = None
 
     model = JEPA(
         encoder=encoder, predictor=predictor, projector=projector,
@@ -98,6 +109,8 @@ def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     state_dict = ckpt["state_dict"]
 
+    has_lang_module = getattr(model, "lang_encoder", None) is not None
+
     # Strip "model." prefix from spt.Module wrapper
     model_sd = {}
     for k, v in state_dict.items():
@@ -105,6 +118,9 @@ def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device
             new_key = k.removeprefix("model.")
             # Skip T5 encoder keys (loaded from pretrained)
             if new_key.startswith("lang_encoder."):
+                continue
+            # In no-language mode the model has no lang_proj — skip any residual keys
+            if not has_lang_module and new_key.startswith("lang_proj."):
                 continue
             model_sd[new_key] = v
 
@@ -236,7 +252,7 @@ def tokenize_language(
 def evaluate_task(
     model: torch.nn.Module,
     processor,
-    t5_tokenizer: T5Tokenizer,
+    t5_tokenizer: T5Tokenizer | None,
     env: OffScreenRenderEnv,
     init_states: list,
     action_low: np.ndarray,
@@ -255,15 +271,20 @@ def evaluate_task(
     video_dir: str | None = None,
     task_name: str = "",
     max_video_episodes: int = 3,
+    use_language: bool = True,
 ) -> tuple[int, int]:
     """Run episodes and count successes."""
     successes = 0
     max_chunks = max_steps // chunk_size
 
-    # Pre-tokenize language instruction (same for all episodes)
-    lang_ids, lang_mask = tokenize_language(
-        language_instruction, t5_tokenizer, max_lang_tokens, device,
-    )
+    # Pre-tokenize language instruction (same for all episodes); skipped in no-language mode.
+    if use_language:
+        assert t5_tokenizer is not None, "t5_tokenizer required when use_language=True"
+        lang_ids, lang_mask = tokenize_language(
+            language_instruction, t5_tokenizer, max_lang_tokens, device,
+        )
+    else:
+        lang_ids, lang_mask = None, None
 
     for ep in range(num_episodes):
         # Reset with deterministic initial state
@@ -363,25 +384,32 @@ def main():
                         help="Single task index (0-9). Omit to run all tasks in suite")
     parser.add_argument("--num-episodes", type=int, default=20, help="Episodes per task")
     parser.add_argument("--max-steps", type=int, default=300, help="Max raw steps per episode")
-    parser.add_argument("--camera-size", type=int, default=256,
-                        help="LIBERO camera resolution (env render size)")
+    parser.add_argument("--camera-size", type=int, default=128,
+                        help="LIBERO camera resolution (env render size). "
+                             "Must match the resolution of images stored in preprocessed "
+                             "training HDF5 (LIBERO default: 128).")
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument("--temperature", type=float, default=0.0, help="0=greedy, >0=sampling")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-videos", action="store_true", help="Save rollout videos for first 3 episodes per task")
     parser.add_argument("--video-dir", type=str, default="/Data/lyw/eval_videos", help="Directory to save videos")
     parser.add_argument("--max-video-episodes", type=int, default=3, help="Max episodes per task to record")
+    parser.add_argument("--no-language", action="store_true",
+                        help="Ablation: evaluate a model trained without the language instruction. "
+                             "Must match the checkpoint's training-time use_language setting.")
     args = parser.parse_args()
 
     if args.save_videos and iio is None:
         raise ImportError("imageio required for --save-videos: pip install imageio imageio-ffmpeg")
+
+    use_language = not args.no_language
 
     device = torch.device(args.device)
     np.random.seed(args.seed)
 
     # Load model
     print("Loading model...")
-    model = build_model(device)
+    model = build_model(device, use_language=use_language)
     load_checkpoint(model, args.checkpoint, device)
     model.eval()
 
@@ -389,8 +417,8 @@ def main():
     print(f"Loading FAST tokenizer from {args.tokenizer}")
     processor = load_fast_processor(args.tokenizer)
 
-    # Load T5 tokenizer for language
-    t5_tokenizer = T5Tokenizer.from_pretrained("t5-small")
+    # Load T5 tokenizer for language (skipped in no-language mode)
+    t5_tokenizer = T5Tokenizer.from_pretrained("t5-small") if use_language else None
 
     # Get task suite
     task_suite = benchmark.get_benchmark_dict()[args.suite]()
@@ -448,6 +476,7 @@ def main():
                 video_dir=args.video_dir,
                 task_name=task_name,
                 max_video_episodes=args.max_video_episodes,
+                use_language=use_language,
             )
         finally:
             env.close()

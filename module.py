@@ -251,7 +251,7 @@ class ARPredictor(nn.Module):
     def _build_attn_mask(
         self,
         n_lang: int,
-        lang_lengths: torch.Tensor,
+        lang_lengths: torch.Tensor | None,
         action_tokens: torch.Tensor,
         L: int,
         device: torch.device,
@@ -259,8 +259,8 @@ class ARPredictor(nn.Module):
         """Build hybrid prefix-bidirectional + action-causal attention mask.
 
         Args:
-            n_lang: number of language token positions (max_lang_tokens).
-            lang_lengths: (B,) real language token count per sample.
+            n_lang: number of language token positions (0 when language disabled).
+            lang_lengths: (B,) real language token count per sample, or None when n_lang==0.
             action_tokens: (B, max_action_tokens) with PAD_TOKEN_ID for padding.
             L: total sequence length.
             device: target device.
@@ -277,9 +277,11 @@ class ARPredictor(nn.Module):
         # --- Determine which positions are real (not padding) ---
         is_real = torch.zeros(B, L, dtype=torch.bool, device=device)
 
-        # Language: real if position < lang_lengths[b]
-        lang_pos = pos[:n_lang].unsqueeze(0).expand(B, -1)  # (B, n_lang)
-        is_real[:, :n_lang] = lang_pos < lang_lengths.unsqueeze(1)
+        # Language: real if position < lang_lengths[b] (skipped when no language)
+        if n_lang > 0:
+            assert lang_lengths is not None, "lang_lengths required when n_lang > 0"
+            lang_pos = pos[:n_lang].unsqueeze(0).expand(B, -1)  # (B, n_lang)
+            is_real[:, :n_lang] = lang_pos < lang_lengths.unsqueeze(1)
 
         # z_agent, z_hand, z_proprio: always real
         is_real[:, n_lang:n_prefix] = True
@@ -318,7 +320,8 @@ class ARPredictor(nn.Module):
     def _build_generate_mask(
         self,
         n_lang: int,
-        lang_lengths: torch.Tensor,
+        lang_lengths: torch.Tensor | None,
+        B: int,
         L: int,
         device: torch.device,
     ) -> torch.Tensor:
@@ -328,17 +331,20 @@ class ARPredictor(nn.Module):
             [lang..., z_ag, z_hd, z_pr, BOS, T_1, T_2, ...]
         All action tokens are real (no PAD), but language may still have padding.
 
+        When n_lang == 0 the language block is skipped entirely.
+
         Returns: (B, 1, L, L) bool mask.
         """
-        B = lang_lengths.size(0)
         n_prefix = n_lang + 3
         pos = torch.arange(L, device=device)
 
         # Real positions: language real + visual/proprio always real + all action real
         is_real = torch.ones(B, L, dtype=torch.bool, device=device)
-        # Mask out language padding
-        lang_pos = pos[:n_lang].unsqueeze(0).expand(B, -1)
-        is_real[:, :n_lang] = lang_pos < lang_lengths.unsqueeze(1)
+        # Mask out language padding (skipped when no language)
+        if n_lang > 0:
+            assert lang_lengths is not None, "lang_lengths required when n_lang > 0"
+            lang_pos = pos[:n_lang].unsqueeze(0).expand(B, -1)
+            is_real[:, :n_lang] = lang_pos < lang_lengths.unsqueeze(1)
 
         in_prefix = pos < n_prefix  # (L,)
 
@@ -362,8 +368,8 @@ class ARPredictor(nn.Module):
         z_agent: torch.Tensor,
         z_hand: torch.Tensor,
         z_proprio_raw: torch.Tensor,
-        lang_embeds: torch.Tensor,
-        lang_lengths: torch.Tensor,
+        lang_embeds: torch.Tensor | None,
+        lang_lengths: torch.Tensor | None,
         action_tokens: torch.Tensor,
         action_lengths: torch.Tensor,
     ) -> torch.Tensor:
@@ -373,8 +379,9 @@ class ARPredictor(nn.Module):
             z_agent: (B, D) agentview visual latent from encoder.
             z_hand: (B, D) eye-in-hand visual latent from encoder.
             z_proprio_raw: (B, 8) raw proprioceptive state (ee_pos3 + ee_quat4 + gripper1).
-            lang_embeds: (B, max_lang_tokens, D) projected language embeddings.
-            lang_lengths: (B,) real language token count per sample.
+            lang_embeds: (B, max_lang_tokens, D) projected language embeddings,
+                or None for language-ablation runs.
+            lang_lengths: (B,) real language token count per sample, or None.
             action_tokens: (B, max_action_tokens) FAST token ids padded with PAD_TOKEN_ID.
             action_lengths: (B,) number of real FAST tokens per sample.
 
@@ -383,18 +390,21 @@ class ARPredictor(nn.Module):
         """
         B = z_agent.size(0)
         device = z_agent.device
-        n_lang = lang_embeds.size(1)
+        n_lang = lang_embeds.size(1) if lang_embeds is not None else 0
 
         # 1. Encode proprioception
         z_proprio = self.proprio_encoder(z_proprio_raw)  # (B, D)
 
         # 2. Build prefix embeddings with type embeddings
-        lang_prefix = lang_embeds + self.type_embedding.weight[0]  # (B, n_lang, D)
         vis_agent = z_agent.unsqueeze(1) + self.type_embedding.weight[1]  # (B, 1, D)
         vis_hand = z_hand.unsqueeze(1) + self.type_embedding.weight[1]   # (B, 1, D)
         proprio_emb = z_proprio.unsqueeze(1) + self.type_embedding.weight[2]  # (B, 1, D)
 
-        prefix = torch.cat([lang_prefix, vis_agent, vis_hand, proprio_emb], dim=1)  # (B, n_lang+3, D)
+        if lang_embeds is not None:
+            lang_prefix = lang_embeds + self.type_embedding.weight[0]  # (B, n_lang, D)
+            prefix = torch.cat([lang_prefix, vis_agent, vis_hand, proprio_emb], dim=1)  # (B, n_lang+3, D)
+        else:
+            prefix = torch.cat([vis_agent, vis_hand, proprio_emb], dim=1)  # (B, 3, D)
 
         # 3. Build action embeddings (BOS + action tokens) with type embedding
         bos = torch.full((B, 1), BOS_TOKEN_ID, dtype=torch.long, device=device)
@@ -430,14 +440,15 @@ class ARPredictor(nn.Module):
         z_agent: torch.Tensor,
         z_hand: torch.Tensor,
         z_proprio_raw: torch.Tensor,
-        lang_embeds: torch.Tensor,
-        lang_lengths: torch.Tensor,
+        lang_embeds: torch.Tensor | None,
+        lang_lengths: torch.Tensor | None,
         max_len: int = 80,
         temperature: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Autoregressively generate FAST action tokens.
 
         Sequence grows as [lang..., z_ag, z_hd, z_pr, BOS, T_1, T_2, ...]
+        (language segment absent when lang_embeds is None).
         Prefix uses bidirectional attention, action tokens use causal.
         Stops at EOS or max_len.
 
@@ -447,15 +458,19 @@ class ARPredictor(nn.Module):
         """
         B = z_agent.size(0)
         device = z_agent.device
-        n_lang = lang_embeds.size(1)
+        n_lang = lang_embeds.size(1) if lang_embeds is not None else 0
 
         # 1. Build prefix embeddings (same as forward)
         z_proprio = self.proprio_encoder(z_proprio_raw)
-        lang_prefix = lang_embeds + self.type_embedding.weight[0]
         vis_agent = z_agent.unsqueeze(1) + self.type_embedding.weight[1]
         vis_hand = z_hand.unsqueeze(1) + self.type_embedding.weight[1]
         proprio_emb = z_proprio.unsqueeze(1) + self.type_embedding.weight[2]
-        prefix = torch.cat([lang_prefix, vis_agent, vis_hand, proprio_emb], dim=1)
+
+        if lang_embeds is not None:
+            lang_prefix = lang_embeds + self.type_embedding.weight[0]
+            prefix = torch.cat([lang_prefix, vis_agent, vis_hand, proprio_emb], dim=1)
+        else:
+            prefix = torch.cat([vis_agent, vis_hand, proprio_emb], dim=1)
 
         # 2. BOS token
         bos_ids = torch.full((B, 1), BOS_TOKEN_ID, dtype=torch.long, device=device)
@@ -472,7 +487,7 @@ class ARPredictor(nn.Module):
             x = seq + self.pos_embedding[:, :L]
 
             # Build generate-time mask (prefix bidir, action causal, no PAD)
-            attn_mask = self._build_generate_mask(n_lang, lang_lengths, L, device)
+            attn_mask = self._build_generate_mask(n_lang, lang_lengths, B, L, device)
 
             for block in self.blocks:
                 x = block(x, attn_mask=attn_mask)

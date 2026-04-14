@@ -22,6 +22,10 @@ class JEPA(nn.Module):
         self.lang_encoder = lang_encoder  # T5EncoderModel, frozen
         self.lang_proj = lang_proj        # nn.Linear(T5_hidden, embed_dim)
 
+    @property
+    def use_language(self) -> bool:
+        return self.lang_encoder is not None
+
     def train(self, mode=True):
         """Override to keep T5 encoder frozen in eval mode.
 
@@ -34,20 +38,27 @@ class JEPA(nn.Module):
             self.lang_encoder.eval()
         return self
 
-    def encode(self, pixels_agent, pixels_hand, lang_input_ids, lang_attention_mask):
-        """Encode both views + language.
+    def encode(
+        self,
+        pixels_agent,
+        pixels_hand,
+        lang_input_ids=None,
+        lang_attention_mask=None,
+    ):
+        """Encode both views + (optionally) language.
 
         Args:
             pixels_agent: (B, C, H, W) agentview image.
             pixels_hand: (B, C, H, W) eye-in-hand image.
-            lang_input_ids: (B, max_lang_tokens) T5 token IDs.
-            lang_attention_mask: (B, max_lang_tokens) attention mask (1=real, 0=pad).
+            lang_input_ids: (B, max_lang_tokens) T5 token IDs, or None for no-language mode.
+            lang_attention_mask: (B, max_lang_tokens) attention mask (1=real, 0=pad), or None.
 
         Returns:
             z_agent: (B, D) agentview CLS token, projected.
             z_hand: (B, D) hand CLS token, projected.
-            lang_embeds: (B, max_lang_tokens, D) projected language embeddings.
-            lang_lengths: (B,) real language token count per sample.
+            lang_embeds: (B, max_lang_tokens, D) projected language embeddings,
+                or None when language is disabled.
+            lang_lengths: (B,) real language token count per sample, or None.
         """
         # Visual: shared ViT encoder for both views
         agent_out = self.encoder(pixels_agent, interpolate_pos_encoding=True)
@@ -56,16 +67,18 @@ class JEPA(nn.Module):
         hand_out = self.encoder(pixels_hand, interpolate_pos_encoding=True)
         z_hand = self.projector(hand_out.last_hidden_state[:, 0])  # CLS, same encoder
 
-        # Language: frozen T5-small
-        with torch.no_grad():
-            lang_out = self.lang_encoder(
-                input_ids=lang_input_ids,
-                attention_mask=lang_attention_mask,
-            )
-        lang_embeds = self.lang_proj(lang_out.last_hidden_state)  # (B, seq_len, D)
-
-        # Compute lang_lengths from attention_mask
-        lang_lengths = lang_attention_mask.sum(dim=1)  # (B,)
+        # Language: only when encoder is present AND tokens are provided
+        if self.lang_encoder is not None and lang_input_ids is not None:
+            with torch.no_grad():
+                lang_out = self.lang_encoder(
+                    input_ids=lang_input_ids,
+                    attention_mask=lang_attention_mask,
+                )
+            lang_embeds = self.lang_proj(lang_out.last_hidden_state)  # (B, seq_len, D)
+            lang_lengths = lang_attention_mask.sum(dim=1)  # (B,)
+        else:
+            lang_embeds = None
+            lang_lengths = None
 
         return z_agent, z_hand, lang_embeds, lang_lengths
 

@@ -23,12 +23,14 @@ def lejepa_forward(self, batch, stage, cfg):
     pixels_agent = batch["pixels_agent"]          # (B, 3, H, W)
     pixels_hand = batch["pixels_hand"]            # (B, 3, H, W)
     proprio = batch["proprio"]                    # (B, 8)
-    lang_ids = batch["lang_input_ids"]            # (B, max_lang_tokens)
-    lang_mask = batch["lang_attention_mask"]       # (B, max_lang_tokens)
     fast_tokens = batch["fast_tokens"]            # (B, max_action_tokens)
     fast_lengths = batch["fast_lengths"]          # (B,)
 
-    # 2. Encode visual + language
+    # Language batch fields may be absent in no-language ablation runs
+    lang_ids = batch.get("lang_input_ids", None)   # (B, max_lang_tokens) or None
+    lang_mask = batch.get("lang_attention_mask", None)  # (B, max_lang_tokens) or None
+
+    # 2. Encode visual + language (language skipped when lang_ids is None)
     z_agent, z_hand, lang_embeds, lang_lengths = self.model.encode(
         pixels_agent, pixels_hand, lang_ids, lang_mask,
     )
@@ -93,6 +95,7 @@ def run(cfg):
     max_action_tokens = cfg.data.dataset.get("max_action_tokens", 80)
     max_lang_tokens = cfg.data.dataset.get("max_lang_tokens", 25)
     proprio_dim = cfg.data.dataset.get("proprio_dim", 8)
+    use_language = cfg.data.dataset.get("use_language", True)
 
     from libero_dataset import LiberoDataset
 
@@ -101,6 +104,7 @@ def run(cfg):
         max_action_tokens=max_action_tokens,
         max_lang_tokens=max_lang_tokens,
         img_size=cfg.data.dataset.get("img_size", cfg.img_size),
+        use_language=use_language,
     )
 
     # Demo-level split: avoid leaking chunks from the same demo into both train and val.
@@ -145,7 +149,9 @@ def run(cfg):
     hidden_dim = encoder.config.hidden_size
     embed_dim = cfg.wm.get("embed_dim", hidden_dim)
 
-    # ARPredictor with language + proprio support
+    # ARPredictor with language + proprio support.
+    # max_lang_tokens is still passed in so pos_embedding has a large-enough max_seq_len —
+    # when use_language=False, language positions are simply never populated at runtime.
     predictor = ARPredictor(
         embed_dim=embed_dim,
         max_action_tokens=max_action_tokens,
@@ -161,14 +167,19 @@ def run(cfg):
         norm_fn=torch.nn.BatchNorm1d,
     )
 
-    # T5-small encoder (frozen)
-    lang_encoder = T5EncoderModel.from_pretrained("t5-small")
-    lang_encoder.eval()
-    for p in lang_encoder.parameters():
-        p.requires_grad_(False)
+    if use_language:
+        # T5-small encoder (frozen)
+        lang_encoder = T5EncoderModel.from_pretrained("t5-small")
+        lang_encoder.eval()
+        for p in lang_encoder.parameters():
+            p.requires_grad_(False)
 
-    # Language projection: T5 d_model (512) → embed_dim
-    lang_proj = torch.nn.Linear(lang_encoder.config.d_model, embed_dim)
+        # Language projection: T5 d_model (512) → embed_dim
+        lang_proj = torch.nn.Linear(lang_encoder.config.d_model, embed_dim)
+    else:
+        print("[Ablation] use_language=False — skipping T5 encoder and language projection.")
+        lang_encoder = None
+        lang_proj = None
 
     world_model = JEPA(
         encoder=encoder,

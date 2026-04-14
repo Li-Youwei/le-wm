@@ -72,10 +72,12 @@ class LiberoDataset(Dataset):
         max_action_tokens: int = 80,
         max_lang_tokens: int = 25,
         img_size: int = 224,
+        use_language: bool = True,
     ):
         self.max_action_tokens = max_action_tokens
         self.max_lang_tokens = max_lang_tokens
         self.img_size = img_size
+        self.use_language = use_language
 
         # Discover all HDF5 files and build a global index
         hdf5_dir = Path(hdf5_dir)
@@ -85,11 +87,11 @@ class LiberoDataset(Dataset):
         if not self.files:
             raise FileNotFoundError(f"No .hdf5/.h5 files found in {hdf5_dir}")
 
-        # T5 tokenizer for language instructions
-        self.t5_tokenizer = T5Tokenizer.from_pretrained("t5-small")
+        # T5 tokenizer (only when language is enabled)
+        self.t5_tokenizer = T5Tokenizer.from_pretrained("t5-small") if use_language else None
 
         # Pre-tokenize language instructions (one per file) and build global index
-        self._index = []  # list of (file_path, local_idx)
+        self._index: list[tuple[Path, int]] = []
         self._lang_cache: dict[Path, tuple[torch.Tensor, torch.Tensor]] = {}
 
         for fpath in self.files:
@@ -102,23 +104,29 @@ class LiberoDataset(Dataset):
                 else:
                     raise KeyError(f"No image_agent or image_current in {fpath}")
 
-                # Read language instruction
-                lang_str = f.attrs.get("language_instruction", "")
-                if not lang_str:
-                    logger.warning("No language_instruction attr in %s, using empty string", fpath.name)
+                # Read language instruction only if needed
+                if use_language:
+                    lang_str = f.attrs.get("language_instruction", "")
+                    if not lang_str:
+                        logger.warning(
+                            "No language_instruction attr in %s, using empty string", fpath.name
+                        )
+                else:
+                    lang_str = None
 
-            # Tokenize language instruction
-            tok_out = self.t5_tokenizer(
-                lang_str,
-                max_length=self.max_lang_tokens,
-                padding="max_length",
-                truncation=True,
-                return_tensors="pt",
-            )
-            self._lang_cache[fpath] = (
-                tok_out["input_ids"].squeeze(0),        # (max_lang_tokens,) long
-                tok_out["attention_mask"].squeeze(0),    # (max_lang_tokens,) long
-            )
+            # Tokenize language instruction only if needed
+            if use_language:
+                tok_out = self.t5_tokenizer(
+                    lang_str,
+                    max_length=self.max_lang_tokens,
+                    padding="max_length",
+                    truncation=True,
+                    return_tensors="pt",
+                )
+                self._lang_cache[fpath] = (
+                    tok_out["input_ids"].squeeze(0),        # (max_lang_tokens,) long
+                    tok_out["attention_mask"].squeeze(0),   # (max_lang_tokens,) long
+                )
 
             self._index.extend([(fpath, i) for i in range(n_samples)])
 
@@ -152,9 +160,6 @@ class LiberoDataset(Dataset):
         # Proprioception: (8,) float64 → float32 tensor
         proprio = torch.from_numpy(np.array(f["proprio"][local_idx], dtype=np.float32))
 
-        # Language tokens (pre-tokenized, same for all samples in this file)
-        lang_ids, lang_mask = self._lang_cache[fpath]
-
         # FAST tokens: variable-length → pad to max_action_tokens
         raw_tokens = f["fast_tokens"][local_idx]
         raw_tokens = np.array(raw_tokens, dtype=np.int64)
@@ -169,15 +174,21 @@ class LiberoDataset(Dataset):
         fast_tokens = np.full(self.max_action_tokens, PAD_TOKEN_ID, dtype=np.int64)
         fast_tokens[:token_len] = raw_tokens[:token_len]
 
-        return {
+        item = {
             "pixels_agent": img_agent,                                  # (3, 224, 224)
             "pixels_hand": img_hand,                                    # (3, 224, 224)
             "proprio": proprio,                                         # (8,)
-            "lang_input_ids": lang_ids,                                 # (max_lang_tokens,)
-            "lang_attention_mask": lang_mask,                           # (max_lang_tokens,)
             "fast_tokens": torch.from_numpy(fast_tokens),               # (max_action_tokens,)
             "fast_lengths": torch.tensor(token_len, dtype=torch.long),  # scalar
         }
+
+        # Language tokens (only when enabled)
+        if self.use_language:
+            lang_ids, lang_mask = self._lang_cache[fpath]
+            item["lang_input_ids"] = lang_ids                           # (max_lang_tokens,)
+            item["lang_attention_mask"] = lang_mask                     # (max_lang_tokens,)
+
+        return item
 
     def __del__(self):
         for f in getattr(self, "_open_files", {}).values():
