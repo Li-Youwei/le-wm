@@ -55,3 +55,55 @@ class ModelObjectCallBack(Callback):
             torch.save(model, path)
         except Exception as e:
             print(f"Error saving model object: {e}")
+
+
+class PeriodicPrintCallback(Callback):
+    """Print key training metrics to stdout every N epochs.
+
+    Complements the TensorBoard logger during long-running sanity/overfit
+    experiments where you want a compact progress line in the terminal at a
+    fixed cadence (instead of Lightning's default per-epoch progress bar).
+
+    Args:
+        every_n_epochs: print cadence in epochs.
+        keys: metric keys to print. Missing keys are silently skipped. The
+              default matches the keys logged by `lejepa_forward` in train.py.
+        tag: short prefix shown at the start of each line.
+    """
+
+    def __init__(
+        self,
+        every_n_epochs: int = 100,
+        keys: tuple[str, ...] = (
+            "fit/ce_loss_epoch",
+            "fit/token_accuracy_epoch",
+            "validate/ce_loss_epoch",
+            "validate/token_accuracy_epoch",
+        ),
+        tag: str = "overfit",
+    ) -> None:
+        super().__init__()
+        self.every_n_epochs = max(1, int(every_n_epochs))
+        self.keys = tuple(keys)
+        self.tag = tag
+
+    def on_train_epoch_end(self, trainer, pl_module) -> None:
+        if not trainer.is_global_zero:
+            return
+        epoch = trainer.current_epoch + 1
+        is_last = trainer.max_epochs is not None and epoch == trainer.max_epochs
+        if epoch % self.every_n_epochs != 0 and not is_last:
+            return
+
+        metrics = trainer.callback_metrics
+        parts = [f"epoch={epoch:>5d}"]
+        for key in self.keys:
+            if key in metrics:
+                val = metrics[key]
+                try:
+                    val = float(val)
+                    short = key.split("/")[-1].replace("_epoch", "")
+                    parts.append(f"{short}={val:.4f}")
+                except (TypeError, ValueError):
+                    continue
+        print(f"[{self.tag}] " + "  ".join(parts), flush=True)

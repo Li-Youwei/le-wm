@@ -13,7 +13,7 @@ from transformers import T5EncoderModel
 
 from jepa import JEPA
 from module import ARPredictor, MLP, ACTION_HEAD_SIZE, EOS_TOKEN_ID
-from utils import ModelObjectCallBack
+from utils import ModelObjectCallBack, PeriodicPrintCallback
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -120,18 +120,43 @@ def run(cfg):
             prev_file = fpath
         demo_ids.append(int(_demo_arr[local_idx]))
 
-    unique_demos = sorted(set(demo_ids))
-    n_train_demos = int(len(unique_demos) * cfg.train_split)
-    perm = torch.randperm(len(unique_demos), generator=rnd_gen).tolist()
-    train_demo_set = set(unique_demos[perm[i]] for i in range(n_train_demos))
+    overfit_demo = cfg.get("overfit_demo", None)
+    if overfit_demo is not None:
+        # Pipeline sanity check: take one demo and use the same samples for
+        # both train and val. If the model can't drive loss to ~0 on this,
+        # there is a bug in the pipeline (data, forward, or loss).
+        target = int(overfit_demo)
+        overfit_indices = [i for i, d in enumerate(demo_ids) if d == target]
+        if not overfit_indices:
+            available = sorted(set(demo_ids))
+            raise ValueError(
+                f"overfit_demo={target} produced 0 samples. "
+                f"Available demo_ids in this dataset: {available[:20]}"
+            )
+        print(
+            f"[Overfit mode] demo_idx={target}: {len(overfit_indices)} chunks "
+            f"(train == val, demo-level split disabled)."
+        )
+        train_indices = overfit_indices
+        val_indices = list(overfit_indices)
+    else:
+        unique_demos = sorted(set(demo_ids))
+        n_train_demos = int(len(unique_demos) * cfg.train_split)
+        perm = torch.randperm(len(unique_demos), generator=rnd_gen).tolist()
+        train_demo_set = set(unique_demos[perm[i]] for i in range(n_train_demos))
 
-    train_indices = [i for i, d in enumerate(demo_ids) if d in train_demo_set]
-    val_indices = [i for i, d in enumerate(demo_ids) if d not in train_demo_set]
+        train_indices = [i for i, d in enumerate(demo_ids) if d in train_demo_set]
+        val_indices = [i for i, d in enumerate(demo_ids) if d not in train_demo_set]
 
     train_set = torch.utils.data.Subset(dataset, train_indices)
     val_set = torch.utils.data.Subset(dataset, val_indices)
 
-    train = torch.utils.data.DataLoader(train_set, **cfg.loader, shuffle=True, drop_last=True, generator=rnd_gen)
+    # In overfit mode, keep every sample each epoch — drop_last=True could
+    # discard the only batch when the sample count is smaller than batch_size.
+    train_drop_last = overfit_demo is None
+    train = torch.utils.data.DataLoader(
+        train_set, **cfg.loader, shuffle=True, drop_last=train_drop_last, generator=rnd_gen,
+    )
     val = torch.utils.data.DataLoader(val_set, **cfg.loader, shuffle=False, drop_last=False)
 
     ##############################
@@ -223,9 +248,16 @@ def run(cfg):
         dirpath=run_dir, filename=cfg.output_model_name, epoch_interval=1,
     )
 
+    callbacks = [object_dump_callback]
+    if overfit_demo is not None:
+        # Terminal progress line every N epochs — easier to eyeball than
+        # scrolling Lightning progress bars over 2k epochs.
+        print_every = int(cfg.get("overfit_print_every", 100))
+        callbacks.append(PeriodicPrintCallback(every_n_epochs=print_every))
+
     trainer = pl.Trainer(
         **cfg.trainer,
-        callbacks=[object_dump_callback],
+        callbacks=callbacks,
         num_sanity_val_steps=1,
         logger=logger,
         enable_checkpointing=True,

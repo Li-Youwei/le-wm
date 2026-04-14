@@ -1,0 +1,76 @@
+# -----------------------------------------------------------------------------
+# overfit.yaml — 1-demo pipeline sanity check.
+#
+# Goal: verify the train pipeline (data -> encoder -> predictor -> CE loss)
+# can memorize a tiny fixed set. If this can't drive loss < 0.1 and
+# token_accuracy > 0.95 after a few hundred epochs, there is a bug in the
+# pipeline — model capacity and optimization are NOT the problem.
+#
+# What's different vs lewm.yaml:
+#   - overfit_demo=0 → train.py picks only samples whose demo_idx==0 and uses
+#     the same subset for both train and val (no demo-level split)
+#   - batch_size small, drop_last=False handled in train.py
+#   - lr 1e-3 (10x normal), weight_decay 0, predictor dropout 0
+#   - max_epochs=2000, print every 100 epochs via PeriodicPrintCallback
+#   - devices=1 (single GPU, CUDA_VISIBLE_DEVICES=0)
+#
+# Usage:
+#   CUDA_VISIBLE_DEVICES=0 python train.py --config-name=overfit \
+#       data.dataset.hdf5_dir=/Data/lyw/libero_processed/libero_spatial/.train_pick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate \
+#       subdir=overfit_sanity
+# -----------------------------------------------------------------------------
+
+defaults:
+  - _self_
+  - data: libero
+
+output_model_name: lewm
+subdir: ${hydra:job.id}
+
+# --- Overfit switch (read by train.py) ---
+overfit_demo: 0          # take chunks from demo_idx=0 only; train == val
+overfit_print_every: 100 # terminal print cadence (epochs)
+
+# --- Split (unused when overfit_demo is set, but kept for consistency) ---
+train_split: 1.0
+
+num_workers: 2
+seed: 3072
+img_size: 224
+patch_size: 14
+encoder_scale: tiny
+dump_object: True
+
+trainer:
+  max_epochs: 2000
+  devices: 1
+  accelerator: gpu
+  precision: bf16
+  gradient_clip_val: 1.0
+  log_every_n_steps: 1
+
+loader:
+  batch_size: 8
+  num_workers: ${num_workers}
+  persistent_workers: True
+  prefetch_factor: 2
+  pin_memory: True
+
+optimizer:
+  type: AdamW
+  lr: 1.0e-3        # 20x baseline (5e-5) — tiny data, push through fast
+  weight_decay: 0.0 # disable to ease memorization
+
+wm:
+  type: vla_baseline
+  embed_dim: 192
+
+predictor:
+  depth: 6
+  heads: 16
+  mlp_dim: 2048
+  dim_head: 64
+  dropout: 0.0      # turn off to eliminate regularization noise
+  emb_dropout: 0.0
+
+loss: {}
