@@ -5,11 +5,13 @@ Loads preprocessed HDF5 files produced by preprocess_libero.py.
 Expected HDF5 structure (one file per task):
     /image_agent:         (N, H_img, W_img, 3) uint8 HWC  — agentview at chunk start
     /image_hand:          (N, H_img, W_img, 3) uint8 HWC  — eye-in-hand at chunk start
-    /proprio:             (N, 8) float64                   — ee_pos(3)+ee_quat(4)+gripper(1)
+    /proprio:             (N, 9) float64                   — ee_pos(3)+xyzw_quat(4)+gripper_raw(2)
     /fast_tokens:         variable-length int32 (h5py vlen_dtype)
     /continuous_actions:  (N, H, action_dim) float32  [optional, for debug]
     attrs:
         language_instruction: str — task description for T5 encoding
+        chunk_size:  int          — H (raw steps per chunk)
+        chunk_stride: int         — sliding-window stride (default 1)
 """
 
 import logging
@@ -157,7 +159,8 @@ class LiberoDataset(Dataset):
                            f"Re-run preprocess_libero.py to generate new format.")
         img_hand = _preprocess_image(f[hand_key][local_idx], self.img_size)
 
-        # Proprioception: (8,) float64 → float32 tensor
+        # Proprioception: (9,) float64 → float32 tensor
+        # [ee_pos(3) + xyzw_quat(4) + gripper_raw(2)] — see preprocess_libero.py
         proprio = torch.from_numpy(np.array(f["proprio"][local_idx], dtype=np.float32))
 
         # FAST tokens: variable-length → pad to max_action_tokens
@@ -177,7 +180,7 @@ class LiberoDataset(Dataset):
         item = {
             "pixels_agent": img_agent,                                  # (3, 224, 224)
             "pixels_hand": img_hand,                                    # (3, 224, 224)
-            "proprio": proprio,                                         # (8,)
+            "proprio": proprio,                                         # (9,)
             "fast_tokens": torch.from_numpy(fast_tokens),               # (max_action_tokens,)
             "fast_lengths": torch.tensor(token_len, dtype=torch.long),  # scalar
         }

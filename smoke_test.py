@@ -5,7 +5,7 @@ Validates the full pipeline with real preprocessed LIBERO data on GPU:
 
 Tests:
   1. Model instantiation (ViT shared encoder, frozen T5, proprio MLP)
-  2. Data loading (dual-view, proprio 8d, language tokens, FAST tokens)
+  2. Data loading (dual-view, proprio 9d, language tokens, FAST tokens)
   3. Forward pass shape correctness
   4. CE loss finite and nonzero
   5. Backward pass gradient flow (all trainable params have grads)
@@ -47,7 +47,7 @@ from module import (
 EMBED_DIM = 192
 MAX_ACTION_TOKENS = 80
 MAX_LANG_TOKENS = 25
-PROPRIO_DIM = 8
+PROPRIO_DIM = 9  # ee_pos(3) + xyzw_quat(4) + gripper_raw(2)
 
 
 def create_model(device: torch.device) -> JEPA:

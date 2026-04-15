@@ -214,7 +214,7 @@ class ARPredictor(nn.Module):
         mlp_dim: int = 2048,
         max_action_tokens: int = 80,
         max_lang_tokens: int = 25,
-        proprio_dim: int = 8,
+        proprio_dim: int = 9,
         dropout: float = 0.1,
         emb_dropout: float = 0.0,
     ):
@@ -225,7 +225,7 @@ class ARPredictor(nn.Module):
         # max_seq_len = lang + z_agent + z_hand + z_proprio + BOS + max_action_tokens
         self.max_seq_len = max_lang_tokens + 3 + 1 + max_action_tokens
 
-        # Proprioception encoder: 8d → embed_dim
+        # Proprioception encoder: proprio_dim (9d for LIBERO) → embed_dim
         self.proprio_encoder = MLP(proprio_dim, embed_dim, embed_dim)
 
         # Token embeddings for action tokens (FAST vocab + BOS/EOS/PAD)
@@ -378,7 +378,8 @@ class ARPredictor(nn.Module):
         Args:
             z_agent: (B, D) agentview visual latent from encoder.
             z_hand: (B, D) eye-in-hand visual latent from encoder.
-            z_proprio_raw: (B, 8) raw proprioceptive state (ee_pos3 + ee_quat4 + gripper1).
+            z_proprio_raw: (B, proprio_dim) raw proprioceptive state.
+                For LIBERO: (B, 9) = ee_pos(3) + xyzw_quat(4) + gripper_raw(2).
             lang_embeds: (B, max_lang_tokens, D) projected language embeddings,
                 or None for language-ablation runs.
             lang_lengths: (B,) real language token count per sample, or None.
