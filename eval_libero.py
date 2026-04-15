@@ -31,6 +31,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import torch
+from scipy.spatial.transform import Rotation as R
 from transformers import T5EncoderModel, T5Tokenizer
 
 try:
@@ -74,7 +75,7 @@ def build_model(device: torch.device, use_language: bool = True) -> torch.nn.Mod
 
     predictor = ARPredictor(
         embed_dim=embed_dim, max_action_tokens=80, max_lang_tokens=25,
-        proprio_dim=8,
+        proprio_dim=9,
         depth=6, heads=16, dim_head=64, mlp_dim=2048, dropout=0.1, emb_dropout=0.0,
     )
     projector = MLP(input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048,
@@ -192,6 +193,13 @@ def preprocess_obs(
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     """Extract dual-view images and proprio from LIBERO env observation.
 
+    Must match preprocess_libero.py's 9D proprio layout exactly:
+        [ee_pos(3), xyzw_quat(4), gripper_raw(2)]
+
+    The gripper dims are the two raw finger positions (obs["robot0_gripper_qpos"]),
+    used directly without mean/abs — averaging collapses the signal because the
+    two fingers are symmetric around 0.
+
     Args:
         obs: LIBERO observation dict.
         img_size: target image size (224).
@@ -200,7 +208,7 @@ def preprocess_obs(
     Returns:
         pixels_agent: (1, 3, img_size, img_size) agentview tensor.
         pixels_hand: (1, 3, img_size, img_size) hand tensor.
-        proprio: (1, 8) proprioceptive state tensor.
+        proprio: (1, 9) proprioceptive state tensor.
     """
     # Agentview image
     img_agent = _preprocess_image(obs["agentview_image"], img_size)
@@ -210,13 +218,12 @@ def preprocess_obs(
     img_hand = _preprocess_image(obs["robot0_eye_in_hand_image"], img_size)
     pixels_hand = img_hand.unsqueeze(0).to(device)
 
-    # Proprioception: ee_pos(3) + ee_quat(4) + gripper(1) = 8d
-    ee_pos = obs["robot0_eef_pos"]          # (3,)
-    ee_quat = obs["robot0_eef_quat"]        # (4,) quaternion
-    grip_2d = obs["robot0_gripper_qpos"]    # (2,) two finger widths
-    gripper = np.array([np.mean(np.abs(grip_2d))])  # (1,) mean of 2 fingers
-    proprio_raw = np.concatenate([ee_pos, ee_quat, gripper])  # (8,)
-    proprio_np = normalize_proprio(proprio_raw)  # re-normalize quaternion
+    # 9D proprio — no averaging / no abs on the gripper.
+    ee_pos = obs["robot0_eef_pos"]              # (3,)
+    ee_quat = obs["robot0_eef_quat"]            # (4,) xyzw (robosuite default)
+    grip_2d = obs["robot0_gripper_qpos"]        # (2,) raw two finger joint positions
+    proprio_raw = np.concatenate([ee_pos, ee_quat, grip_2d])  # (9,)
+    proprio_np = normalize_proprio(proprio_raw)  # re-normalize quaternion at [3:7]
     proprio = torch.from_numpy(proprio_np).float().unsqueeze(0).to(device)
 
     return pixels_agent, pixels_hand, proprio
@@ -248,6 +255,113 @@ def tokenize_language(
 # Single-task evaluation
 # ---------------------------------------------------------------------------
 
+def _read_osc_scales(env: OffScreenRenderEnv) -> tuple[float, float]:
+    """Read robosuite OSC_POSE scales from the running controller.
+
+    The anchor-relative action chunks are stored in PHYSICAL units (meters for
+    position, radians for rotation). To convert a physical step-delta into the
+    [-1, 1] input range that `env.step` expects, we divide by these scales:
+
+        output_max[0:3] = pos_scale (typically 0.05 m)
+        output_max[3:6] = rot_scale (typically 0.5 rad)
+
+    We read them at runtime instead of hardcoding so the code automatically
+    adapts if LIBERO / robosuite changes the defaults. Asserts uniform scales
+    for pos/rot (the 3 translation axes and 3 rotation axes must all match) and
+    input range [-1, 1].
+    """
+    ctrl = env.env.robots[0].controller
+    output_max = np.asarray(ctrl.output_max, dtype=np.float64)
+    assert output_max.shape == (6,), f"unexpected output_max shape: {output_max.shape}"
+    pos_scale = float(output_max[0])
+    rot_scale = float(output_max[3])
+    assert np.allclose(output_max[:3], pos_scale), (
+        f"OSC pos scales not uniform: {output_max[:3]}"
+    )
+    assert np.allclose(output_max[3:6], rot_scale), (
+        f"OSC rot scales not uniform: {output_max[3:6]}"
+    )
+    assert ctrl.input_max == 1.0 and ctrl.input_min == -1.0, (
+        f"OSC input range not [-1, 1]: [{ctrl.input_min}, {ctrl.input_max}]"
+    )
+    print(f"  OSC scales read from controller: pos={pos_scale}, rot={rot_scale}")
+    return pos_scale, rot_scale
+
+
+def _execute_chunk_closed_loop(
+    env: OffScreenRenderEnv,
+    obs: dict,
+    chunk: np.ndarray,
+    pos_scale: float,
+    rot_scale: float,
+    frames: list[np.ndarray] | None,
+) -> tuple[dict, float, bool, dict]:
+    """Execute an anchor-relative action chunk in closed-loop against the env.
+
+    Args:
+        env: LIBERO env.
+        obs: latest observation dict — used to snapshot the anchor state
+            (p_t, R_t) at chunk start.
+        chunk: (H, 7) float32 in PHYSICAL units (anchor-relative):
+            chunk[k, 0:3] = cumulative position delta from anchor
+            chunk[k, 3:6] = cumulative rotation delta from anchor (axis-angle)
+            chunk[k, 6]   = gripper command (unchanged, not a delta)
+        pos_scale, rot_scale: robosuite OSC output_max[0] / [3], read once
+            per task via `_read_osc_scales`.
+        frames: optional list to append agentview images to for video capture.
+
+    Returns:
+        obs, reward (scalar), done (bool), info dict — the values returned by
+        the last env.step inside the chunk (or the first one that reports done).
+
+    Closed-loop logic: for each step k we compute the target pose relative to
+    the snapshotted anchor, then read the robot's current pose from the env and
+    send the residual (target - current) scaled into [-1, 1]. This lets the
+    controller self-correct when the robot drifts away from the predicted
+    trajectory, which is the main robustness gap of naive open-loop execution.
+    """
+    # Snapshot the anchor state once per chunk (p_t, R_t)
+    anchor_pos = np.asarray(obs["robot0_eef_pos"], dtype=np.float64).copy()
+    anchor_quat = np.asarray(obs["robot0_eef_quat"], dtype=np.float64).copy()
+    R_anchor = R.from_quat(anchor_quat)  # scipy: xyzw, same as robosuite default
+
+    reward = 0.0
+    done = False
+    info: dict = {}
+    H = chunk.shape[0]
+    for h in range(H):
+        # Anchor-relative target derived from the predicted displacement
+        target_pos = anchor_pos + chunk[h, 0:3]
+        R_step_delta = R.from_rotvec(chunk[h, 3:6])
+        target_R = R_step_delta * R_anchor
+        gripper_cmd = float(chunk[h, 6])
+
+        # Current pose (closed-loop — reads the env state each step)
+        cur_pos = np.asarray(obs["robot0_eef_pos"], dtype=np.float64)
+        cur_R = R.from_quat(np.asarray(obs["robot0_eef_quat"], dtype=np.float64))
+
+        # Residual delta that takes the robot from its current pose to the target
+        step_delta_pos = target_pos - cur_pos
+        step_delta_rotvec = (target_R * cur_R.inv()).as_rotvec()
+
+        # Robosuite's Controller.scale_action also clips to input_max/min before
+        # linear rescaling. We clip explicitly for readability — the clip is
+        # bit-for-bit identical to robosuite's internal behavior.
+        action_input = np.concatenate([
+            np.clip(step_delta_pos / pos_scale, -1.0, 1.0),
+            np.clip(step_delta_rotvec / rot_scale, -1.0, 1.0),
+            [gripper_cmd],
+        ]).astype(np.float32)
+
+        obs, reward, done, info = env.step(action_input)
+        if frames is not None:
+            frames.append(obs["agentview_image"])
+        if done:
+            break
+
+    return obs, reward, done, info
+
+
 @torch.no_grad()
 def evaluate_task(
     model: torch.nn.Module,
@@ -277,6 +391,9 @@ def evaluate_task(
     successes = 0
     max_chunks = max_steps // chunk_size
 
+    # Read OSC scales once per task from the running controller (not hardcoded).
+    pos_scale, rot_scale = _read_osc_scales(env)
+
     # Pre-tokenize language instruction (same for all episodes); skipped in no-language mode.
     if use_language:
         assert t5_tokenizer is not None, "t5_tokenizer required when use_language=True"
@@ -294,11 +411,11 @@ def evaluate_task(
 
         # Collect frames for video (first N episodes only)
         recording = save_videos and ep < max_video_episodes
-        frames: list[np.ndarray] = []
+        frames: list[np.ndarray] | None = [] if recording else None
         if recording:
             frames.append(obs["agentview_image"])
 
-        reward = 0
+        reward = 0.0
         done = False
         for _ in range(max_chunks):
             # Preprocess observation (dual-view + proprio)
@@ -315,18 +432,18 @@ def evaluate_task(
                 temperature=temperature,
             )
 
-            # Decode to continuous actions
+            # Decode tokens → normalized → physical anchor-relative displacements
             actions_norm = fast_decode(tokens, lengths, processor,
                                        time_horizon=chunk_size, action_dim=action_dim)
-            actions_raw = denormalize_actions(actions_norm, action_low, action_high)
+            actions_phys = denormalize_actions(actions_norm, action_low, action_high)
+            # actions_phys[0] is (H, 7) in physical units:
+            #   [0:3] = anchor-relative pos delta (m)
+            #   [3:6] = anchor-relative rot delta (rad, axis-angle)
+            #   [6]   = gripper cmd (unchanged)
 
-            # Execute chunk (H steps)
-            for h in range(chunk_size):
-                obs, reward, done, info_env = env.step(actions_raw[0, h])
-                if recording:
-                    frames.append(obs["agentview_image"])
-                if done:
-                    break
+            obs, reward, done, _ = _execute_chunk_closed_loop(
+                env, obs, actions_phys[0], pos_scale, rot_scale, frames,
+            )
             if done:
                 break
 
