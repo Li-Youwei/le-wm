@@ -317,7 +317,7 @@ The following modifications were made in the first iteration (unified predictor 
 | Component | Previous | New Baseline |
 |-----------|----------|--------------|
 | Visual input | Single view (agentview only) | **Dual view** (agentview + eye_in_hand), shared ViT |
-| Proprioception | None | **EE pose + ori + gripper (8d) → MLP → D** |
+| Proprioception | None | **EE pose(3) + xyzw quat(4) + gripper raw(2) = 9d → MLP → D** |
 | Language | None | **T5-small frozen → prefix tokens** |
 | STATE_QUERY | Yes (at end of sequence) | **Removed** |
 | L_pred (MSE) | Yes | **Removed** |

@@ -29,8 +29,18 @@ SUITES=("libero_spatial" "libero_object" "libero_goal" "libero_10")
 NUM_EPISODES=20
 MAX_STEPS=300
 CHUNK_SIZE=20
+CHUNK_STRIDE=1     # sliding-window stride (default 1 = standard VLA practice)
 MAX_EPOCHS=100
 DEVICE="cuda"
+
+# Preprocessed files from BEFORE the anchor-relative refactor use an incompatible
+# format (non-overlapping chunks + raw step-deltas + 8D proprio). If you have such
+# files in PROCESSED_ROOT, delete them first:
+#   rm -rf ${DATA_ROOT}/libero_processed/<suite>/*.h5
+# Similarly delete the old tokenizer (fitted on the old chunk distribution):
+#   rm -rf ${TOKENIZER}
+# This script will automatically bootstrap a new tokenizer on the first task it
+# preprocesses (see "tokenizer bootstrap" logic below).
 
 # ----------------------------- Parse arguments -------------------------------
 START_FROM=""
@@ -86,19 +96,54 @@ for SUITE in "${SUITES[@]}"; do
             out="${PROC_DIR}/${base}.h5"
 
             if [ -f "$out" ]; then
-                log "  Skip (exists): $(basename "$out")"
-                continue
+                # Guard against stale files from the old (non-overlapping,
+                # 8D proprio) format. New format must have the chunk_stride attr.
+                if python3 -c "
+import sys, h5py
+try:
+    with h5py.File('$out', 'r') as f:
+        ok = 'chunk_stride' in f.attrs and f['proprio'].shape[1] == 9
+    sys.exit(0 if ok else 1)
+except Exception:
+    sys.exit(1)
+" 2>/dev/null; then
+                    log "  Skip (exists, new format): $(basename "$out")"
+                    continue
+                else
+                    err "  Stale file detected (old format): $(basename "$out")"
+                    err "    Delete and rerun: rm $out"
+                    exit 1
+                fi
             fi
 
-            log "  Processing: $(basename "$hdf5_file") -> $(basename "$out")"
-            python preprocess_libero.py \
-                --input "$hdf5_file" \
-                --output "$out" \
-                --chunk-size "$CHUNK_SIZE" \
-                --image-key agentview_rgb \
-                --hand-image-key eye_in_hand_rgb \
-                --max-action-tokens 80 \
-                --load-tokenizer "$TOKENIZER"
+            # Tokenizer bootstrap: fit on the first task where TOKENIZER does
+            # not yet exist, then load on subsequent tasks. This lets the script
+            # work from a clean slate without any pre-fitted tokenizer.
+            if [ ! -d "$TOKENIZER" ]; then
+                log "  Bootstrapping FAST tokenizer on: $(basename "$hdf5_file")"
+                python preprocess_libero.py \
+                    --input "$hdf5_file" \
+                    --output "$out" \
+                    --chunk-size "$CHUNK_SIZE" \
+                    --stride "$CHUNK_STRIDE" \
+                    --image-key agentview_rgb \
+                    --hand-image-key eye_in_hand_rgb \
+                    --max-action-tokens 80 \
+                    --fit-tokenizer \
+                    --save-tokenizer "$TOKENIZER"
+                log "  Tokenizer saved to: $TOKENIZER"
+            else
+                log "  Processing: $(basename "$hdf5_file") -> $(basename "$out")"
+                python preprocess_libero.py \
+                    --input "$hdf5_file" \
+                    --output "$out" \
+                    --chunk-size "$CHUNK_SIZE" \
+                    --stride "$CHUNK_STRIDE" \
+                    --image-key agentview_rgb \
+                    --hand-image-key eye_in_hand_rgb \
+                    --max-action-tokens 80 \
+                    --load-tokenizer "$TOKENIZER"
+            fi
         done
         log "[$SUITE] Preprocessing done"
 

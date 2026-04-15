@@ -542,7 +542,7 @@ def save_hdf5(
         # --- Proprioception ---
         out.create_dataset(
             "proprio",
-            data=np.stack(samples["proprio"], axis=0),  # (N, 8)
+            data=np.stack(samples["proprio"], axis=0),  # (N, 9)
             dtype=np.float64,
         )
 

@@ -22,7 +22,7 @@ def lejepa_forward(self, batch, stage, cfg):
     # 1. Unpack batch
     pixels_agent = batch["pixels_agent"]          # (B, 3, H, W)
     pixels_hand = batch["pixels_hand"]            # (B, 3, H, W)
-    proprio = batch["proprio"]                    # (B, 8)
+    proprio = batch["proprio"]                    # (B, 9) ee_pos(3)+xyzw_quat(4)+grip_raw(2)
     fast_tokens = batch["fast_tokens"]            # (B, max_action_tokens)
     fast_lengths = batch["fast_lengths"]          # (B,)
 

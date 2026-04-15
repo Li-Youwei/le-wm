@@ -1,27 +1,27 @@
 #!/usr/bin/env python3
 """check_fast_roundtrip.py — Sanity-check the FAST encode/decode round-trip.
 
-Validates the full action codec pipeline on preprocessed LIBERO samples:
+Validates the full action codec pipeline on preprocessed LIBERO samples
+under the **anchor-relative chunk format** (see preprocess_libero.py):
 
-    raw actions (H, 7)                     # from original LIBERO HDF5
-      ── normalize to [-1, 1] ──────►      # action_low / action_high
-      ── FAST encode ──────────────►       # stored as fast_tokens
-      ── FAST decode ──────────────►       # fast_utils.fast_decode
-      ── denormalize ──────────────►
-      reconstructed raw actions (H, 7)
+    obs/ee_pos, obs/ee_ori (base-frame anchor state + H+1 future frames)
+      ── compute anchor-relative chunk (pos delta + rotvec delta + grip cmd) ──►
+      ── normalize to [-1, 1] via 1/99 percentile ──► FAST encode ──► stored fast_tokens
+      ── FAST decode ──► decoded_norm ── denormalize ──► decoded_phys
 
-We compare the reconstructed chunk against the raw ground-truth actions from
-the *original* LIBERO HDF5 (via the source_file attr) rather than against the
-already-normalized-and-clipped `continuous_actions` stored alongside the FAST
-tokens. That way any error floor from 1st/99th-percentile clipping is visible
-rather than hidden.
+We compute the **ground-truth anchor-relative chunk** directly from the raw
+LIBERO HDF5 (obs/ee_pos + obs/ee_ori, same formulas as preprocess_libero.py)
+and compare it to the decoded chunks in three layers:
 
-To isolate the two error sources, we also report:
-  • The pure FAST round-trip error in normalized space
-    (decoded_norm vs stored_norm — no clipping involved).
-  • The clipping gap (stored_norm vs re-normalized raw GT) — should be ~0
-    unless actions got clipped.
-  • The raw-space error after denormalization (what the robot actually sees).
+  1. Normalized-space round-trip (decoded_norm vs stored continuous_actions)
+     — pure FAST codec error. Should be a few percent (DCT+BPE is lossy).
+  2. Normalized-space GT comparison (decoded_norm vs renorm(gt_phys))
+     — picks up any clipping that happened at normalization time.
+  3. Physical-space (decoded_phys vs gt_phys) — what the robot actually
+     sees after denormalization.
+
+This validates both the FAST codec AND the new anchor-relative preprocessing
+end-to-end.
 
 Usage:
     python check_fast_roundtrip.py \\
@@ -40,6 +40,7 @@ from pathlib import Path
 import h5py
 import numpy as np
 import torch
+from scipy.spatial.transform import Rotation as R
 
 from fast_utils import denormalize_actions, fast_decode, load_fast_processor
 from preprocess_libero import normalize_actions
@@ -95,8 +96,15 @@ def resolve_source_file(stored_path: str, libero_root: Path | None) -> Path:
     )
 
 
-def load_raw_demo_actions(source_file: Path, demo_idx: int) -> np.ndarray:
-    """Load raw (un-normalized) actions for a single demo from the original HDF5."""
+def load_raw_demo_obs(
+    source_file: Path, demo_idx: int
+) -> tuple[np.ndarray, np.ndarray, np.ndarray]:
+    """Load the raw observations and gripper command stream for one demo.
+
+    Returns (ee_pos, ee_ori, gripper_cmd) from the original LIBERO HDF5 —
+    everything we need to reconstruct the anchor-relative chunk ground truth
+    using the same formulas as preprocess_libero.py::extract_chunks.
+    """
     with h5py.File(source_file, "r") as f:
         demo_keys = sorted(
             (k for k in f["data"].keys() if k.startswith("demo_")),
@@ -109,7 +117,51 @@ def load_raw_demo_actions(source_file: Path, demo_idx: int) -> np.ndarray:
                 f"demo_idx={demo_idx} out of range (file has {len(demo_keys)} demos)"
             )
         dk = demo_keys[demo_idx]
-        return np.asarray(f[f"data/{dk}/actions"][()], dtype=np.float64)  # (T, 7)
+        ee_pos = np.asarray(f[f"data/{dk}/obs/ee_pos"][()], dtype=np.float64)  # (T, 3)
+        ee_ori = np.asarray(f[f"data/{dk}/obs/ee_ori"][()], dtype=np.float64)  # (T, 3) axis-angle
+        actions = np.asarray(f[f"data/{dk}/actions"][()], dtype=np.float64)   # (T, 7)
+        gripper_cmd = actions[:, 6]  # (T,)
+    return ee_pos, ee_ori, gripper_cmd
+
+
+def compute_anchor_relative_chunk_gt(
+    ee_pos: np.ndarray,
+    ee_ori: np.ndarray,
+    gripper_cmd: np.ndarray,
+    anchor_step: int,
+    chunk_size: int,
+) -> np.ndarray:
+    """Reconstruct one anchor-relative chunk from raw demo observations.
+
+    Must use the SAME formulas as preprocess_libero.py::extract_chunks so that
+    the round-trip comparison is apples-to-apples:
+
+        pos_delta[k] = ee_pos[t+k+1] - ee_pos[t]
+        rot_delta[k] = rotvec(R_{t+k+1} * R_t^{-1})  where R_x = from_rotvec(ee_ori[x])
+        gripper[k]   = actions_raw[t+k, 6]
+
+    Args:
+        ee_pos, ee_ori, gripper_cmd: raw demo streams (see load_raw_demo_obs).
+        anchor_step: t (raw step index; the preprocessed HDF5 stores this as chunk_idx).
+        chunk_size: H (raw steps per chunk).
+
+    Returns:
+        (H, 7) float64 anchor-relative chunk in PHYSICAL units.
+    """
+    t = anchor_step
+    H = chunk_size
+    if t + H >= ee_pos.shape[0]:
+        raise IndexError(
+            f"anchor_step={t} + H={H} exceeds demo length {ee_pos.shape[0]}"
+        )
+
+    R_anchor = R.from_rotvec(ee_ori[t])
+    R_target = R.from_rotvec(ee_ori[t + 1 : t + H + 1])  # (H,)
+    pos_delta = ee_pos[t + 1 : t + H + 1] - ee_pos[t]     # (H, 3)
+    rot_delta = (R_target * R_anchor.inv()).as_rotvec()   # (H, 3)
+    grip = gripper_cmd[t : t + H, None]                   # (H, 1)
+
+    return np.concatenate([pos_delta, rot_delta, grip], axis=-1).astype(np.float64)
 
 
 # ---------------------------------------------------------------------------
@@ -222,13 +274,17 @@ def main() -> None:
 
         with h5py.File(fpath, "r") as f:
             chunk_size = int(f.attrs["chunk_size"])
+            chunk_stride = int(f.attrs.get("chunk_stride", 1))  # new format attr
             action_low = np.asarray(f.attrs["action_low"], dtype=np.float64)
             action_high = np.asarray(f.attrs["action_high"], dtype=np.float64)
             action_dim = int(f.attrs.get("action_dim", 7))
             source_file = str(f.attrs["source_file"])
 
             demo_idx = int(f["demo_idx"][local_idx])
-            chunk_idx = int(f["chunk_idx"][local_idx])
+            # chunk_idx is now the **raw step anchor** (not ci * H as in the old
+            # non-overlapping format). preprocess_libero.py stores
+            # samples["chunk_idx"].append(t) where t is the raw step.
+            anchor_step = int(f["chunk_idx"][local_idx])
 
             tokens_np = np.asarray(f["fast_tokens"][local_idx], dtype=np.int64)
             token_len = int(f["fast_length"][local_idx])
@@ -240,36 +296,43 @@ def main() -> None:
 
             stored_norm = np.asarray(
                 f["continuous_actions"][local_idx], dtype=np.float64
-            )  # (H, 7) — already normalized + clipped
+            )  # (H, 7) — already anchor-relative and normalized to [-1, 1]
 
-        # Original raw ground truth from the source LIBERO HDF5
+        # Ground-truth anchor-relative chunk reconstructed from raw LIBERO obs.
         src_path = resolve_source_file(source_file, args.libero_root)
-        raw_demo_actions = load_raw_demo_actions(src_path, demo_idx)
-        start = chunk_idx * chunk_size
-        gt_chunk_raw = raw_demo_actions[start : start + chunk_size]  # (H, 7)
-        if gt_chunk_raw.shape[0] != chunk_size:
+        ee_pos, ee_ori, gripper_cmd = load_raw_demo_obs(src_path, demo_idx)
+        gt_chunk_phys = compute_anchor_relative_chunk_gt(
+            ee_pos, ee_ori, gripper_cmd, anchor_step, chunk_size,
+        )  # (H, 7) physical units: meters / rad / [-1, 1] gripper cmd
+        if gt_chunk_phys.shape != (chunk_size, action_dim):
             raise RuntimeError(
-                f"GT chunk slice is {gt_chunk_raw.shape}, expected "
-                f"({chunk_size}, {action_dim}). demo={demo_idx} chunk={chunk_idx} "
-                f"src={src_path}"
+                f"GT chunk shape {gt_chunk_phys.shape}, expected "
+                f"({chunk_size}, {action_dim}). demo={demo_idx} anchor={anchor_step} "
+                f"src={src_path.name}"
             )
 
-        # FAST decode
-        decoded_norm, decoded_raw = decode_one_sample(
+        # FAST decode: tokens → normalized → physical (via denormalize)
+        decoded_norm, decoded_phys = decode_one_sample(
             tokens_np, token_len, processor,
             chunk_size, action_dim, action_low, action_high,
         )
 
-        # ---- Error decomposition ----
-        # 1) Pure FAST codec error (normalized space): decoded_norm vs stored_norm
+        # ---- Error decomposition (three layers) ----
+        # 1) Pure FAST codec round-trip (normalized space): decoded_norm vs
+        #    stored_norm — no clipping / no GT involved. This is the intrinsic
+        #    DCT+BPE quantization error.
         norm_err = np.abs(decoded_norm - stored_norm)
 
-        # 2) Clipping gap: stored_norm vs re-normalize(gt_raw)
-        renorm_gt = normalize_actions(gt_chunk_raw, action_low, action_high)
+        # 2) Clipping gap: stored_norm vs re-normalize(gt_phys). If ~0, no
+        #    clipping happened; if non-zero, the 1/99 percentile bounds cut off
+        #    some of the GT distribution.
+        renorm_gt = normalize_actions(gt_chunk_phys, action_low, action_high)
         clip_gap = np.abs(renorm_gt - stored_norm)
 
-        # 3) Raw-space total error: decoded_raw vs gt_chunk_raw
-        raw_err = np.abs(decoded_raw - gt_chunk_raw)
+        # 3) Physical-space total error: decoded_phys vs gt_chunk_phys. This is
+        #    what the robot ultimately consumes after denormalization (in meters
+        #    for pos, rad for rot, gripper command unchanged).
+        raw_err = np.abs(decoded_phys - gt_chunk_phys)
 
         per_dim = raw_err.mean(axis=0)               # (action_dim,)
         per_step = raw_err.mean(axis=1)              # (chunk_size,)
@@ -288,27 +351,27 @@ def main() -> None:
         print("=" * 80)
         print(f"[Sample {rank + 1}/{args.num_samples}]  {fpath.name}")
         print(f"  global_idx={pick}  local_idx={local_idx}  "
-              f"demo={demo_idx}  chunk={chunk_idx}  token_len={token_len}")
-        print(f"  chunk_size H={chunk_size}  action_dim={action_dim}")
+              f"demo={demo_idx}  anchor_step={anchor_step}  token_len={token_len}")
+        print(f"  chunk_size H={chunk_size}  stride={chunk_stride}  action_dim={action_dim}")
         print(f"  source_file={src_path.name}")
-        print(f"  raw-space     : mean |err|={overall:.5f}  max |err|={max_err:.5f}")
+        print(f"  physical      : mean |err|={overall:.5f}  max |err|={max_err:.5f}")
         print(f"  normalized    : mean |err|={norm_err.mean():.2e}  "
               f"max |err|={norm_err.max():.2e}   (pure FAST codec)")
         print(f"  clipping gap  : max |err|={clip_gap.max():.2e}   "
               f"(stored_norm vs renorm(gt); should be ~0)")
-        print(f"  per-dim L1  (raw): {format_row(per_dim, width=7, prec=4)}")
-        print(f"  per-step L1 (raw): {format_row(per_step, width=7, prec=4)}")
+        print(f"  per-dim L1  (phys): {format_row(per_dim, width=7, prec=4)}")
+        print(f"  per-step L1 (phys): {format_row(per_step, width=7, prec=4)}")
 
         # ---- Detailed per-step per-dim table for the first N samples ----
         if rank < args.print_samples:
             print()
-            print("  Per-step per-dim detail (raw scale):")
+            print("  Per-step per-dim detail (physical, anchor-relative):")
             header_dims = "  ".join(f"{'d' + str(d):>8}" for d in range(action_dim))
             print(f"    step      {header_dims}")
             print(f"    " + "-" * (11 + len(header_dims)))
             for h in range(chunk_size):
-                print(f"    {h:>3d}  P | {format_row(decoded_raw[h])}")
-                print(f"        G | {format_row(gt_chunk_raw[h])}")
+                print(f"    {h:>3d}  P | {format_row(decoded_phys[h])}")
+                print(f"        G | {format_row(gt_chunk_phys[h])}")
                 print(f"        E | "
                       + " ".join(f"{v:>+8.3f}" for v in raw_err[h]))
 
@@ -319,12 +382,12 @@ def main() -> None:
     print()
     print("=" * 80)
     print(f"[Aggregate over {args.num_samples} samples]")
-    print(f"  Raw-space mean |err|: "
+    print(f"  Physical mean |err|: "
           f"mean={np.mean(per_sample_overall_l1):.5f}  "
           f"std={np.std(per_sample_overall_l1):.5f}  "
           f"min={np.min(per_sample_overall_l1):.5f}  "
           f"max={np.max(per_sample_overall_l1):.5f}")
-    print(f"  Raw-space max |err|:  "
+    print(f"  Physical max |err|:  "
           f"mean={np.mean(per_sample_max_err):.5f}  "
           f"worst={np.max(per_sample_max_err):.5f}")
     print(f"  Normalized mean |err| (pure FAST codec): "
@@ -333,19 +396,20 @@ def main() -> None:
     print(f"  Clipping gap max |err| across samples: "
           f"{np.max(per_sample_clip_gap):.2e}")
 
-    # Per-dimension breakdown — label assumes LIBERO 6D EE + gripper (7d)
+    # Per-dimension breakdown — labels reflect anchor-relative chunk format:
+    # [cumulative pos delta (m) × 3, cumulative rot delta (rad, axis-angle) × 3, gripper cmd]
     if per_dim_arr.shape[1] == 7:
         dim_labels = ["dx", "dy", "dz", "drx", "dry", "drz", "grip"]
     else:
         dim_labels = [f"d{i}" for i in range(per_dim_arr.shape[1])]
 
-    print("  Per-dim L1 (raw scale):")
+    print("  Per-dim L1 (physical, anchor-relative):")
     for d, lbl in enumerate(dim_labels):
         col = per_dim_arr[:, d]
         print(f"    {lbl:>5}:  mean={col.mean():.5f}  "
               f"max={col.max():.5f}  std={col.std():.5f}")
 
-    print("  Per-step L1 (raw scale, averaged over samples):")
+    print("  Per-step L1 (physical, averaged over samples):")
     step_mean = per_step_arr.mean(axis=0)
     for h in range(per_step_arr.shape[1]):
         print(f"    step {h:>2d}: {step_mean[h]:.5f}")

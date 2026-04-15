@@ -34,10 +34,11 @@ import torch
 from module import ARPredictor, PAD_TOKEN_ID
 
 def main():
-    # Create a minimal ARPredictor (only need mask logic, not weights)
+    # Create a minimal ARPredictor (only need mask logic, not weights).
+    # proprio_dim matches the production default (9d = ee_pos(3)+quat(4)+grip(2)).
     pred = ARPredictor(
         embed_dim=32, depth=1, heads=1, dim_head=32, mlp_dim=64,
-        max_action_tokens=6, max_lang_tokens=5, proprio_dim=8,
+        max_action_tokens=6, max_lang_tokens=5, proprio_dim=9,
     )
 
     B = 1
