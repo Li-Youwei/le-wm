@@ -524,10 +524,18 @@ def main():
     device = torch.device(args.device)
     np.random.seed(args.seed)
 
-    # Load model
+    # Load model — two formats supported:
+    #   _weights.ckpt  = Lightning state_dict (from spt.Manager)
+    #   _object.ckpt   = torch.save(model) pickle (from ModelObjectCallBack)
     print("Loading model...")
-    model = build_model(device, use_language=use_language)
-    load_checkpoint(model, args.checkpoint, device)
+    if args.checkpoint.endswith("_object.ckpt"):
+        # Object checkpoint: torch.save(model) — loads the full JEPA directly.
+        print(f"  Loading object checkpoint: {args.checkpoint}")
+        model = torch.load(args.checkpoint, map_location=device, weights_only=False)
+    else:
+        # Lightning checkpoint: build architecture then load state_dict.
+        model = build_model(device, use_language=use_language)
+        load_checkpoint(model, args.checkpoint, device)
     model.eval()
 
     # Load FAST tokenizer
