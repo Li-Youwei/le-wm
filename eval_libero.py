@@ -281,7 +281,7 @@ def _read_osc_scales(env: OffScreenRenderEnv) -> tuple[float, float]:
     assert np.allclose(output_max[3:6], rot_scale), (
         f"OSC rot scales not uniform: {output_max[3:6]}"
     )
-    assert ctrl.input_max == 1.0 and ctrl.input_min == -1.0, (
+    assert np.all(np.asarray(ctrl.input_max) == 1.0) and np.all(np.asarray(ctrl.input_min) == -1.0), (
         f"OSC input range not [-1, 1]: [{ctrl.input_min}, {ctrl.input_max}]"
     )
     print(f"  OSC scales read from controller: pos={pos_scale}, rot={rot_scale}")
