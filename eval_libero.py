@@ -384,7 +384,7 @@ def evaluate_task(
     save_videos: bool = False,
     video_dir: str | None = None,
     task_name: str = "",
-    max_video_episodes: int = 3,
+    max_video_episodes: int = 999,
     use_language: bool = True,
 ) -> tuple[int, int]:
     """Run episodes and count successes."""
@@ -510,7 +510,8 @@ def main():
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--save-videos", action="store_true", help="Save rollout videos for first 3 episodes per task")
     parser.add_argument("--video-dir", type=str, default="/Data/lyw/eval_videos", help="Directory to save videos")
-    parser.add_argument("--max-video-episodes", type=int, default=3, help="Max episodes per task to record")
+    parser.add_argument("--max-video-episodes", type=int, default=999,
+                        help="Max episodes per task to record (default: all)")
     parser.add_argument("--no-language", action="store_true",
                         help="Ablation: evaluate a model trained without the language instruction. "
                              "Must match the checkpoint's training-time use_language setting.")
