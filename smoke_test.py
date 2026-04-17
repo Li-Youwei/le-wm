@@ -83,7 +83,7 @@ def create_model(device: torch.device) -> JEPA:
         input_dim=hidden_dim,
         output_dim=EMBED_DIM,
         hidden_dim=2048,
-        norm_fn=nn.BatchNorm1d,
+        norm_fn=nn.LayerNorm,
     )
 
     # T5-small (frozen)

@@ -56,6 +56,7 @@ def lejepa_forward(self, batch, stage, cfg):
         action_logits.reshape(-1, ACTION_HEAD_SIZE),
         targets.reshape(-1),
         ignore_index=-100,
+        label_smoothing=0.1,
     )
     output["loss"] = output["ce_loss"]
 
@@ -189,7 +190,7 @@ def run(cfg):
         input_dim=hidden_dim,
         output_dim=embed_dim,
         hidden_dim=2048,
-        norm_fn=torch.nn.BatchNorm1d,
+        norm_fn=torch.nn.LayerNorm,
     )
 
     if use_language:

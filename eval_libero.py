@@ -79,7 +79,7 @@ def build_model(device: torch.device, use_language: bool = True) -> torch.nn.Mod
         depth=6, heads=16, dim_head=64, mlp_dim=2048, dropout=0.1, emb_dropout=0.0,
     )
     projector = MLP(input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048,
-                    norm_fn=torch.nn.BatchNorm1d)
+                    norm_fn=torch.nn.LayerNorm)
 
     if use_language:
         # T5-small (frozen)
@@ -350,7 +350,7 @@ def _execute_chunk_closed_loop(
         action_input = np.concatenate([
             np.clip(step_delta_pos / pos_scale, -1.0, 1.0),
             np.clip(step_delta_rotvec / rot_scale, -1.0, 1.0),
-            [gripper_cmd],
+            [np.clip(gripper_cmd, -1.0, 1.0)],
         ]).astype(np.float32)
 
         obs, reward, done, info = env.step(action_input)

@@ -497,6 +497,11 @@ class ARPredictor(nn.Module):
             # Logits at last position
             logits = self.action_head(x[:, -1])  # (B, ACTION_HEAD_SIZE)
 
+            # Prevent BOS from being sampled — it's a start marker, not a valid
+            # action token.  Without this mask the model could (rarely) emit 1024
+            # which the FAST BPE decoder doesn't expect.
+            logits[:, BOS_TOKEN_ID] = -float("inf")
+
             if temperature <= 0:
                 next_token = logits.argmax(dim=-1)
             else:
