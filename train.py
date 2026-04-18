@@ -51,12 +51,15 @@ def lejepa_forward(self, batch, stage, cfg):
         targets[i, k] = EOS_TOKEN_ID           # EOS after last real token
 
     # 5. L_CE only
+    # label_smoothing defaults to 0.1 for backward compat; override via
+    # `label_smoothing=0` on the CLI to run a no-regularization ablation.
+    label_smoothing = float(cfg.get("label_smoothing", 0.1))
     output = {}
     output["ce_loss"] = F.cross_entropy(
         action_logits.reshape(-1, ACTION_HEAD_SIZE),
         targets.reshape(-1),
         ignore_index=-100,
-        label_smoothing=0.1,
+        label_smoothing=label_smoothing,
     )
     output["loss"] = output["ce_loss"]
 

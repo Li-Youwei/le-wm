@@ -32,6 +32,9 @@ optimizer:
   lr: 5e-5
   weight_decay: 0.05
 
+# CE label smoothing — overridden to 0 in the no-regularization ablation.
+label_smoothing: 0.1
+
 wm:
   type: vla_baseline
   embed_dim: 192
