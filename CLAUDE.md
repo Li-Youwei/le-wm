@@ -13,8 +13,10 @@ loss weights:
 
 1. **Frozen baseline** (`pred_weight = sigreg_weight = 0`, default in
    `config/train/lewm.yaml`). Loss = `L_CE` only. This is the
-   reproducibility target frozen at commit `7008f15` and trained on
-   LIBERO-Spatial.
+   reproducibility target frozen at commit `7008f15`. **Joint-trained on
+   the 10 LIBERO-Spatial tasks** (single checkpoint covering all tasks;
+   the model disambiguates them via the language instruction). Achieved
+   65% average success across 10 tasks at evaluation.
 2. **State-prediction extension** (`pred_weight > 0`, optionally
    `sigreg_weight > 0`). Adds three STATE_QUERY tokens (`Q_ag`, `Q_hd`,
    `Q_pr`) to the predictor sequence at training time, which read out
@@ -298,7 +300,8 @@ next section.
 - **No world model prediction (in baseline)**: no STATE_QUERY, no L_pred, no future frame encoding
 - **No SIGReg (in baseline)**: class kept in `module.py` but only instantiated when `sigreg_weight > 0`
 - **No CEM planning (ever)**: actions are directly generated via autoregressive decoding, not searched
-- **No multi-task training**: one checkpoint per LIBERO-Spatial task (10 checkpoints total for the frozen baseline). Language is the only per-task conditioning signal; within a single task every sample shares the same instruction. The pipeline's 4-suite capability is documented in the `run_all_suites.sh` row of the Baseline Implementation table below, but the frozen baseline itself was only trained on LIBERO-Spatial.
+- **Joint training across all 10 LIBERO-Spatial tasks** (one checkpoint, ~65 K chunks total). The language instruction is the sole per-task disambiguation signal — chunks from different tasks have different `language_instruction` strings tokenized by frozen T5. The frozen baseline at `7008f15` was trained this way (see `/Data/lyw/checkpoints/multitask_ln_100ep/config.yaml` on the GPU server: `hdf5_dir: /Data/lyw/libero_processed/libero_spatial` points at the suite directory, so `LiberoDataset` globs all 10 `.h5` files).
+- **Note on `run_all_suites.sh`**: this script runs a per-task training loop (one checkpoint per task) across all 4 suites. The frozen baseline did **not** use this script — `run_all_suites.sh` is an alternative pipeline that exists but was never the basis for the 65 % number. Do not confuse the two.
 - **No history context**: single-frame input per view — each observation is a single timestep (one agentview + one eye_in_hand + one proprio reading). Multi-frame history is a potential follow-up.
 
 ## State-Prediction Extension
@@ -704,7 +707,7 @@ that case (`z_ag_t`, `z_hd_t`).
 
 ## Key Details
 
-- **Data layout**: training HDF5 under `${STABLEWM_HOME}/libero/`; per-suite preprocessed output under `${DATA_ROOT}/libero_processed/<suite>/` (one `.h5` per task); per-task checkpoints under `${DATA_ROOT}/stable-wm/<suite>/<task>/`.
+- **Data layout**: training HDF5 under `${STABLEWM_HOME}/libero/`; per-suite preprocessed output under `${DATA_ROOT}/libero_processed/<suite>/` (one `.h5` per task — the **directory** is what `LiberoDataset` consumes for joint training, not individual files). Frozen baseline checkpoint lives at `/Data/lyw/checkpoints/multitask_ln_100ep/lewm_weights.ckpt` (single ckpt joint-trained on the suite). The `${DATA_ROOT}/stable-wm/<suite>/<task>/` per-task layout exists only for the alternative `run_all_suites.sh` pipeline and is **not** how the frozen 65 % baseline was produced.
 - **FAST tokens**: variable-length int32 (`h5py.vlen_dtype`) per sample; each preprocessed HDF5 stores its own `action_low` / `action_high` percentile bounds (for inverse normalization at eval time), `chunk_size`, `chunk_stride`, and `language_instruction` in the file attrs.
 - **Device handling**: no hardcoded `cuda` — tensor device is inferred from inputs; the caller moves `JEPA` to the target device.
 - **Checkpoint formats**:
