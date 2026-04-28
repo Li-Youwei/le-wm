@@ -90,12 +90,16 @@ for raw_hdf5 in "$RAW_ROOT"/*.hdf5; do
         export STABLEWM_HOME="$task_ckpt_dir"
         mkdir -p "$task_ckpt_dir"
 
+        # `trainer.devices=1` REQUIRED — train.py M3 guard rejects 'auto'
+        # when projector.norm_type=batch to prevent silent multi-GPU
+        # BatchNorm divergence. Explicit single-GPU is the safe path.
         if ! python train.py \
             data=libero \
             data.dataset.hdf5_dir="$task_data_dir" \
             loss.pred_weight="$PRED_WEIGHT" \
             loss.sigreg_weight="$SIGREG_WEIGHT" \
             projector.norm_type=batch \
+            trainer.devices=1 \
             loader.batch_size="$BATCH_SIZE" \
             trainer.max_epochs="$MAX_EPOCHS" \
             subdir="" \
