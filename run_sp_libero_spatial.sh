@@ -36,7 +36,13 @@ NUM_EPISODES=20
 MAX_STEPS=300
 CHUNK_SIZE=20
 CHUNK_STRIDE=1
-MAX_EPOCHS=50          # baseline used 100 but best-val was ~epoch 25-40
+MAX_EPOCHS=100         # baseline default — SP needs more than 50:
+                       # 50-epoch runs converged to token_accuracy ~22%,
+                       # producing 0/20 success. SP has 2 extra losses
+                       # (L_pred + L_sigreg) competing with L_CE for
+                       # gradient capacity, so it converges slower than
+                       # the action-only baseline. Match baseline's 100
+                       # rather than try to economize.
 BATCH_SIZE=64          # conservative — bf16 + SP cat-ViT may OOM at 128
 PRED_WEIGHT=1.0
 SIGREG_WEIGHT=0.1
