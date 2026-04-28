@@ -485,7 +485,7 @@ introduces three side effects worth knowing about:
 | `module.py::ARPredictor` | Adds `state_query_embeddings` (3,D), three prediction heads, an extended attention mask, and an extra type embedding row (5 instead of 4). `forward()` returns `(action_logits, pred_ag, pred_hd, pred_pr)` instead of just `action_logits`. `generate()` is **unchanged** — STATE_QUERY tokens are training-only. |
 | `jepa.py::JEPA` | Adds `encode_future_visual()` that runs the SHARED ViT + projector on the t+H frames with NO `.detach()`. |
 | `train.py::lejepa_forward` | Computes `L_pred` (3 MSE) when `pred_weight > 0`, computes `L_sigreg` on the encoder-only 4-stream stack when `sigreg_weight > 0`, sums into `L_total`. Validates `projector.norm_type == 'batch'` when SIGReg is on. |
-| `eval_libero.py` | **Unchanged.** Loading SP-trained checkpoints requires `_object.ckpt` format (the `_weights.ckpt` path's `build_model` constructs the baseline architecture; a state-dict mismatch would error on `state_pred_head_*` and the larger `pos_embedding` / `type_embedding`). `_object.ckpt` is saved every epoch by `ModelObjectCallBack`, so this is the recommended path for SP eval. |
+| `eval_libero.py` | Inference flow `[lang, z_ag, z_hd, z_pr, BOS] → AR decode → FAST` is unchanged. The only delta is `load_checkpoint()` now hard-rejects non-baseline `_weights.ckpt` payloads (SP keys OR BatchNorm projector running stats) with a clear message pointing at `_object.ckpt`. Both SP-trained and "SIGReg-only no SP" ablation checkpoints must be evaluated via the per-epoch `_object.ckpt` produced by `ModelObjectCallBack`. |
 
 ### How to enable
 
@@ -506,6 +506,42 @@ python eval_libero.py \
     --processed-dir /path/to/libero_processed/<suite>/ \
     --suite libero_spatial
 ```
+
+### Known concerns (not auto-fixed)
+
+These are issues identified during code audit that we deliberately did
+NOT auto-patch, because the right fix requires data-level evidence we
+can only collect on the GPU server.
+
+**Quaternion sign ambiguity in `proprio_future` MSE.**
+A unit quaternion `q` and its negation `-q` represent the same rotation,
+but `MSE(q, -q) = 4` (large). If LIBERO's MuJoCo simulator ever flips
+the sign of `obs/robot_states[:, 5:9]` between raw step `t` and `t+H`
+within a single demo (e.g., when crossing the antipodal hemisphere
+boundary), `loss_pred_pr` will spike at those samples even though the
+predicted rotation is correct.
+
+We did NOT add hemisphere canonicalization (`if q[3] < 0: q = -q`) to
+`normalize_proprio` because:
+1. We can't verify locally whether LIBERO actually produces sign flips
+   (likely rare for short H=20 chunks in continuous trajectories, but
+   not impossible).
+2. `eval_libero.py::preprocess_obs` calls `normalize_proprio` at runtime
+   on environment observations. Adding canonicalization would change
+   the proprio distribution that the **frozen baseline** (trained on
+   un-canonicalized data, ckpt at `7008f15`) sees at eval time —
+   risking unmeasured eval drift on the baseline.
+
+If `loss_pred_pr` shows unexplained spikes during SP training, add this
+to `normalize_proprio`:
+```python
+# Hemisphere canonicalization: q and -q encode the same rotation.
+# Force w >= 0 so MSE(pred, target) doesn't pay the antipodal cost.
+neg_w = out[..., 6] < 0  # w is the last quat component (xyzw layout, [3:7])
+out[..., 3:7] = np.where(neg_w[..., None], -out[..., 3:7], out[..., 3:7])
+```
+…and re-preprocess. Keep the baseline ckpt out of any eval that uses
+the canonicalized version (use a separate processed-dir).
 
 ## Development Environment
 

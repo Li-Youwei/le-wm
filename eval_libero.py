@@ -76,7 +76,12 @@ def build_model(device: torch.device, use_language: bool = True) -> torch.nn.Mod
     predictor = ARPredictor(
         embed_dim=embed_dim, max_action_tokens=80, max_lang_tokens=25,
         proprio_dim=9,
-        depth=6, heads=16, dim_head=64, mlp_dim=2048, dropout=0.1, emb_dropout=0.0,
+        # dropout=0.2 mirrors config/train/lewm.yaml (the frozen baseline's
+        # actual training value). Eval mode is no-op for nn.Dropout, so this
+        # has no inference effect, but it keeps the constructor call honest
+        # and stops future maintainers from chasing a phantom mismatch when
+        # they cross-reference eval and training code.
+        depth=6, heads=16, dim_head=64, mlp_dim=2048, dropout=0.2, emb_dropout=0.0,
     )
     projector = MLP(input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048,
                     norm_fn=torch.nn.LayerNorm)
@@ -110,18 +115,33 @@ def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     state_dict = ckpt["state_dict"]
 
-    # Reject SP-trained checkpoints loaded via the _weights.ckpt path —
-    # build_model() constructs the baseline architecture (no state_pred_head_*,
-    # smaller pos_embedding / type_embedding), so a strict load would shape-
-    # mismatch with confusing torch errors. SP checkpoints must be loaded via
-    # the per-epoch _object.ckpt produced by ModelObjectCallBack.
+    # Reject any non-baseline-architecture checkpoint loaded via the
+    # _weights.ckpt path — build_model() constructs the baseline architecture
+    # (no state_pred_head_*, no state_query_embeddings, LayerNorm projector),
+    # so loading a checkpoint with extra keys would either fail with a
+    # confusing torch shape-mismatch error or (worse) silently pass with
+    # strict=False and skip critical parameters.
+    #
+    # Two known deviations both require _object.ckpt:
+    #   1. SP-trained: state_pred_head_* / state_query_embeddings keys.
+    #   2. BatchNorm-projector: projector.net.1.running_mean buffer (BN1d
+    #      tracks running stats; LayerNorm has no such buffer). This catches
+    #      the legitimate "SIGReg-only, no SP" ablation as well, where
+    #      projector.norm_type='batch' but no SP heads exist.
     sp_keys = [k for k in state_dict if "state_pred_head" in k or "state_query_embeddings" in k]
-    if sp_keys and not ckpt_path.endswith("_object.ckpt"):
+    bn_keys = [k for k in state_dict if "projector.net.1.running_mean" in k]
+    if (sp_keys or bn_keys) and not ckpt_path.endswith("_object.ckpt"):
+        reasons = []
+        if sp_keys:
+            reasons.append(f"state-prediction keys ({sp_keys[:2]}{'...' if len(sp_keys) > 2 else ''})")
+        if bn_keys:
+            reasons.append(f"BatchNorm projector running stats ({bn_keys[:1]})")
         raise ValueError(
-            f"Checkpoint '{ckpt_path}' contains state-prediction keys "
-            f"({sp_keys[:3]}{'...' if len(sp_keys) > 3 else ''}) but is not an "
-            "_object.ckpt. SP-trained models must be evaluated via the per-epoch "
-            "object checkpoint — pass --checkpoint .../lewm_epoch_{N}_object.ckpt."
+            f"Checkpoint '{ckpt_path}' has {' and '.join(reasons)} but is not "
+            "an _object.ckpt. Non-baseline architectures (SP-trained or "
+            "BatchNorm-projector / SIGReg-trained) must be evaluated via the "
+            "per-epoch object checkpoint produced by ModelObjectCallBack — "
+            "pass --checkpoint .../lewm_epoch_{N}_object.ckpt instead."
         )
 
     has_lang_module = getattr(model, "lang_encoder", None) is not None

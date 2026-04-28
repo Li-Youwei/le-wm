@@ -100,13 +100,15 @@ class LiberoDataset(Dataset):
 
         for fpath in self.files:
             with h5py.File(fpath, "r") as f:
-                # Determine sample count — try new key first, fall back to old
-                if "image_agent" in f:
-                    n_samples = f["image_agent"].shape[0]
-                elif "image_current" in f:
-                    n_samples = f["image_current"].shape[0]
-                else:
-                    raise KeyError(f"No image_agent or image_current in {fpath}")
+                # All preprocessed HDF5 produced by the current pipeline have
+                # `image_agent` (agent view) and `image_hand` (eye-in-hand)
+                # at the top level. The old single-view name `image_current`
+                # had no `image_hand` companion, so any file with that legacy
+                # name would already fail at the hand-image load below — the
+                # fallback was effectively dead. Removed for clarity.
+                if "image_agent" not in f:
+                    raise KeyError(f"No 'image_agent' in {fpath}")
+                n_samples = f["image_agent"].shape[0]
 
                 # When state prediction is enabled, all three future fields
                 # MUST exist in the HDF5 — fail fast with a clear message
@@ -167,16 +169,14 @@ class LiberoDataset(Dataset):
         fpath, local_idx = self._index[idx]
         f = self._get_file(fpath)
 
-        # Images: uint8 HWC → float32 CHW (3, 224, 224) ImageNet-normalized
-        # Handle both new and old HDF5 key names
-        agent_key = "image_agent" if "image_agent" in f else "image_current"
-        img_agent = _preprocess_image(f[agent_key][local_idx], self.img_size)
-
-        hand_key = "image_hand"
-        if hand_key not in f:
-            raise KeyError(f"No '{hand_key}' dataset in {fpath}. "
-                           f"Re-run preprocess_libero.py to generate new format.")
-        img_hand = _preprocess_image(f[hand_key][local_idx], self.img_size)
+        # Images: uint8 HWC → float32 CHW (3, 224, 224) ImageNet-normalized.
+        # Existence of both keys was checked in __init__.
+        img_agent = _preprocess_image(f["image_agent"][local_idx], self.img_size)
+        if "image_hand" not in f:
+            raise KeyError(
+                f"No 'image_hand' dataset in {fpath}. Re-run preprocess_libero.py."
+            )
+        img_hand = _preprocess_image(f["image_hand"][local_idx], self.img_size)
 
         # Proprioception: (9,) float64 → float32 tensor
         # [ee_pos(3) + xyzw_quat(4) + gripper_raw(2)] — see preprocess_libero.py

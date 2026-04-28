@@ -385,10 +385,18 @@ def _patch_saved_tokenizer(save_dir: Path) -> None:
 
     save_pretrained() writes the BPE vocab and config, but omits:
     1. The custom processor Python file (processing_action_tokenizer.py)
-    2. The auto_map entry in preprocessor_config.json
+    2. The auto_map entry in processor_config.json
 
     Without these, AutoProcessor.from_pretrained() loads a plain HF tokenizer
     that can't handle numpy action chunks.
+
+    Note on filename: ``ProcessorMixin.save_pretrained`` writes
+    ``processor_config.json`` (NOT ``preprocessor_config.json``, which is
+    the ``ImageProcessingMixin``/``FeatureExtractorMixin`` filename). An
+    earlier version of this function wrote to ``preprocessor_config.json``,
+    which silently created an unreferenced file and left ``--load-tokenizer``
+    falling back to the plain HF tokenizer. Verified against the live
+    layout in ``data/fast_tokenizer/`` (contains ``processor_config.json``).
     """
     # 1. Copy processing_action_tokenizer.py into the saved directory
     processor_src = Path(__file__).parent / "data" / "fast_tokenizer" / "processing_action_tokenizer.py"
@@ -397,8 +405,8 @@ def _patch_saved_tokenizer(save_dir: Path) -> None:
     else:
         print(f"  WARNING: {processor_src} not found, skipping processor file copy")
 
-    # 2. Inject auto_map into preprocessor_config.json
-    config_path = save_dir / "preprocessor_config.json"
+    # 2. Inject auto_map into processor_config.json (NOT preprocessor_config.json)
+    config_path = save_dir / "processor_config.json"
     if config_path.exists():
         config = json.loads(config_path.read_text())
     else:
