@@ -18,6 +18,19 @@
 #   CUDA_VISIBLE_DEVICES=0 python train.py --config-name=overfit \
 #       data.dataset.hdf5_dir=/Data/lyw/libero_processed/libero_spatial/.train_pick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate \
 #       subdir=overfit_sanity
+#
+# WARNING — overfit + state-prediction (SP) interaction:
+#   When running this config with `loss.pred_weight>0` and
+#   `loss.sigreg_weight>0`, you MUST also bump `loader.batch_size` to >= 32.
+#   The default batch_size=8 below is too small for the BatchNorm projector
+#   that SIGReg requires (running stats become noise) and for SIGReg's own
+#   normality test (B=8 makes the Epps–Pulley statistic high-variance).
+#   Recommended SP-overfit invocation:
+#     python train.py --config-name=overfit \
+#         loss.pred_weight=1.0 loss.sigreg_weight=0.1 \
+#         projector.norm_type=batch \
+#         loader.batch_size=32 \
+#         data.dataset.hdf5_dir=...
 # -----------------------------------------------------------------------------
 
 defaults:

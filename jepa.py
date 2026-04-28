@@ -47,6 +47,13 @@ class JEPA(nn.Module):
     ):
         """Encode both views + (optionally) language.
 
+        Performance note: the two views are concatenated along the batch
+        dimension and run through the SHARED ViT in **one** forward pass
+        instead of two sequential calls. This roughly halves the visual
+        wall-clock time (one CUDA kernel launch + better GPU utilization)
+        and gives a BatchNorm projector 2× the samples per call to estimate
+        running statistics.
+
         Args:
             pixels_agent: (B, C, H, W) agentview image.
             pixels_hand: (B, C, H, W) eye-in-hand image.
@@ -60,12 +67,11 @@ class JEPA(nn.Module):
                 or None when language is disabled.
             lang_lengths: (B,) real language token count per sample, or None.
         """
-        # Visual: shared ViT encoder for both views
-        agent_out = self.encoder(pixels_agent, interpolate_pos_encoding=True)
-        z_agent = self.projector(agent_out.last_hidden_state[:, 0])  # CLS token
-
-        hand_out = self.encoder(pixels_hand, interpolate_pos_encoding=True)
-        z_hand = self.projector(hand_out.last_hidden_state[:, 0])  # CLS, same encoder
+        # Visual: cat both views, single ViT pass, then split.
+        visual_cat = torch.cat([pixels_agent, pixels_hand], dim=0)  # (2B, C, H, W)
+        visual_out = self.encoder(visual_cat, interpolate_pos_encoding=True)
+        visual_z = self.projector(visual_out.last_hidden_state[:, 0])  # (2B, D)
+        z_agent, z_hand = visual_z.chunk(2, dim=0)  # (B, D), (B, D)
 
         # Language: only when encoder is present AND tokens are provided
         if self.lang_encoder is not None and lang_input_ids is not None:
@@ -97,12 +103,47 @@ class JEPA(nn.Module):
             action_lengths: (B,) real token count per sample.
 
         Returns:
-            action_logits: (B, 1+max_action_tokens, 1026)
+            When the underlying predictor has ``use_state_prediction=False``:
+                action_logits: (B, 1+max_action_tokens, 1026)
+            When ``use_state_prediction=True``:
+                Tuple ``(action_logits, pred_ag, pred_hd, pred_pr)``;
+                see ``ARPredictor.forward`` for shapes.
         """
         return self.predictor(
             z_agent, z_hand, proprio, lang_embeds, lang_lengths,
             action_tokens, action_lengths,
         )
+
+    def encode_future_visual(self, pixels_agent_future, pixels_hand_future):
+        """Encode future-frame visual inputs through the SHARED ViT + projector.
+
+        Used by the state-prediction branch (``use_state_prediction=True``).
+        Following LeWM paper Section 3 — "We do not employ stop-gradient,
+        exponential moving averages, or additional stabilization heuristics.
+        Gradients are propagated through all components of the loss" — this
+        method does NOT call ``.detach()`` on its outputs. The caller
+        (train.py) must also avoid stop-grad. SIGReg on the encoder outputs
+        is what prevents collapse, not stop-gradient.
+
+        Performance note: same cat-then-split optimization as ``encode()``;
+        the two future views go through the ViT in one forward pass. Total
+        ViT calls per training step in SP mode = 2 (down from 4).
+
+        Args:
+            pixels_agent_future: (B, 3, H, W) agentview image at raw step t+H.
+            pixels_hand_future: (B, 3, H, W) hand-cam image at raw step t+H.
+
+        Returns:
+            z_agent_future: (B, D) future agentview latent.
+            z_hand_future: (B, D) future hand-cam latent.
+        """
+        visual_cat = torch.cat(
+            [pixels_agent_future, pixels_hand_future], dim=0,
+        )  # (2B, C, H, W)
+        visual_out = self.encoder(visual_cat, interpolate_pos_encoding=True)
+        visual_z = self.projector(visual_out.last_hidden_state[:, 0])  # (2B, D)
+        z_agent_future, z_hand_future = visual_z.chunk(2, dim=0)
+        return z_agent_future, z_hand_future
 
     def predict_actions(self, z_agent, z_hand, proprio, lang_embeds, lang_lengths,
                         max_len=80, temperature=0.0):

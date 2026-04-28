@@ -256,6 +256,14 @@ def extract_chunks(
         "image_agent": [],
         "image_hand": [],
         "proprio": [],
+        # State-prediction targets (frame at t+H — one step after the chunk
+        # completes). These are required by libero_dataset.py when
+        # ``use_state_prediction=True`` is set in the training config. They
+        # always populated here so downstream code can pick them up without
+        # needing to re-preprocess for every ablation toggle.
+        "image_agent_future": [],
+        "image_hand_future": [],
+        "proprio_future": [],
         "continuous_actions": [],  # anchor-relative, physical units (meters/rad/command)
         "demo_idx": [],
         "chunk_idx": [],
@@ -325,9 +333,17 @@ def extract_chunks(
         # Anchor state per chunk
         for ci in range(n_chunks):
             t = int(starts_arr[ci])
+            t_future = t + H  # frame at t+H — same index already loaded above
 
             samples["image_agent"].append(agent_imgs[t])  # (H_img, W_img, 3) uint8
             samples["image_hand"].append(hand_imgs[t])
+
+            # State-prediction targets at t+H (LeWM-style next-embedding loss).
+            # The chunk-validity range t <= T-H-1 already guarantees t+H <= T-1,
+            # and we read up to last_obs_idx = (n_chunks-1)*stride + H above,
+            # so agent_imgs[t+H] / hand_imgs[t+H] are always in-bounds here.
+            samples["image_agent_future"].append(agent_imgs[t_future])
+            samples["image_hand_future"].append(hand_imgs[t_future])
 
             # 9D proprio: ee_pos(3) + xyzw-quat(4) + gripper_states raw(2)
             # NEVER mean/abs the gripper — fingers are symmetric, averaging destroys info.
@@ -337,6 +353,15 @@ def extract_chunks(
                 grip_states[t],           # (2,) raw two finger joint positions
             ])
             samples["proprio"].append(normalize_proprio(proprio_raw))  # (9,) float64
+
+            # Same 9D layout at t+H — single source of truth for proprio
+            # normalization is `normalize_proprio` (re-normalizes the quat).
+            proprio_future_raw = np.concatenate([
+                ee_pos[t_future],
+                robot_states[t_future, 5:9],
+                grip_states[t_future],
+            ])
+            samples["proprio_future"].append(normalize_proprio(proprio_future_raw))
 
             samples["continuous_actions"].append(chunks[ci])  # (H, 7) physical units
             samples["demo_idx"].append(demo_i)
@@ -535,14 +560,38 @@ def save_hdf5(
             compression="gzip",
             compression_opts=4,
         )
+        # --- Future-frame images at raw step t+H (state-prediction target) ---
+        ds_agent_future = out.create_dataset(
+            "image_agent_future",
+            shape=(N, *img_shape),
+            dtype=np.uint8,
+            chunks=(1, *img_shape),
+            compression="gzip",
+            compression_opts=4,
+        )
+        ds_hand_future = out.create_dataset(
+            "image_hand_future",
+            shape=(N, *img_shape),
+            dtype=np.uint8,
+            chunks=(1, *img_shape),
+            compression="gzip",
+            compression_opts=4,
+        )
         for i in range(N):
             ds_agent[i] = samples["image_agent"][i]
             ds_hand[i] = samples["image_hand"][i]
+            ds_agent_future[i] = samples["image_agent_future"][i]
+            ds_hand_future[i] = samples["image_hand_future"][i]
 
-        # --- Proprioception ---
+        # --- Proprioception (current and future) ---
         out.create_dataset(
             "proprio",
             data=np.stack(samples["proprio"], axis=0),  # (N, 9)
+            dtype=np.float64,
+        )
+        out.create_dataset(
+            "proprio_future",
+            data=np.stack(samples["proprio_future"], axis=0),  # (N, 9) at t+H
             dtype=np.float64,
         )
 

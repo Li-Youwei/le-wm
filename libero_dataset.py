@@ -75,11 +75,13 @@ class LiberoDataset(Dataset):
         max_lang_tokens: int = 25,
         img_size: int = 224,
         use_language: bool = True,
+        use_state_prediction: bool = False,
     ):
         self.max_action_tokens = max_action_tokens
         self.max_lang_tokens = max_lang_tokens
         self.img_size = img_size
         self.use_language = use_language
+        self.use_state_prediction = use_state_prediction
 
         # Discover all HDF5 files and build a global index
         hdf5_dir = Path(hdf5_dir)
@@ -105,6 +107,23 @@ class LiberoDataset(Dataset):
                     n_samples = f["image_current"].shape[0]
                 else:
                     raise KeyError(f"No image_agent or image_current in {fpath}")
+
+                # When state prediction is enabled, all three future fields
+                # MUST exist in the HDF5 — fail fast with a clear message
+                # rather than silently broadcasting current frame as future.
+                # (Old preprocessed HDF5 from the frozen baseline does not
+                # have these; users must re-run preprocess_libero.py.)
+                if use_state_prediction:
+                    missing = [
+                        key for key in ("image_agent_future", "image_hand_future", "proprio_future")
+                        if key not in f
+                    ]
+                    if missing:
+                        raise KeyError(
+                            f"State-prediction enabled but {fpath.name} lacks "
+                            f"future fields: {missing}. Re-run preprocess_libero.py "
+                            "to regenerate (it will add the t+H frames)."
+                        )
 
                 # Read language instruction only if needed
                 if use_language:
@@ -190,6 +209,19 @@ class LiberoDataset(Dataset):
             lang_ids, lang_mask = self._lang_cache[fpath]
             item["lang_input_ids"] = lang_ids                           # (max_lang_tokens,)
             item["lang_attention_mask"] = lang_mask                     # (max_lang_tokens,)
+
+        # Future-frame state-prediction targets (only when enabled).
+        # Existence was asserted in __init__; here we just read them.
+        if self.use_state_prediction:
+            item["pixels_agent_future"] = _preprocess_image(
+                f["image_agent_future"][local_idx], self.img_size,
+            )
+            item["pixels_hand_future"] = _preprocess_image(
+                f["image_hand_future"][local_idx], self.img_size,
+            )
+            item["proprio_future"] = torch.from_numpy(
+                np.array(f["proprio_future"][local_idx], dtype=np.float32),
+            )
 
         return item
 

@@ -11,3 +11,11 @@ dataset:
   # Ablation switch: set false to drop the language instruction entirely
   # (T5 encoder is not loaded, prefix becomes [z_ag, z_hd, z_pr, BOS, ...]).
   use_language: true
+  # State-prediction switch: when true, dataset additionally loads
+  # image_agent_future / image_hand_future / proprio_future from the preprocessed
+  # HDF5. Old HDF5 files (preprocessed before the state-prediction extension)
+  # do not contain these fields — LiberoDataset.__init__ asserts their presence
+  # only when this flag is true.
+  # Driven automatically by train.py from cfg.loss.pred_weight > 0; do not set
+  # this field manually unless you are bypassing the train.py auto-wiring.
+  use_state_prediction: false

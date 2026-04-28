@@ -110,6 +110,20 @@ def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device
     ckpt = torch.load(ckpt_path, map_location=device, weights_only=True)
     state_dict = ckpt["state_dict"]
 
+    # Reject SP-trained checkpoints loaded via the _weights.ckpt path —
+    # build_model() constructs the baseline architecture (no state_pred_head_*,
+    # smaller pos_embedding / type_embedding), so a strict load would shape-
+    # mismatch with confusing torch errors. SP checkpoints must be loaded via
+    # the per-epoch _object.ckpt produced by ModelObjectCallBack.
+    sp_keys = [k for k in state_dict if "state_pred_head" in k or "state_query_embeddings" in k]
+    if sp_keys and not ckpt_path.endswith("_object.ckpt"):
+        raise ValueError(
+            f"Checkpoint '{ckpt_path}' contains state-prediction keys "
+            f"({sp_keys[:3]}{'...' if len(sp_keys) > 3 else ''}) but is not an "
+            "_object.ckpt. SP-trained models must be evaluated via the per-epoch "
+            "object checkpoint — pass --checkpoint .../lewm_epoch_{N}_object.ckpt."
+        )
+
     has_lang_module = getattr(model, "lang_encoder", None) is not None
 
     # Strip "model." prefix from spt.Module wrapper

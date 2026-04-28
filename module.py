@@ -193,15 +193,31 @@ ACTION_HEAD_SIZE = FAST_VOCAB_SIZE + 2  # 1026: predict 0..1025, PAD excluded
 
 
 class ARPredictor(nn.Module):
-    """Autoregressive predictor for VLA baseline.
+    """Autoregressive predictor for VLA baseline + optional state prediction.
 
-    Processes a unified sequence:
+    Baseline (use_state_prediction=False) processes the unified sequence:
         [l_1...l_n, z_agent, z_hand, z_proprio, BOS, T_1...T_k, PAD...]
 
-    Attention mask is prefix-bidirectional + action-causal:
+    With state prediction enabled (use_state_prediction=True), three query
+    tokens are appended at the end during training:
+        [l_1...l_n, z_agent, z_hand, z_proprio, BOS, T_1...T_k, PAD...,
+         Q_ag, Q_hd, Q_pr]
+
+    The Q tokens read out predicted future latents (z_ag_{t+H}, z_hd_{t+H})
+    and predicted raw future proprio (s_pr_{t+H}, 9d).
+
+    Attention mask is prefix-bidirectional + action-causal + query-isolated:
     - Perception prefix (lang + visual + proprio): bidirectional among real tokens
     - Action tokens (BOS + T_1...T_k): see all real prefix, causal within action group
     - PAD tokens: attend to nothing, no other token attends to them
+    - STATE_QUERY tokens (Q_ag, Q_hd, Q_pr): see all real prefix + real action zone
+      (BOS + real T) + themselves only. The three queries DO NOT attend to each
+      other — this preserves three-way independence of the predictions and
+      prevents one head from copying another's hidden state.
+
+    Inference (`generate()`) does NOT construct STATE_QUERY tokens regardless
+    of the flag, so eval_libero.py flow `[lang, z_ag, z_hd, z_pr, BOS] →
+    autoregressive` is unchanged.
     """
 
     def __init__(
@@ -217,13 +233,22 @@ class ARPredictor(nn.Module):
         proprio_dim: int = 9,
         dropout: float = 0.1,
         emb_dropout: float = 0.0,
+        use_state_prediction: bool = False,
+        state_head_norm_type: str = "layer",
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.max_action_tokens = max_action_tokens
         self.max_lang_tokens = max_lang_tokens
+        self.proprio_dim = proprio_dim
+        self.use_state_prediction = use_state_prediction
+        self.n_state_query = 3 if use_state_prediction else 0
+
         # max_seq_len = lang + z_agent + z_hand + z_proprio + BOS + max_action_tokens
-        self.max_seq_len = max_lang_tokens + 3 + 1 + max_action_tokens
+        # (+ Q_ag + Q_hd + Q_pr when use_state_prediction is True)
+        self.max_seq_len = (
+            max_lang_tokens + 3 + 1 + max_action_tokens + self.n_state_query
+        )
 
         # Proprioception encoder: proprio_dim (9d for LIBERO) → embed_dim
         self.proprio_encoder = MLP(proprio_dim, embed_dim, embed_dim)
@@ -231,14 +256,57 @@ class ARPredictor(nn.Module):
         # Token embeddings for action tokens (FAST vocab + BOS/EOS/PAD)
         self.action_embedding = nn.Embedding(TOTAL_VOCAB_SIZE, embed_dim)  # 1027 entries
 
-        # Type embeddings: 0=language, 1=visual, 2=proprioception, 3=action
-        self.type_embedding = nn.Embedding(4, embed_dim)
+        # Type embeddings: 0=language, 1=visual, 2=proprioception, 3=action,
+        # (4=state_query when use_state_prediction is True).
+        # Size depends on the flag so baseline checkpoints (4-row table) load
+        # cleanly into a baseline-arch model.
+        n_type = 5 if use_state_prediction else 4
+        self.type_embedding = nn.Embedding(n_type, embed_dim)
 
         # Positional encoding (learnable)
         self.pos_embedding = nn.Parameter(torch.randn(1, self.max_seq_len, embed_dim))
 
         # Action classification head: predict vocab 0..1025 (PAD excluded from targets)
         self.action_head = nn.Linear(embed_dim, ACTION_HEAD_SIZE)
+
+        # State-prediction read-out (only when enabled).
+        # Per LeWM paper Section 3: "The predictor is also followed by a
+        # projector network with the same implementation as the one used for
+        # the encoder" — and the encoder projector is a "1-layer MLP with
+        # BatchNorm". Upstream `train.py` confirms this with:
+        #     predictor_proj = MLP(input_dim=hidden_dim, output_dim=embed_dim,
+        #                          hidden_dim=2048, norm_fn=torch.nn.BatchNorm1d)
+        # So each per-query state head here is the SAME MLP signature, with
+        # the norm type mirroring the encoder-side projector (caller passes
+        # `state_head_norm_type` matching `cfg.projector.norm_type`).
+        # The proprio head terminates in `proprio_dim` (9 by default) because
+        # it predicts the RAW future proprio vector — not an embedding.
+        if use_state_prediction:
+            if state_head_norm_type == "batch":
+                head_norm_fn = nn.BatchNorm1d
+            elif state_head_norm_type == "layer":
+                head_norm_fn = nn.LayerNorm
+            else:
+                raise ValueError(
+                    f"state_head_norm_type must be 'batch' or 'layer', got "
+                    f"'{state_head_norm_type}'"
+                )
+
+            # 3 learnable query tokens: Q_ag, Q_hd, Q_pr (one per stream).
+            self.state_query_embeddings = nn.Parameter(
+                torch.randn(3, embed_dim)
+            )
+            # Per-stream projector: matches the encoder-side projector
+            # signature (LeWM paper Sec. 3 + upstream pattern).
+            self.state_pred_head_ag = MLP(
+                embed_dim, 2048, embed_dim, norm_fn=head_norm_fn,
+            )
+            self.state_pred_head_hd = MLP(
+                embed_dim, 2048, embed_dim, norm_fn=head_norm_fn,
+            )
+            self.state_pred_head_pr = MLP(
+                embed_dim, 2048, proprio_dim, norm_fn=head_norm_fn,
+            )
 
         # Transformer blocks
         self.blocks = nn.ModuleList([
@@ -294,9 +362,16 @@ class ARPredictor(nn.Module):
         if action_end <= L:
             is_real[:, action_start:action_end] = (action_tokens != PAD_TOKEN_ID)
 
+        # STATE_QUERY tokens (Q_ag, Q_hd, Q_pr) are always real when present.
+        query_start = action_end
+        query_end = query_start + self.n_state_query
+        if self.n_state_query > 0:
+            is_real[:, query_start:query_end] = True
+
         # --- Zone membership ---
         in_prefix = pos < n_prefix                        # (L,)
         in_action = (pos >= n_prefix) & (pos < action_end)  # (L,) includes BOS
+        # in_query is empty when use_state_prediction is False (query_end == query_start).
 
         # --- Build mask ---
         mask = torch.zeros(B, L, L, dtype=torch.bool, device=device)
@@ -314,6 +389,27 @@ class ARPredictor(nn.Module):
         # Rule 3: Action tokens attend causally to real action tokens (j <= i)
         causal = pos.unsqueeze(0) <= pos.unsqueeze(1)  # (L, L) lower-triangular
         mask |= action_real.unsqueeze(2) & action_real.unsqueeze(1) & causal.unsqueeze(0)
+
+        # Rule 4: STATE_QUERY rows (Q_ag, Q_hd, Q_pr) — only when enabled.
+        # Each Q sees: real prefix + real action zone (BOS + non-PAD T) + itself.
+        # Each Q does NOT see: PAD, OTHER queries (preserves 3-way independence
+        # so pred_pr cannot peek at pred_ag's hidden state, etc.). No token
+        # outside the query group attends to a query (q columns stay all-False).
+        if self.n_state_query > 0:
+            in_query = (pos >= query_start) & (pos < query_end)  # (L,)
+            query_real = is_real & in_query.unsqueeze(0)         # (B, L)
+
+            # Q sees real prefix
+            mask |= query_real.unsqueeze(2) & prefix_real.unsqueeze(1)
+            # Q sees real action zone (BOS + non-PAD action tokens)
+            mask |= query_real.unsqueeze(2) & action_real.unsqueeze(1)
+            # Q sees only itself within the query block — diagonal, NOT bidir
+            eye_L = torch.eye(L, dtype=torch.bool, device=device)
+            mask |= (
+                query_real.unsqueeze(2)
+                & query_real.unsqueeze(1)
+                & eye_L.unsqueeze(0)
+            )
 
         return mask.unsqueeze(1)  # (B, 1, L, L)
 
@@ -372,7 +468,7 @@ class ARPredictor(nn.Module):
         lang_lengths: torch.Tensor | None,
         action_tokens: torch.Tensor,
         action_lengths: torch.Tensor,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
         """Training forward: teacher forcing with unified sequence.
 
         Args:
@@ -387,7 +483,15 @@ class ARPredictor(nn.Module):
             action_lengths: (B,) number of real FAST tokens per sample.
 
         Returns:
-            action_logits: (B, 1+max_action_tokens, 1026) logits at BOS + action positions.
+            When ``use_state_prediction is False`` (baseline):
+                action_logits: (B, 1+max_action_tokens, 1026) logits at BOS + action positions.
+
+            When ``use_state_prediction is True``:
+                Tuple ``(action_logits, pred_ag, pred_hd, pred_pr)`` where
+                  - action_logits: same shape as baseline,
+                  - pred_ag: (B, embed_dim) predicted future agentview latent,
+                  - pred_hd: (B, embed_dim) predicted future hand-cam latent,
+                  - pred_pr: (B, proprio_dim) predicted RAW future proprio.
         """
         B = z_agent.size(0)
         device = z_agent.device
@@ -412,15 +516,25 @@ class ARPredictor(nn.Module):
         bos_action = torch.cat([bos, action_tokens], dim=1)  # (B, 1+max_action_tokens)
         action_emb = self.action_embedding(bos_action) + self.type_embedding.weight[3]
 
-        # 4. Concatenate full sequence
-        x = torch.cat([prefix, action_emb], dim=1)  # (B, L, D)
+        # 4. Concatenate prefix + action zones
+        x = torch.cat([prefix, action_emb], dim=1)  # (B, n_prefix + 1 + max_action_tokens, D)
+
+        # 4b. (Optional) Append STATE_QUERY tokens at the very end. Each
+        # query is a learnable embedding plus the type embedding (index 4).
+        # Index 4 only exists when use_state_prediction is True (n_type=5).
+        if self.use_state_prediction:
+            # state_query_embeddings: (3, D) → (1, 3, D) → (B, 3, D)
+            q_base = self.state_query_embeddings.unsqueeze(0).expand(B, -1, -1)
+            q_emb = q_base + self.type_embedding.weight[4]  # broadcast over (B, 3, D)
+            x = torch.cat([x, q_emb], dim=1)
+
         L = x.size(1)
 
         # 5. Positional embedding + dropout
         x = x + self.pos_embedding[:, :L]
         x = self.dropout(x)
 
-        # 6. Build hybrid attention mask
+        # 6. Build hybrid attention mask (extended with query rules when SP is on)
         attn_mask = self._build_attn_mask(n_lang, lang_lengths, action_tokens, L, device)
 
         # 7. Transformer blocks
@@ -433,7 +547,21 @@ class ARPredictor(nn.Module):
         action_output = x[:, n_prefix:n_prefix + 1 + self.max_action_tokens]  # (B, 1+max_action_tokens, D)
         action_logits = self.action_head(action_output)  # (B, 1+max_action_tokens, ACTION_HEAD_SIZE)
 
-        return action_logits
+        if not self.use_state_prediction:
+            return action_logits
+
+        # 9. Read out the three STATE_QUERY positions and run them through
+        #    their respective heads. Q_ag/Q_hd predict latent (D,), Q_pr
+        #    predicts the raw 9d proprio vector at t+H (NOT an embedding —
+        #    the target is the un-encoded proprio so the loss is in physical
+        #    units).
+        query_start = n_prefix + 1 + self.max_action_tokens
+        q_out = x[:, query_start:query_start + 3]            # (B, 3, D)
+        pred_ag = self.state_pred_head_ag(q_out[:, 0])       # (B, D)
+        pred_hd = self.state_pred_head_hd(q_out[:, 1])       # (B, D)
+        pred_pr = self.state_pred_head_pr(q_out[:, 2])       # (B, proprio_dim)
+
+        return action_logits, pred_ag, pred_hd, pred_pr
 
     @torch.no_grad()
     def generate(
