@@ -26,6 +26,12 @@ SP_PROCESSED="${DATA_ROOT}/libero_processed_v4/libero_spatial"
 SP_CKPT_ROOT="${DATA_ROOT}/stable-wm/sp_libero_spatial"
 RESULTS_LOG="${DATA_ROOT}/sp_libero_spatial_results.txt"
 
+# Pin to a specific GPU (GPU 0 was 16 GB-in-use by another user during the
+# initial run, causing back-to-back OOMs). server-51 has 4× RTX 4090; pick
+# whichever is empty when starting. Override on the CLI:
+#   CUDA_VISIBLE_DEVICES=3 bash run_sp_libero_spatial.sh
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+
 NUM_EPISODES=20
 MAX_STEPS=300
 CHUNK_SIZE=20
