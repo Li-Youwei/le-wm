@@ -24,8 +24,15 @@ RAW_ROOT="/nas_data_new/caz/data_ssd/libero/libero_spatial"
 DATA_ROOT="/Data/lyw"
 TOKENIZER="${DATA_ROOT}/fast_tokenizer"
 SP_PROCESSED="${DATA_ROOT}/libero_processed_v4/libero_spatial"
-SP_CKPT_DIR="${DATA_ROOT}/stable-wm/sp_libero_spatial_joint"
-RESULTS_LOG="${DATA_ROOT}/sp_libero_spatial_joint_results.txt"
+
+# Seed control — pass via CLI: `SEED=42 bash run_sp_libero_spatial.sh`.
+# Output dirs include the seed so multiple seed sweeps coexist; the
+# default 3072 matches config/train/lewm.yaml so a no-arg run reproduces
+# the original sweep.
+SEED="${SEED:-3072}"
+SP_CKPT_DIR="${DATA_ROOT}/stable-wm/sp_libero_spatial_joint_seed${SEED}"
+RESULTS_LOG="${DATA_ROOT}/sp_libero_spatial_joint_seed${SEED}_results.txt"
+EVAL_LOG="${DATA_ROOT}/sp_eval_joint_seed${SEED}.log"
 
 NUM_EPISODES=20
 MAX_STEPS=300
@@ -43,7 +50,8 @@ export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
 mkdir -p "$SP_PROCESSED" "$SP_CKPT_DIR"
 echo "==== SP joint libero_spatial run started $(date) ====" | tee "$RESULTS_LOG"
-echo "GPU: $CUDA_VISIBLE_DEVICES, batch=$BATCH_SIZE, epochs=$MAX_EPOCHS, pred=$PRED_WEIGHT, sigreg=$SIGREG_WEIGHT" | tee -a "$RESULTS_LOG"
+echo "GPU=$CUDA_VISIBLE_DEVICES, seed=$SEED, batch=$BATCH_SIZE, epochs=$MAX_EPOCHS, pred=$PRED_WEIGHT, sigreg=$SIGREG_WEIGHT" | tee -a "$RESULTS_LOG"
+echo "ckpt_dir=$SP_CKPT_DIR" | tee -a "$RESULTS_LOG"
 
 log()  { echo -e "\n$(date '+%H:%M:%S') [INFO] $*"  | tee -a "$RESULTS_LOG"; }
 err()  { echo -e "\n$(date '+%H:%M:%S') [ERR ] $*"  | tee -a "$RESULTS_LOG" >&2; }
@@ -100,6 +108,7 @@ else
         trainer.devices=1 \
         loader.batch_size="$BATCH_SIZE" \
         trainer.max_epochs="$MAX_EPOCHS" \
+        seed="$SEED" \
         subdir="" \
         output_model_name=lewm 2>&1 | tail -30; then
         err "training FAILED — aborting"
@@ -163,7 +172,6 @@ if [ ! -f "$best_ckpt" ]; then
     exit 1
 fi
 
-eval_log="${DATA_ROOT}/sp_eval_joint.log"
 if ! python eval_libero.py \
     --checkpoint "$best_ckpt" \
     --tokenizer "$TOKENIZER" \
@@ -171,8 +179,8 @@ if ! python eval_libero.py \
     --suite libero_spatial \
     --num-episodes "$NUM_EPISODES" \
     --max-steps "$MAX_STEPS" \
-    --device cuda 2>&1 | tee "$eval_log" | tail -50; then
-    err "eval FAILED — see $eval_log"
+    --device cuda 2>&1 | tee "$EVAL_LOG" | tail -50; then
+    err "eval FAILED — see $EVAL_LOG"
     exit 1
 fi
 
@@ -181,8 +189,9 @@ fi
 # -----------------------------------------------------------------------------
 echo "" | tee -a "$RESULTS_LOG"
 echo "==== PER-TASK RESULTS ====" | tee -a "$RESULTS_LOG"
-grep -E "Task [0-9]+:.*\(.*%\)" "$eval_log" | tee -a "$RESULTS_LOG"
+# Match the indented "Task N: NN/20 (NN.N%) — ..." rows printed by eval_libero.py
+grep -E "^[[:space:]]+Task[[:space:]]+[0-9]+:" "$EVAL_LOG" | tee -a "$RESULTS_LOG"
 echo "" | tee -a "$RESULTS_LOG"
 echo "==== OVERALL ====" | tee -a "$RESULTS_LOG"
-grep -E "Overall:" "$eval_log" | tee -a "$RESULTS_LOG"
+grep -E "Overall:" "$EVAL_LOG" | tee -a "$RESULTS_LOG"
 echo "==== run finished $(date) ====" | tee -a "$RESULTS_LOG"
