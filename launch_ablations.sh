@@ -76,21 +76,33 @@ for gpu in $GPUS; do
     log_file="/Data/lyw/abl_gpu${gpu}.tmuxlog"
 
     # Build a single shell command that walks the queue serially on this GPU.
-    cmd="cd $REPO_DIR && conda activate vla && exec > >(tee -a $log_file) 2>&1; "
-    cmd+="echo '==== GPU $gpu queue start: $(date) ===='; "
+    # `conda` is NOT available in non-interactive shells on this server, so we
+    # source conda.sh explicitly before `conda activate`. Trailing `; bash`
+    # keeps the tmux window open after the queue completes (so logs are
+    # readable on attach instead of the window vanishing).
+    # HF_HUB_OFFLINE=1 + TRANSFORMERS_OFFLINE=1 — the GPU server cannot reach
+    # huggingface.co, so without these flags `T5Tokenizer.from_pretrained(...)`
+    # spends 5-15 minutes per file timing out HEAD probes before it falls back
+    # to the cache at ~/.cache/huggingface/hub. Both vars are needed because
+    # transformers <4.35 reads TRANSFORMERS_OFFLINE while newer reads HF_HUB_OFFLINE.
+    cmd="exec > >(tee -a $log_file) 2>&1; "
+    cmd+="source $HOME/miniconda3/etc/profile.d/conda.sh && "
+    cmd+="conda activate vla && cd $REPO_DIR && "
+    cmd+="export HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 && "
+    cmd+="echo '==== GPU $gpu queue start: '\$(date)' ===='; "
     for item in $queue; do
         arm="${item%%:*}"; seed="${item##*:}"
-        cmd+="echo '---- start  arm=$arm  seed=$seed  GPU=$gpu  $(date) ----'; "
+        cmd+="echo '---- start  arm=$arm  seed=$seed  GPU=$gpu  '\$(date)' ----'; "
         cmd+="ARM=$arm SEED=$seed CUDA_VISIBLE_DEVICES=$gpu bash run_ablation.sh; "
-        cmd+="echo '---- finish arm=$arm  seed=$seed  GPU=$gpu  $(date) ----'; "
+        cmd+="echo '---- finish arm=$arm  seed=$seed  GPU=$gpu  '\$(date)' ----'; "
     done
-    cmd+="echo '==== GPU $gpu queue done: $(date) ===='"
+    cmd+="echo '==== GPU $gpu queue done: '\$(date)' ===='; bash"
 
     if $first_window; then
-        tmux new-session -d -s "$TMUX_SESS" -n "$win" "bash -lc \"$cmd\""
+        tmux new-session -d -s "$TMUX_SESS" -n "$win" "bash -c \"$cmd\""
         first_window=false
     else
-        tmux new-window -t "$TMUX_SESS" -n "$win" "bash -lc \"$cmd\""
+        tmux new-window -t "$TMUX_SESS" -n "$win" "bash -c \"$cmd\""
     fi
 done
 
