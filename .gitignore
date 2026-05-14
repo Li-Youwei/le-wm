@@ -1,0 +1,37 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+.ruff_cache/
+.mypy_cache/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor / IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Agent harness state (per-machine)
+.claude/
+.codex/
+
+# Local eval outputs
+abl_videos/
+*.mp4
+
+# Model artifacts (training output lives on the server)
+*.ckpt
+*.pt
+tb_logs/
+
+# Hydra runtime
+outputs/
+multirun/
+
+# Misc
+*.log
