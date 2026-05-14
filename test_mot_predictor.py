@@ -89,6 +89,30 @@ class MoTPredictorTest(unittest.TestCase):
         out = predictor(*self._make_inputs())
         self.assertEqual(out.shape, (2, 6, ACTION_HEAD_SIZE))
 
+    def test_mot_attention_handles_bfloat16_autocast(self) -> None:
+        predictor = self._make_predictor()
+        with torch.autocast("cpu", dtype=torch.bfloat16):
+            out = predictor(*self._make_inputs())
+        self.assertEqual(len(out), 4)
+
+    def test_old_object_checkpoints_without_mot_flag_default_to_shared(self) -> None:
+        predictor = ARPredictor(
+            embed_dim=16,
+            depth=1,
+            heads=2,
+            dim_head=8,
+            mlp_dim=32,
+            max_action_tokens=5,
+            max_lang_tokens=4,
+            proprio_dim=9,
+            dropout=0.0,
+            emb_dropout=0.0,
+            use_state_prediction=False,
+        )
+        delattr(predictor, "use_mot_transformer")
+        out = predictor(*self._make_inputs())
+        self.assertEqual(out.shape, (2, 6, ACTION_HEAD_SIZE))
+
 
 if __name__ == "__main__":
     unittest.main()

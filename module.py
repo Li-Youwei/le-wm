@@ -165,16 +165,19 @@ class MoTAttention(nn.Module):
         device = x.device
         inner_dim = self.to_qkv[0].out_features // 3
 
-        q = torch.empty(B, T, inner_dim, device=device, dtype=x.dtype)
-        k = torch.empty_like(q)
-        v = torch.empty_like(q)
+        q = k = v = None
         for modality, proj in enumerate(self.to_qkv):
             mask = modality_ids == modality
             if mask.any():
                 q_m, k_m, v_m = proj(x[mask]).chunk(3, dim=-1)
+                if q is None:
+                    q = torch.empty(B, T, inner_dim, device=device, dtype=q_m.dtype)
+                    k = torch.empty_like(q)
+                    v = torch.empty_like(q)
                 q[mask] = q_m
                 k[mask] = k_m
                 v[mask] = v_m
+        assert q is not None and k is not None and v is not None
 
         q = rearrange(q, "b t (h d) -> b h t d", h=self.heads)
         k = rearrange(k, "b t (h d) -> b h t d", h=self.heads)
@@ -189,7 +192,13 @@ class MoTAttention(nn.Module):
         )
         attn_out = rearrange(attn_out, "b h t d -> b t (h d)")
 
-        out = torch.empty(B, T, self.to_out[0][0].out_features, device=device, dtype=x.dtype)
+        out = torch.empty(
+            B,
+            T,
+            self.to_out[0][0].out_features,
+            device=device,
+            dtype=attn_out.dtype,
+        )
         for modality, proj in enumerate(self.to_out):
             mask = modality_ids == modality
             if mask.any():
@@ -236,11 +245,19 @@ class MoTBlock(nn.Module):
     ) -> torch.Tensor:
         x = x + self.attn(self.norm1(x, modality_ids), modality_ids, attn_mask=attn_mask)
         y = self.norm2(x, modality_ids)
-        mlp_out = torch.empty_like(x)
+        mlp_out = None
         for modality, mlp in enumerate(self.mlp):
             mask = modality_ids == modality
             if mask.any():
-                mlp_out[mask] = mlp(y[mask])
+                out_m = mlp(y[mask])
+                if mlp_out is None:
+                    mlp_out = torch.empty(
+                        *x.shape,
+                        device=x.device,
+                        dtype=out_m.dtype,
+                    )
+                mlp_out[mask] = out_m
+        assert mlp_out is not None
         return x + mlp_out
 
 
@@ -781,7 +798,7 @@ class ARPredictor(nn.Module):
         modality_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Run shared or MoT-routed transformer blocks."""
-        if self.use_mot_transformer:
+        if self._uses_mot_transformer():
             assert modality_ids is not None
             for block in self.blocks:
                 x = block(x, modality_ids, attn_mask=attn_mask)
@@ -789,6 +806,16 @@ class ARPredictor(nn.Module):
         for block in self.blocks:
             x = block(x, attn_mask=attn_mask)
         return self.norm(x)
+
+    def _uses_mot_transformer(self) -> bool:
+        """Backward-compatible MoT flag for old pickled object checkpoints."""
+        return bool(
+            getattr(
+                self,
+                "use_mot_transformer",
+                getattr(self, "state_prediction_arch", "shared") == "mot",
+            )
+        )
 
     def forward(
         self,
@@ -909,7 +936,7 @@ class ARPredictor(nn.Module):
                 include_queries=self.use_state_prediction,
                 device=device,
             )
-            if self.use_mot_transformer
+            if self._uses_mot_transformer()
             else None
         )
 
@@ -1048,7 +1075,7 @@ class ARPredictor(nn.Module):
                     n_action_positions=L - (n_lang + 2 * nv + 1),
                     device=device,
                 )
-                if self.use_mot_transformer
+                if self._uses_mot_transformer()
                 else None
             )
             x = self._run_blocks(x, attn_mask, modality_ids)
@@ -1188,7 +1215,7 @@ class ARPredictor(nn.Module):
                 n_action_positions=L - (n_lang + 2 * nv + 1),
                 device=device,
             )
-            if self.use_mot_transformer
+            if self._uses_mot_transformer()
             else None
         )
         x = self._run_blocks(x, attn_mask, modality_ids)
