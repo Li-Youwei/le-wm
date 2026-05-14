@@ -53,6 +53,7 @@ from preprocess_libero import normalize_proprio
 # Model loading
 # ---------------------------------------------------------------------------
 
+
 def build_model(device: torch.device, use_language: bool = True) -> torch.nn.Module:
     """Build the JEPA model with the same architecture as train.py.
 
@@ -68,23 +69,38 @@ def build_model(device: torch.device, use_language: bool = True) -> torch.nn.Mod
     from module import ARPredictor, MLP
 
     encoder = spt.backbone.utils.vit_hf(
-        "tiny", patch_size=14, image_size=224, pretrained=False, use_mask_token=False,
+        "tiny",
+        patch_size=14,
+        image_size=224,
+        pretrained=False,
+        use_mask_token=False,
     )
     hidden_dim = encoder.config.hidden_size
     embed_dim = 192
 
     predictor = ARPredictor(
-        embed_dim=embed_dim, max_action_tokens=80, max_lang_tokens=25,
+        embed_dim=embed_dim,
+        max_action_tokens=80,
+        max_lang_tokens=25,
         proprio_dim=9,
         # dropout=0.2 mirrors config/train/lewm.yaml (the frozen baseline's
         # actual training value). Eval mode is no-op for nn.Dropout, so this
         # has no inference effect, but it keeps the constructor call honest
         # and stops future maintainers from chasing a phantom mismatch when
         # they cross-reference eval and training code.
-        depth=6, heads=16, dim_head=64, mlp_dim=2048, dropout=0.2, emb_dropout=0.0,
+        depth=6,
+        heads=16,
+        dim_head=64,
+        mlp_dim=2048,
+        dropout=0.2,
+        emb_dropout=0.0,
     )
-    projector = MLP(input_dim=hidden_dim, output_dim=embed_dim, hidden_dim=2048,
-                    norm_fn=torch.nn.LayerNorm)
+    projector = MLP(
+        input_dim=hidden_dim,
+        output_dim=embed_dim,
+        hidden_dim=2048,
+        norm_fn=torch.nn.LayerNorm,
+    )
 
     if use_language:
         # T5-small (frozen)
@@ -99,13 +115,18 @@ def build_model(device: torch.device, use_language: bool = True) -> torch.nn.Mod
         lang_proj = None
 
     model = JEPA(
-        encoder=encoder, predictor=predictor, projector=projector,
-        lang_encoder=lang_encoder, lang_proj=lang_proj,
+        encoder=encoder,
+        predictor=predictor,
+        projector=projector,
+        lang_encoder=lang_encoder,
+        lang_proj=lang_proj,
     )
     return model.to(device)
 
 
-def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device) -> None:
+def load_checkpoint(
+    model: torch.nn.Module, ckpt_path: str, device: torch.device
+) -> None:
     """Load Lightning weights checkpoint into JEPA model.
 
     spt.Module stores the JEPA as self.model, so checkpoint keys are
@@ -117,31 +138,43 @@ def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device
 
     # Reject any non-baseline-architecture checkpoint loaded via the
     # _weights.ckpt path — build_model() constructs the baseline architecture
-    # (no state_pred_head_*, no state_query_embeddings, LayerNorm projector),
-    # so loading a checkpoint with extra keys would either fail with a
-    # confusing torch shape-mismatch error or (worse) silently pass with
-    # strict=False and skip critical parameters.
+    # (no state_pred_head_*, no state_query_embeddings, LayerNorm projector,
+    # no gripper_aux_head), so loading a checkpoint with extra keys would
+    # either fail with a confusing torch shape-mismatch error or (worse)
+    # silently pass with strict=False and skip critical parameters.
     #
-    # Two known deviations both require _object.ckpt:
+    # Three known deviations all require _object.ckpt:
     #   1. SP-trained: state_pred_head_* / state_query_embeddings keys.
     #   2. BatchNorm-projector: projector.net.1.running_mean buffer (BN1d
     #      tracks running stats; LayerNorm has no such buffer). This catches
     #      the legitimate "SIGReg-only, no SP" ablation as well, where
     #      projector.norm_type='batch' but no SP heads exist.
-    sp_keys = [k for k in state_dict if "state_pred_head" in k or "state_query_embeddings" in k]
+    #   3. Gripper-aux-trained: gripper_aux_head.* keys. Bypass-FAST head
+    #      for the gripper dim; build_model() never constructs it.
+    sp_keys = [
+        k for k in state_dict if "state_pred_head" in k or "state_query_embeddings" in k
+    ]
     bn_keys = [k for k in state_dict if "projector.net.1.running_mean" in k]
-    if (sp_keys or bn_keys) and not ckpt_path.endswith("_object.ckpt"):
+    grip_keys = [k for k in state_dict if "gripper_aux_head" in k]
+    if (sp_keys or bn_keys or grip_keys) and not ckpt_path.endswith("_object.ckpt"):
         reasons = []
         if sp_keys:
-            reasons.append(f"state-prediction keys ({sp_keys[:2]}{'...' if len(sp_keys) > 2 else ''})")
+            reasons.append(
+                f"state-prediction keys ({sp_keys[:2]}{'...' if len(sp_keys) > 2 else ''})"
+            )
         if bn_keys:
             reasons.append(f"BatchNorm projector running stats ({bn_keys[:1]})")
+        if grip_keys:
+            reasons.append(
+                f"gripper-aux head keys ({grip_keys[:2]}{'...' if len(grip_keys) > 2 else ''})"
+            )
         raise ValueError(
             f"Checkpoint '{ckpt_path}' has {' and '.join(reasons)} but is not "
-            "an _object.ckpt. Non-baseline architectures (SP-trained or "
-            "BatchNorm-projector / SIGReg-trained) must be evaluated via the "
-            "per-epoch object checkpoint produced by ModelObjectCallBack — "
-            "pass --checkpoint .../lewm_epoch_{N}_object.ckpt instead."
+            "an _object.ckpt. Non-baseline architectures (SP-trained, "
+            "BatchNorm-projector / SIGReg-trained, or gripper-aux-trained) "
+            "must be evaluated via the per-epoch object checkpoint produced "
+            "by ModelObjectCallBack — pass "
+            "--checkpoint .../lewm_*_object.ckpt instead."
         )
 
     has_lang_module = getattr(model, "lang_encoder", None) is not None
@@ -178,6 +211,7 @@ def load_checkpoint(model: torch.nn.Module, ckpt_path: str, device: torch.device
 # ---------------------------------------------------------------------------
 # Preprocessed data lookup
 # ---------------------------------------------------------------------------
+
 
 def find_processed_h5(processed_dir: str, task_name: str) -> Path | None:
     """Find the preprocessed H5 file matching a LIBERO task name."""
@@ -220,6 +254,7 @@ def load_language_instruction(h5_path: Path) -> str:
 # Observation preprocessing
 # ---------------------------------------------------------------------------
 
+
 def preprocess_obs(
     obs: dict,
     img_size: int,
@@ -253,9 +288,9 @@ def preprocess_obs(
     pixels_hand = img_hand.unsqueeze(0).to(device)
 
     # 9D proprio — no averaging / no abs on the gripper.
-    ee_pos = obs["robot0_eef_pos"]              # (3,)
-    ee_quat = obs["robot0_eef_quat"]            # (4,) xyzw (robosuite default)
-    grip_2d = obs["robot0_gripper_qpos"]        # (2,) raw two finger joint positions
+    ee_pos = obs["robot0_eef_pos"]  # (3,)
+    ee_quat = obs["robot0_eef_quat"]  # (4,) xyzw (robosuite default)
+    grip_2d = obs["robot0_gripper_qpos"]  # (2,) raw two finger joint positions
     proprio_raw = np.concatenate([ee_pos, ee_quat, grip_2d])  # (9,)
     proprio_np = normalize_proprio(proprio_raw)  # re-normalize quaternion at [3:7]
     proprio = torch.from_numpy(proprio_np).float().unsqueeze(0).to(device)
@@ -289,6 +324,7 @@ def tokenize_language(
 # Single-task evaluation
 # ---------------------------------------------------------------------------
 
+
 def _read_osc_scales(env: OffScreenRenderEnv) -> tuple[float, float]:
     """Read robosuite OSC_POSE scales from the running controller.
 
@@ -315,9 +351,9 @@ def _read_osc_scales(env: OffScreenRenderEnv) -> tuple[float, float]:
     assert np.allclose(output_max[3:6], rot_scale), (
         f"OSC rot scales not uniform: {output_max[3:6]}"
     )
-    assert np.all(np.asarray(ctrl.input_max) == 1.0) and np.all(np.asarray(ctrl.input_min) == -1.0), (
-        f"OSC input range not [-1, 1]: [{ctrl.input_min}, {ctrl.input_max}]"
-    )
+    assert np.all(np.asarray(ctrl.input_max) == 1.0) and np.all(
+        np.asarray(ctrl.input_min) == -1.0
+    ), f"OSC input range not [-1, 1]: [{ctrl.input_min}, {ctrl.input_max}]"
     print(f"  OSC scales read from controller: pos={pos_scale}, rot={rot_scale}")
     return pos_scale, rot_scale
 
@@ -381,11 +417,13 @@ def _execute_chunk_closed_loop(
         # Robosuite's Controller.scale_action also clips to input_max/min before
         # linear rescaling. We clip explicitly for readability — the clip is
         # bit-for-bit identical to robosuite's internal behavior.
-        action_input = np.concatenate([
-            np.clip(step_delta_pos / pos_scale, -1.0, 1.0),
-            np.clip(step_delta_rotvec / rot_scale, -1.0, 1.0),
-            [np.clip(gripper_cmd, -1.0, 1.0)],
-        ]).astype(np.float32)
+        action_input = np.concatenate(
+            [
+                np.clip(step_delta_pos / pos_scale, -1.0, 1.0),
+                np.clip(step_delta_rotvec / rot_scale, -1.0, 1.0),
+                [np.clip(gripper_cmd, -1.0, 1.0)],
+            ]
+        ).astype(np.float32)
 
         obs, reward, done, info = env.step(action_input)
         if frames is not None:
@@ -432,7 +470,10 @@ def evaluate_task(
     if use_language:
         assert t5_tokenizer is not None, "t5_tokenizer required when use_language=True"
         lang_ids, lang_mask = tokenize_language(
-            language_instruction, t5_tokenizer, max_lang_tokens, device,
+            language_instruction,
+            t5_tokenizer,
+            max_lang_tokens,
+            device,
         )
     else:
         lang_ids, lang_mask = None, None
@@ -457,26 +498,58 @@ def evaluate_task(
 
             # Encode visual + language
             z_agent, z_hand, lang_embeds, lang_lengths = model.encode(
-                pixels_agent, pixels_hand, lang_ids, lang_mask,
+                pixels_agent,
+                pixels_hand,
+                lang_ids,
+                lang_mask,
             )
 
             # Generate FAST action tokens
             tokens, lengths = model.predict_actions(
-                z_agent, z_hand, proprio, lang_embeds, lang_lengths,
+                z_agent,
+                z_hand,
+                proprio,
+                lang_embeds,
+                lang_lengths,
                 temperature=temperature,
             )
 
             # Decode tokens → normalized → physical anchor-relative displacements
-            actions_norm = fast_decode(tokens, lengths, processor,
-                                       time_horizon=chunk_size, action_dim=action_dim)
+            actions_norm = fast_decode(
+                tokens,
+                lengths,
+                processor,
+                time_horizon=chunk_size,
+                action_dim=action_dim,
+            )
             actions_phys = denormalize_actions(actions_norm, action_low, action_high)
             # actions_phys[0] is (H, 7) in physical units:
             #   [0:3] = anchor-relative pos delta (m)
             #   [3:6] = anchor-relative rot delta (rad, axis-angle)
             #   [6]   = gripper cmd (unchanged)
 
+            # Gripper aux override: when the model was trained with the
+            # auxiliary gripper-command head, bypass FAST for dim 6 and
+            # take the direct regression head's output instead. This
+            # addresses the libero_object 0% failure where FAST joint BPE
+            # diluted the gripper signal — see CLAUDE.md diagnostic notes.
+            if getattr(model.predictor, "use_gripper_aux", False):
+                pred_grip = model.predict_gripper_aux(
+                    z_agent,
+                    z_hand,
+                    proprio,
+                    lang_embeds,
+                    lang_lengths,
+                )  # (B=1, H)
+                actions_phys[0, :, 6] = pred_grip[0].detach().cpu().numpy()
+
             obs, reward, done, _ = _execute_chunk_closed_loop(
-                env, obs, actions_phys[0], pos_scale, rot_scale, frames,
+                env,
+                obs,
+                actions_phys[0],
+                pos_scale,
+                rot_scale,
+                frames,
             )
             if done:
                 break
@@ -522,37 +595,91 @@ def _save_video(
 # Main
 # ---------------------------------------------------------------------------
 
+
 def main():
     parser = argparse.ArgumentParser(description="LIBERO VLA baseline evaluation")
-    parser.add_argument("--checkpoint", type=str, required=True, help="Path to _weights.ckpt")
-    parser.add_argument("--tokenizer", type=str, required=True, help="Path to saved FAST tokenizer directory")
-    parser.add_argument("--processed-dir", type=str, required=True,
-                        help="Directory with preprocessed H5 files (one per task)")
-    parser.add_argument("--suite", type=str, default="libero_spatial",
-                        choices=["libero_spatial", "libero_object", "libero_goal", "libero_10", "libero_90"],
-                        help="LIBERO task suite")
-    parser.add_argument("--task-id", type=int, default=None,
-                        help="Single task index (0-9). Omit to run all tasks in suite")
-    parser.add_argument("--num-episodes", type=int, default=20, help="Episodes per task")
-    parser.add_argument("--max-steps", type=int, default=300, help="Max raw steps per episode")
-    parser.add_argument("--camera-size", type=int, default=128,
-                        help="LIBERO camera resolution (env render size). "
-                             "Must match the resolution of images stored in preprocessed "
-                             "training HDF5 (LIBERO default: 128).")
+    parser.add_argument(
+        "--checkpoint", type=str, required=True, help="Path to _weights.ckpt"
+    )
+    parser.add_argument(
+        "--tokenizer",
+        type=str,
+        required=True,
+        help="Path to saved FAST tokenizer directory",
+    )
+    parser.add_argument(
+        "--processed-dir",
+        type=str,
+        required=True,
+        help="Directory with preprocessed H5 files (one per task)",
+    )
+    parser.add_argument(
+        "--suite",
+        type=str,
+        default="libero_spatial",
+        choices=[
+            "libero_spatial",
+            "libero_object",
+            "libero_goal",
+            "libero_10",
+            "libero_90",
+        ],
+        help="LIBERO task suite",
+    )
+    parser.add_argument(
+        "--task-id",
+        type=int,
+        default=None,
+        help="Single task index (0-9). Omit to run all tasks in suite",
+    )
+    parser.add_argument(
+        "--num-episodes", type=int, default=20, help="Episodes per task"
+    )
+    parser.add_argument(
+        "--max-steps", type=int, default=300, help="Max raw steps per episode"
+    )
+    parser.add_argument(
+        "--camera-size",
+        type=int,
+        default=128,
+        help="LIBERO camera resolution (env render size). "
+        "Must match the resolution of images stored in preprocessed "
+        "training HDF5 (LIBERO default: 128).",
+    )
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument("--temperature", type=float, default=0.0, help="0=greedy, >0=sampling")
+    parser.add_argument(
+        "--temperature", type=float, default=0.0, help="0=greedy, >0=sampling"
+    )
     parser.add_argument("--seed", type=int, default=42)
-    parser.add_argument("--save-videos", action="store_true", help="Save rollout videos for first 3 episodes per task")
-    parser.add_argument("--video-dir", type=str, default="/Data/lyw/eval_videos", help="Directory to save videos")
-    parser.add_argument("--max-video-episodes", type=int, default=999,
-                        help="Max episodes per task to record (default: all)")
-    parser.add_argument("--no-language", action="store_true",
-                        help="Ablation: evaluate a model trained without the language instruction. "
-                             "Must match the checkpoint's training-time use_language setting.")
+    parser.add_argument(
+        "--save-videos",
+        action="store_true",
+        help="Save rollout videos for first 3 episodes per task",
+    )
+    parser.add_argument(
+        "--video-dir",
+        type=str,
+        default="/Data/lyw/eval_videos",
+        help="Directory to save videos",
+    )
+    parser.add_argument(
+        "--max-video-episodes",
+        type=int,
+        default=999,
+        help="Max episodes per task to record (default: all)",
+    )
+    parser.add_argument(
+        "--no-language",
+        action="store_true",
+        help="Ablation: evaluate a model trained without the language instruction. "
+        "Must match the checkpoint's training-time use_language setting.",
+    )
     args = parser.parse_args()
 
     if args.save_videos and iio is None:
-        raise ImportError("imageio required for --save-videos: pip install imageio imageio-ffmpeg")
+        raise ImportError(
+            "imageio required for --save-videos: pip install imageio imageio-ffmpeg"
+        )
 
     use_language = not args.no_language
 
@@ -597,9 +724,9 @@ def main():
     for task_id in task_ids:
         task = task_suite.get_task(task_id)
         task_name = task.name
-        print(f"\n{'='*60}")
+        print(f"\n{'=' * 60}")
         print(f"Task {task_id}: {task_name}")
-        print(f"{'='*60}")
+        print(f"{'=' * 60}")
 
         # Find preprocessed H5 for this task
         h5_path = find_processed_h5(args.processed_dir, task_name)
@@ -614,7 +741,9 @@ def main():
 
         # Create environment — task.bddl_file is just a filename, need full path
         bddl_path = os.path.join(
-            get_libero_path("bddl_files"), args.suite, task.bddl_file,
+            get_libero_path("bddl_files"),
+            args.suite,
+            task.bddl_file,
         )
         env = OffScreenRenderEnv(
             bddl_file_name=bddl_path,
@@ -625,8 +754,15 @@ def main():
 
         try:
             successes, n_eps = evaluate_task(
-                model, processor, t5_tokenizer, env, init_states,
-                action_low, action_high, chunk_size, action_dim,
+                model,
+                processor,
+                t5_tokenizer,
+                env,
+                init_states,
+                action_low,
+                action_high,
+                chunk_size,
+                action_dim,
                 language_instruction,
                 num_episodes=args.num_episodes,
                 max_steps=args.max_steps,
@@ -642,18 +778,25 @@ def main():
             env.close()
 
         rate = successes / n_eps * 100
-        results[task_id] = {"name": task_name, "success": successes, "total": n_eps, "rate": rate}
+        results[task_id] = {
+            "name": task_name,
+            "success": successes,
+            "total": n_eps,
+            "rate": rate,
+        }
         total_successes += successes
         total_episodes += n_eps
 
         print(f"  Result: {successes}/{n_eps} ({rate:.1f}%)")
 
     # Summary
-    print(f"\n{'='*60}")
+    print(f"\n{'=' * 60}")
     print(f"SUMMARY — {args.suite}")
-    print(f"{'='*60}")
+    print(f"{'=' * 60}")
     for tid, r in results.items():
-        print(f"  Task {tid:2d}: {r['success']:2d}/{r['total']} ({r['rate']:5.1f}%) — {r['name']}")
+        print(
+            f"  Task {tid:2d}: {r['success']:2d}/{r['total']} ({r['rate']:5.1f}%) — {r['name']}"
+        )
     if total_episodes > 0:
         overall = total_successes / total_episodes * 100
         print(f"\n  Overall: {total_successes}/{total_episodes} ({overall:.1f}%)")

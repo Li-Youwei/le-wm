@@ -301,7 +301,6 @@ next section.
 - **No SIGReg (in baseline)**: class kept in `module.py` but only instantiated when `sigreg_weight > 0`
 - **No CEM planning (ever)**: actions are directly generated via autoregressive decoding, not searched
 - **Joint training across all 10 LIBERO-Spatial tasks** (one checkpoint, ~65 K chunks total). The language instruction is the sole per-task disambiguation signal — chunks from different tasks have different `language_instruction` strings tokenized by frozen T5. The frozen baseline at `7008f15` was trained this way (see `/Data/lyw/checkpoints/multitask_ln_100ep/config.yaml` on the GPU server: `hdf5_dir: /Data/lyw/libero_processed/libero_spatial` points at the suite directory, so `LiberoDataset` globs all 10 `.h5` files).
-- **Note on `run_all_suites.sh`**: this script runs a per-task training loop (one checkpoint per task) across all 4 suites. The frozen baseline did **not** use this script — `run_all_suites.sh` is an alternative pipeline that exists but was never the basis for the 65 % number. Do not confuse the two.
 - **No history context**: single-frame input per view — each observation is a single timestep (one agentview + one eye_in_hand + one proprio reading). Multi-frame history is a potential follow-up.
 
 ## State-Prediction Extension
@@ -556,7 +555,7 @@ the canonicalized version (use a separate processed-dir).
 conda activate vla
 pip install -r requirements.txt   # transformers pin >=4.48,<5 matters for FAST
 
-python train.py data=libero       # train one task (repeat per task via run_all_suites.sh)
+python train.py data=libero       # joint training over a directory of preprocessed .h5 (see run_all4.sh)
 
 export STABLEWM_HOME=/path/to/storage
 ```
@@ -579,7 +578,7 @@ end-to-end validation:
 | `preprocess_libero.py` | Anchor-relative chunks + stride=1 sliding window + FAST BPE. `normalize_proprio` is the single source of truth for the 9D layout and is re-used by `eval_libero.py::preprocess_obs`. |
 | `eval_libero.py` | Closed-loop chunk execution. OSC `pos_scale` / `rot_scale` are read from the running controller at runtime (not hardcoded) with uniformity assertions. Supports both `_weights.ckpt` (Lightning) and `_object.ckpt` (pickled JEPA) formats, plus `--no-language` ablation. |
 | `fast_utils.py` | `fast_decode` with pad/truncate fallback (the built-in FAST decoder silently zeros the chunk on length mismatch, which freezes the robot; our wrapper preserves as much of the signal as possible) + `denormalize_actions`. |
-| `run_all_suites.sh` | End-to-end driver: preprocess → per-task train (100 epochs) → per-task eval (20 episodes) across all 4 LIBERO suites. Bootstraps the FAST tokenizer on the first task when none exists, then reuses it for the rest. |
+| `run_all4.sh` | End-to-end driver for 4-suite joint training: trains a single ckpt on the flat 40-task dir, picks best ckpt by `validate/ce_loss_taskbal`, runs per-suite eval. Optional grip-aux / V17 variants live in sibling scripts. |
 | `config/train/lewm.yaml` | Baseline training config with regularization defaults. |
 | `config/train/overfit.yaml` | 1-demo pipeline sanity-check config. |
 | `config/train/data/libero.yaml` | Dataset config + `use_language` ablation switch + proprio layout. |
@@ -707,7 +706,7 @@ that case (`z_ag_t`, `z_hd_t`).
 
 ## Key Details
 
-- **Data layout**: training HDF5 under `${STABLEWM_HOME}/libero/`; per-suite preprocessed output under `${DATA_ROOT}/libero_processed/<suite>/` (one `.h5` per task — the **directory** is what `LiberoDataset` consumes for joint training, not individual files). Frozen baseline checkpoint lives at `/Data/lyw/checkpoints/multitask_ln_100ep/lewm_weights.ckpt` (single ckpt joint-trained on the suite). The `${DATA_ROOT}/stable-wm/<suite>/<task>/` per-task layout exists only for the alternative `run_all_suites.sh` pipeline and is **not** how the frozen 65 % baseline was produced.
+- **Data layout**: training HDF5 under `${STABLEWM_HOME}/libero/`; per-suite preprocessed output under `${DATA_ROOT}/libero_processed/<suite>/` (one `.h5` per task — the **directory** is what `LiberoDataset` consumes for joint training, not individual files). Frozen baseline checkpoint lives at `/Data/lyw/checkpoints/multitask_ln_100ep/lewm_weights.ckpt` (single ckpt joint-trained on the suite). 4-suite joint training uses a flat-symlink dir `${DATA_ROOT}/libero_processed_v5/all4_flat/` so `LiberoDataset` can glob all 40 `.h5` from one root — see `run_all4.sh`.
 - **FAST tokens**: variable-length int32 (`h5py.vlen_dtype`) per sample; each preprocessed HDF5 stores its own `action_low` / `action_high` percentile bounds (for inverse normalization at eval time), `chunk_size`, `chunk_stride`, and `language_instruction` in the file attrs.
 - **Device handling**: no hardcoded `cuda` — tensor device is inferred from inputs; the caller moves `JEPA` to the target device.
 - **Checkpoint formats**:

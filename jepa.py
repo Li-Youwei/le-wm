@@ -5,7 +5,6 @@ from torch import nn
 
 
 class JEPA(nn.Module):
-
     def __init__(
         self,
         encoder,
@@ -13,14 +12,18 @@ class JEPA(nn.Module):
         projector=None,
         lang_encoder=None,
         lang_proj=None,
+        visual_pool_grid: int = 0,
     ):
         super().__init__()
 
-        self.encoder = encoder          # Shared ViT encoder (both views)
-        self.predictor = predictor      # ARPredictor instance
+        self.encoder = encoder  # Shared ViT encoder (both views)
+        self.predictor = predictor  # ARPredictor instance
         self.projector = projector or nn.Identity()
         self.lang_encoder = lang_encoder  # T5EncoderModel, frozen
-        self.lang_proj = lang_proj        # nn.Linear(T5_hidden, embed_dim)
+        self.lang_proj = lang_proj  # nn.Linear(T5_hidden, embed_dim)
+        # visual_pool_grid > 0 enables CLS + G*G adaptive-avg-pooled patch
+        # tokens per view; 0 keeps the legacy CLS-only output.
+        self.visual_pool_grid = int(visual_pool_grid)
 
     @property
     def use_language(self) -> bool:
@@ -61,8 +64,10 @@ class JEPA(nn.Module):
             lang_attention_mask: (B, max_lang_tokens) attention mask (1=real, 0=pad), or None.
 
         Returns:
-            z_agent: (B, D) agentview CLS token, projected.
-            z_hand: (B, D) hand CLS token, projected.
+            z_agent: (B, N, D) agentview tokens, projected. N=1 (CLS only) by
+                default; when visual_pool_grid>0, N = 1 + grid*grid (CLS first,
+                then grid*grid spatially-pooled patches).
+            z_hand: (B, N, D) hand tokens, projected. Same layout as z_agent.
             lang_embeds: (B, max_lang_tokens, D) projected language embeddings,
                 or None when language is disabled.
             lang_lengths: (B,) real language token count per sample, or None.
@@ -70,8 +75,17 @@ class JEPA(nn.Module):
         # Visual: cat both views, single ViT pass, then split.
         visual_cat = torch.cat([pixels_agent, pixels_hand], dim=0)  # (2B, C, H, W)
         visual_out = self.encoder(visual_cat, interpolate_pos_encoding=True)
-        visual_z = self.projector(visual_out.last_hidden_state[:, 0])  # (2B, D)
-        z_agent, z_hand = visual_z.chunk(2, dim=0)  # (B, D), (B, D)
+        # tokens_2b: (2B, N, D) with CLS at index 0 and (optionally) pooled patches
+        # at indices 1..N-1. The projector wants a 2D (batch, channel) input —
+        # BatchNorm1d(2048) interprets a 3D (2B, N, 2048) as (N_batch, C=N, L)
+        # and breaks when N != 2048. LayerNorm works on any (..., D) shape
+        # but flattening costs nothing; reshape unconditionally to keep both
+        # paths identical. (B*N, D) → projector → (B, N, D').
+        tokens_2b = self._pool_visual_tokens(visual_out.last_hidden_state)
+        B_total, N_per, D_in = tokens_2b.shape
+        visual_z_flat = self.projector(tokens_2b.reshape(B_total * N_per, D_in))
+        visual_z = visual_z_flat.reshape(B_total, N_per, -1)  # (2B, N, D)
+        z_agent, z_hand = visual_z.chunk(2, dim=0)  # (B, N, D), (B, N, D)
 
         # Language: only when encoder is present AND tokens are provided
         if self.lang_encoder is not None and lang_input_ids is not None:
@@ -88,8 +102,16 @@ class JEPA(nn.Module):
 
         return z_agent, z_hand, lang_embeds, lang_lengths
 
-    def predict(self, z_agent, z_hand, proprio, lang_embeds, lang_lengths,
-                action_tokens, action_lengths):
+    def predict(
+        self,
+        z_agent,
+        z_hand,
+        proprio,
+        lang_embeds,
+        lang_lengths,
+        action_tokens,
+        action_lengths,
+    ):
         """Training: run predictor with teacher forcing.
 
         Args:
@@ -110,8 +132,13 @@ class JEPA(nn.Module):
                 see ``ARPredictor.forward`` for shapes.
         """
         return self.predictor(
-            z_agent, z_hand, proprio, lang_embeds, lang_lengths,
-            action_tokens, action_lengths,
+            z_agent,
+            z_hand,
+            proprio,
+            lang_embeds,
+            lang_lengths,
+            action_tokens,
+            action_lengths,
         )
 
     def encode_future_visual(self, pixels_agent_future, pixels_hand_future):
@@ -134,19 +161,65 @@ class JEPA(nn.Module):
             pixels_hand_future: (B, 3, H, W) hand-cam image at raw step t+H.
 
         Returns:
-            z_agent_future: (B, D) future agentview latent.
-            z_hand_future: (B, D) future hand-cam latent.
+            z_agent_future: (B, D) future agentview CLS latent.
+            z_hand_future: (B, D) future hand-cam CLS latent.
+
+        Note: even when visual_pool_grid>0 (multi-token prefix), the future
+        target stays CLS-only because the SP heads are MLP(D→D) and SIGReg
+        operates on a single per-view embedding. Per-patch SP would require
+        head + loss redesign — left for a follow-up.
         """
         visual_cat = torch.cat(
-            [pixels_agent_future, pixels_hand_future], dim=0,
+            [pixels_agent_future, pixels_hand_future],
+            dim=0,
         )  # (2B, C, H, W)
         visual_out = self.encoder(visual_cat, interpolate_pos_encoding=True)
+        # CLS-only path for SP / SIGReg: take last_hidden_state[:, 0] before
+        # the projector to skip the pooling-and-reshape codepath entirely.
         visual_z = self.projector(visual_out.last_hidden_state[:, 0])  # (2B, D)
         z_agent_future, z_hand_future = visual_z.chunk(2, dim=0)
         return z_agent_future, z_hand_future
 
-    def predict_actions(self, z_agent, z_hand, proprio, lang_embeds, lang_lengths,
-                        max_len=80, temperature=0.0):
+    def _pool_visual_tokens(self, hidden: torch.Tensor) -> torch.Tensor:
+        """Extract CLS + (optional) spatially-pooled patches from a ViT output.
+
+        Args:
+            hidden: (B, 1 + P, D) encoder ``last_hidden_state``, where P is the
+                number of patch tokens (e.g., 256 for 224/14 = 16x16).
+
+        Returns:
+            (B, N, D) where N = 1 when ``self.visual_pool_grid == 0`` (CLS only),
+            else N = 1 + G*G with CLS at index 0 and G*G spatially-pooled patch
+            tokens at indices 1..N-1.
+        """
+        if self.visual_pool_grid <= 0:
+            return hidden[:, :1]  # (B, 1, D) — CLS only
+        cls = hidden[:, :1]  # (B, 1, D)
+        patches = hidden[:, 1:]  # (B, P, D)
+        B, P, D = patches.shape
+        side = int(P**0.5)
+        if side * side != P:
+            raise ValueError(
+                f"Cannot reshape {P} patch tokens to a square grid. "
+                "Check encoder patch_size / image_size."
+            )
+        # (B, P, D) → (B, D, side, side) for adaptive_avg_pool2d.
+        feat = patches.transpose(1, 2).reshape(B, D, side, side)
+        G = self.visual_pool_grid
+        pooled = torch.nn.functional.adaptive_avg_pool2d(feat, (G, G))  # (B, D, G, G)
+        pooled = pooled.reshape(B, D, G * G).transpose(1, 2)  # (B, G*G, D)
+        return torch.cat([cls, pooled], dim=1)  # (B, 1+G*G, D)
+
+    def predict_actions(
+        self,
+        z_agent,
+        z_hand,
+        proprio,
+        lang_embeds,
+        lang_lengths,
+        max_len=80,
+        temperature=0.0,
+    ):
         """Inference: autoregressively generate FAST action tokens.
 
         Returns:
@@ -154,6 +227,32 @@ class JEPA(nn.Module):
             lengths: (B,) real token count per sample.
         """
         return self.predictor.generate(
-            z_agent, z_hand, proprio, lang_embeds, lang_lengths,
-            max_len=max_len, temperature=temperature,
+            z_agent,
+            z_hand,
+            proprio,
+            lang_embeds,
+            lang_lengths,
+            max_len=max_len,
+            temperature=temperature,
+        )
+
+    def predict_gripper_aux(
+        self,
+        z_agent,
+        z_hand,
+        proprio,
+        lang_embeds,
+        lang_lengths,
+    ):
+        """Inference: read out (B, gripper_chunk_size) from the aux head.
+
+        Wrapper for ``ARPredictor.predict_gripper_aux``. Raises if the
+        underlying predictor does not have ``use_gripper_aux=True``.
+        """
+        return self.predictor.predict_gripper_aux(
+            z_agent,
+            z_hand,
+            proprio,
+            lang_embeds,
+            lang_lengths,
         )
