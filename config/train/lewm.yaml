@@ -46,6 +46,12 @@ predictor:
   dim_head: 64
   dropout: 0.2
   emb_dropout: 0.0
+  # Mixture-of-Transformers — when True the FFN in each transformer block has
+  # a separate expert per modality (prefix / action / state-query); attention
+  # stays shared. Hypothesis: shared FFN causes action prediction and
+  # image/state prediction to interfere, especially with multi-token visual
+  # prefix. Parameter count grows by ~1.6-2x (3 FFN experts instead of 1).
+  use_mot: false
 
 # Projector normalization layer — see CLAUDE.md "Known caveats of switching to
 # BatchNorm projector". Default 'layer' reproduces the frozen baseline.

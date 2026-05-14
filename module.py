@@ -51,6 +51,56 @@ class FeedForward(nn.Module):
         return self.net(x)
 
 
+class MoTFeedForward(nn.Module):
+    """Per-modality FFN routing — each token's FFN parameters depend on its
+    modality, following the Meta "Mixture of Transformers" recipe.
+
+    Attention (Q/K/V/output projections) stays shared across modalities; only
+    the FFN is split. Modality is assigned by absolute position in the
+    sequence layout (prefix=0, action=1, query=2), so routing has no learned
+    gating — it's a hard partition.
+
+    The forward runs each expert on the full sequence and masks-merges the
+    outputs. For our scale (B=128, T~110, M=3) this is ~2x slowdown of the
+    FFN layer in exchange for code simplicity; scatter-gather would be
+    faster but messier.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        hidden_dim: int,
+        n_modalities: int,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        if n_modalities < 1:
+            raise ValueError(
+                f"MoTFeedForward requires n_modalities >= 1, got {n_modalities}"
+            )
+        self.n_modalities = n_modalities
+        self.experts = nn.ModuleList(
+            [FeedForward(dim, hidden_dim, dropout=dropout) for _ in range(n_modalities)]
+        )
+
+    def forward(self, x: torch.Tensor, modality_ids: torch.Tensor) -> torch.Tensor:
+        """
+        Args:
+            x: (B, T, D) normalized input.
+            modality_ids: (B, T) long tensor in [0, n_modalities).
+
+        Returns:
+            (B, T, D) output with per-token FFN routed by modality.
+        """
+        out = torch.zeros_like(x)
+        for m in range(self.n_modalities):
+            mask = (modality_ids == m).unsqueeze(-1)  # (B, T, 1) bool
+            if not mask.any():
+                continue
+            out = out + mask.to(x.dtype) * self.experts[m](x)
+        return out
+
+
 class Attention(nn.Module):
     """Scaled dot-product attention with causal masking"""
 
@@ -93,19 +143,52 @@ class Attention(nn.Module):
 
 
 class Block(nn.Module):
-    """Standard Transformer block"""
+    """Standard Transformer block.
 
-    def __init__(self, dim, heads, dim_head, mlp_dim, dropout=0.0):
+    ``n_modalities=0`` (default) keeps the legacy single shared FFN and the
+    block is bit-identical to the frozen baseline. Setting ``n_modalities>0``
+    switches the FFN to a per-modality MoT routing — attention stays shared,
+    only the FFN params split. The ``forward`` then requires ``modality_ids``.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        dim_head: int,
+        mlp_dim: int,
+        dropout: float = 0.0,
+        n_modalities: int = 0,
+    ):
         super().__init__()
 
         self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
-        self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
+        self.use_mot = n_modalities > 0
+        if self.use_mot:
+            self.mlp = MoTFeedForward(
+                dim, mlp_dim, n_modalities=n_modalities, dropout=dropout
+            )
+        else:
+            self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
 
-    def forward(self, x, attn_mask=None):
+    def forward(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+        modality_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
         x = x + self.attn(self.norm1(x), attn_mask=attn_mask)
-        x = x + self.mlp(self.norm2(x))
+        x_norm = self.norm2(x)
+        if self.use_mot:
+            if modality_ids is None:
+                raise ValueError(
+                    "Block.forward requires modality_ids when n_modalities>0."
+                )
+            x = x + self.mlp(x_norm, modality_ids)
+        else:
+            x = x + self.mlp(x_norm)
         return x
 
 
@@ -243,6 +326,7 @@ class ARPredictor(nn.Module):
         visual_pool_grid: int = 0,
         use_gripper_aux: bool = False,
         gripper_chunk_size: int = 20,
+        use_mot: bool = False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -251,6 +335,24 @@ class ARPredictor(nn.Module):
         self.proprio_dim = proprio_dim
         self.use_state_prediction = use_state_prediction
         self.n_state_query = 3 if use_state_prediction else 0
+
+        # Mixture-of-Transformers (Meta MoT) — when True the FFN in each
+        # transformer block has a separate expert per modality (attention
+        # remains shared). Hypothesis under test: shared FFN causes action
+        # prediction and image/state prediction to interfere, especially
+        # with multi-token visual prefix.
+        # Modality partitioning by position:
+        #   0 = prefix (lang + visual + proprio),
+        #   1 = action zone (BOS + action tokens + PAD),
+        #   2 = state-query (Q_ag/Q_hd/Q_pr, only when use_state_prediction).
+        self.use_mot = bool(use_mot)
+        if self.use_mot:
+            # n_modalities is fixed by the predictor's layout: 3 with SP
+            # enabled (which is the only configuration where modality 2
+            # is populated), 2 otherwise.
+            self.n_modalities = 3 if use_state_prediction else 2
+        else:
+            self.n_modalities = 0  # 0 = legacy single FFN (Block.use_mot=False)
 
         # Visual-token layout (CLS-only by default, opt-in to CLS+pooled patches).
         # If visual_pool_grid > 0 the encoder is expected to deliver CLS + G*G
@@ -372,9 +474,21 @@ class ARPredictor(nn.Module):
                 norm_fn=head_norm_fn,
             )
 
-        # Transformer blocks
+        # Transformer blocks. When MoT is on, each Block has a
+        # per-modality FFN (and forward() requires modality_ids); otherwise
+        # the FFN is shared (legacy baseline).
         self.blocks = nn.ModuleList(
-            [Block(embed_dim, heads, dim_head, mlp_dim, dropout) for _ in range(depth)]
+            [
+                Block(
+                    embed_dim,
+                    heads,
+                    dim_head,
+                    mlp_dim,
+                    dropout,
+                    n_modalities=self.n_modalities,
+                )
+                for _ in range(depth)
+            ]
         )
         self.norm = nn.LayerNorm(embed_dim)
         self.dropout = nn.Dropout(emb_dropout)
@@ -480,6 +594,45 @@ class ARPredictor(nn.Module):
             )
 
         return mask.unsqueeze(1)  # (B, 1, L, L)
+
+    def _build_modality_ids(
+        self,
+        n_lang: int,
+        L: int,
+        B: int,
+        device: torch.device,
+        has_query: bool,
+    ) -> torch.Tensor | None:
+        """Build (B, L) modality_ids for MoT routing.
+
+        Modality assignment is by absolute position (deterministic, no learned
+        gating), matching the sequence layout used by forward() / generate() /
+        predict_gripper_aux():
+            0 = prefix  (lang + visual + proprio)
+            1 = action  (BOS + action tokens + PAD)
+            2 = state-query  (Q_ag, Q_hd, Q_pr) — only when has_query is True
+
+        Returns None when MoT is disabled (Block ignores it in that case).
+        """
+        if not self.use_mot:
+            return None
+        nv = self.n_visual_per_view
+        n_prefix = n_lang + 2 * nv + 1
+        action_end = n_prefix + 1 + self.max_action_tokens
+        # NB: forward() may pass L < action_end (e.g., generate() with only
+        # prefix+BOS+a-few-generated-tokens). Clamp the per-zone slices to L.
+        ids = torch.zeros(B, L, dtype=torch.long, device=device)
+        if action_end > n_prefix:
+            a_lo = min(n_prefix, L)
+            a_hi = min(action_end, L)
+            if a_hi > a_lo:
+                ids[:, a_lo:a_hi] = 1
+        if has_query and self.n_state_query > 0:
+            q_lo = min(action_end, L)
+            q_hi = min(action_end + self.n_state_query, L)
+            if q_hi > q_lo:
+                ids[:, q_lo:q_hi] = 2
+        return ids
 
     def _build_generate_mask(
         self,
@@ -653,9 +806,14 @@ class ARPredictor(nn.Module):
             n_lang, lang_lengths, action_tokens, L, device
         )
 
+        # 6b. Build MoT modality_ids (None when use_mot=False — Block ignores it).
+        modality_ids = self._build_modality_ids(
+            n_lang, L, B, device, has_query=self.use_state_prediction
+        )
+
         # 7. Transformer blocks
         for block in self.blocks:
-            x = block(x, attn_mask=attn_mask)
+            x = block(x, attn_mask=attn_mask, modality_ids=modality_ids)
         x = self.norm(x)
 
         # 8. Extract action zone output: BOS + action token positions
@@ -774,8 +932,14 @@ class ARPredictor(nn.Module):
             # Build generate-time mask (prefix bidir, action causal, no PAD)
             attn_mask = self._build_generate_mask(n_lang, lang_lengths, B, L, device)
 
+            # MoT modality_ids over the growing prefix+action sequence — no
+            # query tokens during generation, so has_query=False.
+            modality_ids = self._build_modality_ids(
+                n_lang, L, B, device, has_query=False
+            )
+
             for block in self.blocks:
-                x = block(x, attn_mask=attn_mask)
+                x = block(x, attn_mask=attn_mask, modality_ids=modality_ids)
             x = self.norm(x)
 
             # Logits at last position
@@ -905,9 +1069,10 @@ class ARPredictor(nn.Module):
         L = seq.size(1)
         x = seq + self.pos_embedding[:, :L]
         attn_mask = self._build_generate_mask(n_lang, lang_lengths, B, L, device)
+        modality_ids = self._build_modality_ids(n_lang, L, B, device, has_query=False)
 
         for block in self.blocks:
-            x = block(x, attn_mask=attn_mask)
+            x = block(x, attn_mask=attn_mask, modality_ids=modality_ids)
         x = self.norm(x)
 
         n_prefix = n_lang + 2 * nv + 1
