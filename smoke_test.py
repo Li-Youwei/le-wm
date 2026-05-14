@@ -75,7 +75,7 @@ def create_model(device: torch.device) -> JEPA:
         max_action_tokens=MAX_ACTION_TOKENS,
         max_lang_tokens=MAX_LANG_TOKENS,
         proprio_dim=PROPRIO_DIM,
-        dropout=0.1,
+        dropout=0.2,
         emb_dropout=0.0,
     )
 
@@ -138,8 +138,8 @@ def training_step(model: JEPA, batch: dict, device: torch.device) -> float:
         pixels_agent, pixels_hand, lang_ids, lang_mask,
     )
 
-    assert z_agent.shape == (B, EMBED_DIM), f"z_agent shape {z_agent.shape}"
-    assert z_hand.shape == (B, EMBED_DIM), f"z_hand shape {z_hand.shape}"
+    assert z_agent.shape == (B, 1, EMBED_DIM), f"z_agent shape {z_agent.shape}"
+    assert z_hand.shape == (B, 1, EMBED_DIM), f"z_hand shape {z_hand.shape}"
     assert lang_embeds.shape == (B, MAX_LANG_TOKENS, EMBED_DIM), f"lang_embeds shape {lang_embeds.shape}"
     print(f"  encode OK: z_agent={z_agent.shape}, lang_embeds={lang_embeds.shape}, lang_lengths={lang_lengths.tolist()}")
 
@@ -423,7 +423,7 @@ def main() -> None:
     print("=" * 60)
     print(f"  Model: ViT-Tiny(shared) + T5-small(frozen) + ARPredictor")
     print(f"  Params: {trainable_params:,} trainable + {frozen_params:,} frozen")
-    print(f"  Sequence: [lang({MAX_LANG_TOKENS}) + z_ag + z_hd + z_pr + BOS + tokens({MAX_ACTION_TOKENS})]")
+    print(f"  Sequence: [lang({MAX_LANG_TOKENS}) + z_ag(1) + z_hd(1) + z_pr + BOS + tokens({MAX_ACTION_TOKENS})]")
     print(f"  Loss: L_CE only")
     print(f"  H=20, max_action_tokens={MAX_ACTION_TOKENS}, proprio_dim={PROPRIO_DIM}")
     if device.type == "cuda":

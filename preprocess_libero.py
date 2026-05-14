@@ -51,7 +51,9 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import inspect
 import json
+import re
 import shutil
 import sys
 from collections import Counter
@@ -380,7 +382,7 @@ def extract_chunks(
 # Step 4: FAST tokenization
 # ---------------------------------------------------------------------------
 
-def _patch_saved_tokenizer(save_dir: Path) -> None:
+def _patch_saved_tokenizer(save_dir: Path, tokenizer: Any | None = None) -> None:
     """Ensure a saved FAST tokenizer can be reloaded via AutoProcessor.
 
     save_pretrained() writes the BPE vocab and config, but omits:
@@ -398,12 +400,28 @@ def _patch_saved_tokenizer(save_dir: Path) -> None:
     falling back to the plain HF tokenizer. Verified against the live
     layout in ``data/fast_tokenizer/`` (contains ``processor_config.json``).
     """
-    # 1. Copy processing_action_tokenizer.py into the saved directory
+    # 1. Copy processing_action_tokenizer.py into the saved directory.
+    # Prefer a vendored copy when present; otherwise copy the actual module file
+    # backing the live remote-code processor. This keeps tokenizer fitting
+    # usable even when the repo does not vendor data/fast_tokenizer/.
     processor_src = Path(__file__).parent / "data" / "fast_tokenizer" / "processing_action_tokenizer.py"
+    if not processor_src.exists() and tokenizer is not None:
+        try:
+            candidate = Path(inspect.getfile(tokenizer.__class__))
+            if candidate.exists():
+                processor_src = candidate
+        except (OSError, TypeError):
+            pass
+
+    processor_dst = save_dir / "processing_action_tokenizer.py"
     if processor_src.exists():
-        shutil.copy2(processor_src, save_dir / "processing_action_tokenizer.py")
+        shutil.copy2(processor_src, processor_dst)
     else:
-        print(f"  WARNING: {processor_src} not found, skipping processor file copy")
+        print(
+            f"  WARNING: could not locate processing_action_tokenizer.py; "
+            f"checked {processor_src}. Saved tokenizer may require the FAST "
+            "processor code to be copied manually."
+        )
 
     # 2. Inject auto_map into processor_config.json (NOT preprocessor_config.json)
     config_path = save_dir / "processor_config.json"
@@ -411,8 +429,11 @@ def _patch_saved_tokenizer(save_dir: Path) -> None:
         config = json.loads(config_path.read_text())
     else:
         config = {}
+    processor_cls_name = (
+        tokenizer.__class__.__name__ if tokenizer is not None else "UniversalActionProcessor"
+    )
     config["auto_map"] = {
-        "AutoProcessor": "processing_action_tokenizer.UniversalActionProcessor"
+        "AutoProcessor": f"processing_action_tokenizer.{processor_cls_name}"
     }
     config_path.write_text(json.dumps(config, indent=2) + "\n")
 
@@ -475,7 +496,7 @@ def tokenize_actions(
                 # save_pretrained() doesn't copy the custom processor code or
                 # the auto_map needed for AutoProcessor.from_pretrained().
                 # Fix both so --load-tokenizer works out of the box.
-                _patch_saved_tokenizer(save_dir)
+                _patch_saved_tokenizer(save_dir, tokenizer=tokenizer)
                 print(f"  Saved fitted tokenizer to: {save_tokenizer_path}")
 
     # Encode all chunks in one call (batched)
@@ -507,20 +528,95 @@ def tokenize_actions(
 # Step 5: Save to output HDF5
 # ---------------------------------------------------------------------------
 
-def extract_language_instruction(f: h5py.File) -> str:
-    """Extract language instruction from LIBERO HDF5 data attributes.
+LANGUAGE_KEYS = (
+    "language_instruction",
+    "language",
+    "task_language",
+    "task_description",
+    "instruction",
+)
 
-    Looks for the instruction in data attrs 'problem_info' (JSON with
-    'language_instruction' key), falling back to empty string.
-    """
-    data_attrs = f["data"].attrs
-    if "problem_info" in data_attrs:
+
+def _clean_attr_value(value: Any) -> Any:
+    """Convert HDF5 scalar attrs into plain Python values."""
+    if isinstance(value, bytes):
+        return value.decode("utf-8", errors="replace")
+    if isinstance(value, np.generic):
+        return value.item()
+    return value
+
+
+def _find_language_in_metadata(value: Any) -> str:
+    """Recursively search decoded metadata for known language keys."""
+    value = _clean_attr_value(value)
+    if isinstance(value, str):
+        stripped = value.strip()
+        if not stripped:
+            return ""
         try:
-            info = json.loads(data_attrs["problem_info"])
-            return info.get("language_instruction", "")
-        except (json.JSONDecodeError, TypeError):
-            pass
+            return _find_language_in_metadata(json.loads(stripped))
+        except json.JSONDecodeError:
+            return ""
+    if isinstance(value, dict):
+        for key in LANGUAGE_KEYS:
+            candidate = value.get(key)
+            if candidate is None:
+                continue
+            candidate = _clean_attr_value(candidate)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+        for candidate in value.values():
+            found = _find_language_in_metadata(candidate)
+            if found:
+                return found
+    if isinstance(value, (list, tuple)):
+        for candidate in value:
+            found = _find_language_in_metadata(candidate)
+            if found:
+                return found
     return ""
+
+
+def _derive_instruction_from_filename(source_path: str | Path) -> str:
+    """Fallback task text from LIBERO file names when attrs omit language."""
+    stem = Path(source_path).stem
+    stem = re.sub(r"^(libero_)?(spatial|object|goal|10)_?", "", stem, flags=re.I)
+    stem = re.sub(r"_(demo|demos|image|images)(_|$).*", "", stem, flags=re.I)
+    stem = stem.replace("_", " ")
+    stem = re.sub(r"\s+", " ", stem).strip()
+    return stem
+
+
+def extract_language_instruction(
+    f: h5py.File,
+    source_path: str | Path,
+) -> tuple[str, str]:
+    """Extract language instruction from LIBERO HDF5 metadata.
+
+    Searches direct attrs, nested JSON attrs such as ``problem_info`` /
+    ``env_args``, then falls back to the task filename. Returning a non-empty
+    instruction is important: object-suite tasks are language-conditioned.
+    """
+    for scope_name, attrs in (("data.attrs", f["data"].attrs), ("root.attrs", f.attrs)):
+        for key in LANGUAGE_KEYS:
+            if key in attrs:
+                value = _clean_attr_value(attrs[key])
+                if isinstance(value, str) and value.strip():
+                    return value.strip(), f"{scope_name}.{key}"
+        for key in ("problem_info", "env_args", "metadata"):
+            if key in attrs:
+                found = _find_language_in_metadata(attrs[key])
+                if found:
+                    return found, f"{scope_name}.{key}"
+
+    fallback = _derive_instruction_from_filename(source_path)
+    if fallback:
+        return fallback, "filename"
+    raise ValueError(
+        f"Could not extract language_instruction from {source_path}. LIBERO "
+        "multi-task training requires a non-empty language string; inspect the "
+        "raw HDF5 attrs and add the missing key before preprocessing."
+    )
 
 
 def save_hdf5(
@@ -536,6 +632,7 @@ def save_hdf5(
     source_file: str,
     num_demos: int,
     language_instruction: str = "",
+    language_source: str = "",
     save_tokenizer_path: str | None = None,
     load_tokenizer_path: str | None = None,
 ) -> None:
@@ -636,6 +733,7 @@ def save_hdf5(
         out.attrs["num_samples"] = N
         out.attrs["action_dim"] = action_dim
         out.attrs["language_instruction"] = language_instruction
+        out.attrs["language_source"] = language_source
         # Store tokenizer paths separately to avoid overwrite
         if save_tokenizer_path is not None:
             out.attrs["tokenizer_save_path"] = str(Path(save_tokenizer_path).resolve())
@@ -784,8 +882,14 @@ def main() -> None:
         inspect_hdf5(f, args.image_key, args.hand_image_key, demo_keys)
 
         # Extract language instruction
-        language_instruction = extract_language_instruction(f)
-        print(f"  Language instruction: '{language_instruction}'")
+        language_instruction, language_source = extract_language_instruction(
+            f,
+            args.input,
+        )
+        print(
+            f"  Language instruction: '{language_instruction}' "
+            f"(source={language_source})"
+        )
 
         # Step 2+3: Extract anchor-relative sliding-window chunks in PHYSICAL units.
         # Stats are computed from the chunks themselves (not raw HDF5 actions) so
@@ -837,6 +941,7 @@ def main() -> None:
         source_file=args.input,
         num_demos=len(demo_keys),
         language_instruction=language_instruction,
+        language_source=language_source,
         save_tokenizer_path=args.save_tokenizer,
         load_tokenizer_path=args.load_tokenizer,
     )

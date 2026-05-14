@@ -143,7 +143,7 @@ def load_checkpoint(
     # either fail with a confusing torch shape-mismatch error or (worse)
     # silently pass with strict=False and skip critical parameters.
     #
-    # Three known deviations all require _object.ckpt:
+    # Four known deviations all require _object.ckpt:
     #   1. SP-trained: state_pred_head_* / state_query_embeddings keys.
     #   2. BatchNorm-projector: projector.net.1.running_mean buffer (BN1d
     #      tracks running stats; LayerNorm has no such buffer). This catches
@@ -151,12 +151,25 @@ def load_checkpoint(
     #      projector.norm_type='batch' but no SP heads exist.
     #   3. Gripper-aux-trained: gripper_aux_head.* keys. Bypass-FAST head
     #      for the gripper dim; build_model() never constructs it.
+    #   4. V17 / visual-prefix trained: view_embedding or per-view 2D patch
+    #      position keys. build_model() constructs CLS-only visual inputs.
     sp_keys = [
         k for k in state_dict if "state_pred_head" in k or "state_query_embeddings" in k
     ]
     bn_keys = [k for k in state_dict if "projector.net.1.running_mean" in k]
     grip_keys = [k for k in state_dict if "gripper_aux_head" in k]
-    if (sp_keys or bn_keys or grip_keys) and not ckpt_path.endswith("_object.ckpt"):
+    visual_keys = [
+        k
+        for k in state_dict
+        if (
+            "view_embedding" in k
+            or "agent_patch_2d_pos" in k
+            or "hand_patch_2d_pos" in k
+        )
+    ]
+    if (
+        sp_keys or bn_keys or grip_keys or visual_keys
+    ) and not ckpt_path.endswith("_object.ckpt"):
         reasons = []
         if sp_keys:
             reasons.append(
@@ -168,10 +181,15 @@ def load_checkpoint(
             reasons.append(
                 f"gripper-aux head keys ({grip_keys[:2]}{'...' if len(grip_keys) > 2 else ''})"
             )
+        if visual_keys:
+            reasons.append(
+                f"visual-prefix keys ({visual_keys[:2]}{'...' if len(visual_keys) > 2 else ''})"
+            )
         raise ValueError(
             f"Checkpoint '{ckpt_path}' has {' and '.join(reasons)} but is not "
             "an _object.ckpt. Non-baseline architectures (SP-trained, "
-            "BatchNorm-projector / SIGReg-trained, or gripper-aux-trained) "
+            "BatchNorm-projector / SIGReg-trained, gripper-aux-trained, "
+            "or visual-prefix-trained) "
             "must be evaluated via the per-epoch object checkpoint produced "
             "by ModelObjectCallBack — pass "
             "--checkpoint .../lewm_*_object.ckpt instead."
@@ -248,6 +266,22 @@ def load_language_instruction(h5_path: Path) -> str:
     """Read language instruction from preprocessed HDF5."""
     with h5py.File(h5_path, "r") as f:
         return f.attrs.get("language_instruction", "")
+
+
+def _denormalize_gripper_aux(
+    grip_norm: np.ndarray,
+    action_low: np.ndarray,
+    action_high: np.ndarray,
+) -> np.ndarray:
+    """Map gripper aux output from normalized space to env command space."""
+    grip_norm = np.clip(np.asarray(grip_norm, dtype=np.float64), -1.0, 1.0)
+    grip_low = float(action_low[6])
+    grip_high = float(action_high[6])
+    grip_mid = (grip_high + grip_low) / 2.0
+    grip_half_range = (grip_high - grip_low) / 2.0
+    if grip_half_range < 1e-8:
+        return np.full_like(grip_norm, grip_mid, dtype=np.float32)
+    return (grip_norm * grip_half_range + grip_mid).astype(np.float32)
 
 
 # ---------------------------------------------------------------------------
@@ -541,7 +575,11 @@ def evaluate_task(
                     lang_embeds,
                     lang_lengths,
                 )  # (B=1, H)
-                actions_phys[0, :, 6] = pred_grip[0].detach().cpu().numpy()
+                actions_phys[0, :, 6] = _denormalize_gripper_aux(
+                    pred_grip[0].detach().cpu().numpy(),
+                    action_low,
+                    action_high,
+                )
 
             obs, reward, done, _ = _execute_chunk_closed_loop(
                 env,
@@ -599,7 +637,10 @@ def _save_video(
 def main():
     parser = argparse.ArgumentParser(description="LIBERO VLA baseline evaluation")
     parser.add_argument(
-        "--checkpoint", type=str, required=True, help="Path to _weights.ckpt"
+        "--checkpoint",
+        type=str,
+        required=True,
+        help="Path to a Lightning _weights.ckpt or full-model _object.ckpt",
     )
     parser.add_argument(
         "--tokenizer",
@@ -737,6 +778,14 @@ def main():
 
         action_low, action_high, chunk_size, action_dim = load_action_stats(h5_path)
         language_instruction = load_language_instruction(h5_path)
+        if use_language and not str(language_instruction).strip():
+            raise ValueError(
+                f"Empty language_instruction in {h5_path}. This makes LIBERO "
+                "multi-task evaluation ambiguous; re-run preprocess_libero.py "
+                "with a version that records task language, or pass "
+                "--no-language only for a checkpoint trained with "
+                "data.dataset.use_language=false."
+            )
         print(f"  Language: '{language_instruction}'")
 
         # Create environment — task.bddl_file is just a filename, need full path

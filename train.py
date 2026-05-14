@@ -521,7 +521,14 @@ def run(cfg):
         steps_per_epoch = max(1, len(train))
         epochs_budget = int(trainer_cfg_sched.get("max_epochs", 1))
         sched_max_steps = max(1, steps_per_epoch * epochs_budget)
-    sched_warmup = max(1, min(2000, int(0.02 * sched_max_steps)))
+    scheduler_cfg = cfg.get("scheduler", {}) or {}
+    cfg_warmup = scheduler_cfg.get("warmup_steps", None)
+    if cfg_warmup is None:
+        sched_warmup = max(1, min(2000, int(0.02 * sched_max_steps)))
+    else:
+        sched_warmup = int(cfg_warmup)
+        if sched_warmup < 1:
+            raise ValueError(f"scheduler.warmup_steps must be >= 1, got {sched_warmup}")
     print(
         f"[scheduler] LinearWarmupCosineAnnealingLR: max_steps={sched_max_steps}, "
         f"warmup_steps={sched_warmup}, interval=step"

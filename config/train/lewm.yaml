@@ -32,6 +32,11 @@ optimizer:
   lr: 5e-5
   weight_decay: 0.05
 
+scheduler:
+  # Null = train.py uses min(2000, 2% of max_steps). Set explicitly from
+  # launcher scripts when comparing runs with a fixed warmup budget.
+  warmup_steps: null
+
 # CE label smoothing — overridden to 0 in the no-regularization ablation.
 label_smoothing: 0.1
 
@@ -70,8 +75,9 @@ loss:
   # Motivation: diagnostic on libero_object 0% showed FAST joint BPE diluting
   # the gripper signal — predicted gripper command oscillated ±1 while GT
   # stayed constant at -1 for early chunks. The bypass head restores a clean
-  # direct signal. At inference eval_libero.py auto-detects the head and
-  # overrides actions_phys[..., 6] with its prediction.
+  # direct signal. At inference eval_libero.py auto-detects the head,
+  # denormalizes it with the task's action_low/high, then overrides
+  # actions_phys[..., 6].
   gripper_aux_weight: 0.0
   sigreg:
     kwargs:

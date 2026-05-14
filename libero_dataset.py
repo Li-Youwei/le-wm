@@ -170,9 +170,14 @@ class LiberoDataset(Dataset):
                 if use_language:
                     lang_str = f.attrs.get("language_instruction", "")
                     if not lang_str:
-                        logger.warning(
-                            "No language_instruction attr in %s, using empty string",
-                            fpath.name,
+                        raise ValueError(
+                            f"Empty language_instruction in {fpath}. This makes "
+                            "LIBERO multi-task training ambiguous, especially for "
+                            "libero_object where the target object is language "
+                            "conditioned. Re-run preprocess_libero.py with a "
+                            "version that records task language, or set "
+                            "data.dataset.use_language=False only for an explicit "
+                            "no-language ablation."
                         )
                 else:
                     lang_str = None
@@ -250,9 +255,9 @@ class LiberoDataset(Dataset):
         # Direct gripper-command supervision target — bypasses FAST tokenization
         # to give the gripper dim a clean signal that doesn't get diluted by the
         # 6 spatial dims when FAST jointly BPE-encodes them.
-        # `continuous_actions` is normalized to [-1, 1] per task; for gripper
-        # (dim 6) low=-1, high=+1, so the normalization is identity and the
-        # stored values are already the raw OSC gripper command per step.
+        # `continuous_actions` is normalized to [-1, 1] per task. Eval maps the
+        # aux prediction back through action_low/high before writing dim 6, so
+        # this target must stay in the same normalized space as FAST.
         grip_seq = np.array(f["continuous_actions"][local_idx, :, 6], dtype=np.float32)
 
         item = {

@@ -91,15 +91,16 @@ PROBE_ENABLED="${PROBE_ENABLED:-true}"
 
 # Hydra strict struct: only keys ABSENT from lewm.yaml need `+` prefix.
 # Existing keys in lewm.yaml (loss.pred_weight, loss.sigreg_weight,
-# projector.norm_type, loader.batch_size, seed, trainer.{devices,max_epochs})
-# get plain overrides. New keys (trainer.max_steps, trainer.val_check_interval,
-# probe.*) get `+`.
+# projector.norm_type, scheduler.warmup_steps, loader.batch_size, seed,
+# trainer.{devices,max_epochs}) get plain overrides. New keys
+# (trainer.max_steps, trainer.val_check_interval, probe.*) get `+`.
 python train.py \
     data=libero \
     data.dataset.hdf5_dir="$FLAT_DIR" \
     loss.pred_weight="$PRED" \
     loss.sigreg_weight="$SIGREG" \
     projector.norm_type="$NORM" \
+    scheduler.warmup_steps="$WARMUP_STEPS" \
     trainer.devices=1 \
     +trainer.max_steps="$MAX_STEPS" \
     trainer.max_epochs=999 \

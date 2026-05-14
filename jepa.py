@@ -217,7 +217,7 @@ class JEPA(nn.Module):
         proprio,
         lang_embeds,
         lang_lengths,
-        max_len=80,
+        max_len=None,
         temperature=0.0,
     ):
         """Inference: autoregressively generate FAST action tokens.
@@ -226,6 +226,8 @@ class JEPA(nn.Module):
             tokens: (B, gen_len) clean FAST token ids.
             lengths: (B,) real token count per sample.
         """
+        if max_len is None:
+            max_len = self.predictor.max_action_tokens
         return self.predictor.generate(
             z_agent,
             z_hand,

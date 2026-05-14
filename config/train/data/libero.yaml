@@ -3,6 +3,9 @@ dataset:
   hdf5_dir: ${oc.env:STABLEWM_HOME}/libero
   max_action_tokens: 80
   max_lang_tokens: 25
+  # Action chunk horizon H, in raw LIBERO control steps.
+  # Must match preprocess_libero.py --chunk-size and gripper aux head output.
+  chunk_size: 20
   img_size: 224
   # 9d: ee_pos(3) + xyzw_quat(4) + gripper_states raw(2).
   # Do NOT mean/abs the gripper — fingers are symmetric around 0, averaging

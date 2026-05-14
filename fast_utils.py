@@ -140,5 +140,6 @@ def denormalize_actions(
     """
     mid = (action_high + action_low) / 2.0
     half_range = (action_high - action_low) / 2.0
-    half_range = np.where(half_range < 1e-8, 1.0, half_range)
-    return actions * half_range + mid
+    zero_range = half_range < 1e-8
+    restored = actions * half_range + mid
+    return np.where(zero_range, mid, restored)
