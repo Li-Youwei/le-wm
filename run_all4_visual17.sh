@@ -19,10 +19,11 @@ set -euo pipefail
 
 ARM="${ARM:-sp_sigreg}"
 case "$ARM" in
-  baseline)    NORM=layer; PRED=0;   SIGREG=0   ;;
-  sigreg_only) NORM=batch; PRED=0;   SIGREG=0.1 ;;
-  sp_only_ln)  NORM=layer; PRED=1.0; SIGREG=0   ;;
-  sp_sigreg)   NORM=batch; PRED=1.0; SIGREG=0.1 ;;
+  baseline)      NORM=layer; PRED=0;   SIGREG=0;   STATE_ARCH_DEFAULT=shared ;;
+  sigreg_only)   NORM=batch; PRED=0;   SIGREG=0.1; STATE_ARCH_DEFAULT=shared ;;
+  sp_only_ln)    NORM=layer; PRED=1.0; SIGREG=0;   STATE_ARCH_DEFAULT=shared ;;
+  sp_sigreg)     NORM=batch; PRED=1.0; SIGREG=0.1; STATE_ARCH_DEFAULT=shared ;;
+  sp_sigreg_mot) NORM=batch; PRED=1.0; SIGREG=0.1; STATE_ARCH_DEFAULT=mot    ;;
   *) echo "Unknown ARM: $ARM" >&2; exit 1 ;;
 esac
 
@@ -31,12 +32,17 @@ SEED="${SEED:-3072}"
 MAX_STEPS="${MAX_STEPS:-100000}"
 VAL_INTERVAL="${VAL_INTERVAL:-4000}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
+STATE_ARCH="${STATE_ARCH:-$STATE_ARCH_DEFAULT}"
+ARCH_SUFFIX=""
+if [[ "$STATE_ARCH" != "shared" && "$ARM" != *"_${STATE_ARCH}"* ]]; then
+    ARCH_SUFFIX="_${STATE_ARCH}"
+fi
 
 FLAT_DIR="${FLAT_DIR:-/Data/lyw/libero_processed_v5/all4_flat}"
 TOKENIZER="${TOKENIZER:-/Data/lyw/fast_tokenizer_all4}"
 PROCESSED_ROOT="${PROCESSED_ROOT:-/Data/lyw/libero_processed_v5}"
 CKPT_ROOT="${CKPT_ROOT:-/Data/lyw/stable-wm}"
-CKPT_DIR="${CKPT_ROOT}/all4_${ARM}_v17_seed${SEED}"
+CKPT_DIR="${CKPT_ROOT}/all4_${ARM}_v17${ARCH_SUFFIX}_seed${SEED}"
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-3}"
 export HF_HUB_OFFLINE=1
@@ -47,7 +53,7 @@ source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate vla
 
 echo "=========================================================="
-echo "[run_all4_v17] ARM=$ARM POOL_GRID=$POOL_GRID SEED=$SEED"
+echo "[run_all4_v17] ARM=$ARM STATE_ARCH=$STATE_ARCH POOL_GRID=$POOL_GRID SEED=$SEED"
 echo "[run_all4_v17] FLAT_DIR=$FLAT_DIR"
 echo "[run_all4_v17] TOKENIZER=$TOKENIZER"
 echo "[run_all4_v17] CKPT_DIR=$CKPT_DIR"
@@ -72,6 +78,7 @@ python train.py \
     data.dataset.hdf5_dir="$FLAT_DIR" \
     loss.pred_weight="$PRED" \
     loss.sigreg_weight="$SIGREG" \
+    predictor.state_prediction_arch="$STATE_ARCH" \
     projector.norm_type="$NORM" \
     trainer.devices=1 \
     +trainer.max_steps="$MAX_STEPS" \

@@ -31,11 +31,12 @@ set -euo pipefail
 
 ARM="${ARM:-sp_sigreg}"
 case "$ARM" in
-  baseline)    NORM=layer; PRED=0;   SIGREG=0   ;;
-  sigreg_only) NORM=batch; PRED=0;   SIGREG=0.1 ;;
-  sp_only_ln)  NORM=layer; PRED=1.0; SIGREG=0   ;;
-  sp_sigreg)   NORM=batch; PRED=1.0; SIGREG=0.1 ;;
-  *) echo "Unknown ARM: $ARM (expected baseline|sigreg_only|sp_only_ln|sp_sigreg)" >&2; exit 1 ;;
+  baseline)      NORM=layer; PRED=0;   SIGREG=0;   STATE_ARCH_DEFAULT=shared ;;
+  sigreg_only)   NORM=batch; PRED=0;   SIGREG=0.1; STATE_ARCH_DEFAULT=shared ;;
+  sp_only_ln)    NORM=layer; PRED=1.0; SIGREG=0;   STATE_ARCH_DEFAULT=shared ;;
+  sp_sigreg)     NORM=batch; PRED=1.0; SIGREG=0.1; STATE_ARCH_DEFAULT=shared ;;
+  sp_sigreg_mot) NORM=batch; PRED=1.0; SIGREG=0.1; STATE_ARCH_DEFAULT=mot    ;;
+  *) echo "Unknown ARM: $ARM (expected baseline|sigreg_only|sp_only_ln|sp_sigreg|sp_sigreg_mot)" >&2; exit 1 ;;
 esac
 
 SEED="${SEED:-3072}"
@@ -43,12 +44,17 @@ MAX_STEPS="${MAX_STEPS:-100000}"
 VAL_INTERVAL="${VAL_INTERVAL:-4000}"
 WARMUP_STEPS="${WARMUP_STEPS:-2000}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
+STATE_ARCH="${STATE_ARCH:-$STATE_ARCH_DEFAULT}"
+ARCH_SUFFIX=""
+if [[ "$STATE_ARCH" != "shared" && "$ARM" != *"_${STATE_ARCH}"* ]]; then
+    ARCH_SUFFIX="_${STATE_ARCH}"
+fi
 
 FLAT_DIR="${FLAT_DIR:-/Data/lyw/libero_processed_v5/all4_flat}"
 TOKENIZER="${TOKENIZER:-/Data/lyw/fast_tokenizer_all4}"
 PROCESSED_ROOT="${PROCESSED_ROOT:-/Data/lyw/libero_processed_v5}"
 CKPT_ROOT="${CKPT_ROOT:-/Data/lyw/stable-wm}"
-CKPT_DIR="${CKPT_ROOT}/all4_${ARM}_seed${SEED}"
+CKPT_DIR="${CKPT_ROOT}/all4_${ARM}${ARCH_SUFFIX}_seed${SEED}"
 
 # Set GPU explicitly via CUDA_VISIBLE_DEVICES; default GPU 0.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -61,7 +67,7 @@ source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate vla
 
 echo "=========================================================="
-echo "[run_all4] ARM=$ARM SEED=$SEED MAX_STEPS=$MAX_STEPS"
+echo "[run_all4] ARM=$ARM STATE_ARCH=$STATE_ARCH SEED=$SEED MAX_STEPS=$MAX_STEPS"
 echo "[run_all4] FLAT_DIR=$FLAT_DIR"
 echo "[run_all4] TOKENIZER=$TOKENIZER"
 echo "[run_all4] CKPT_DIR=$CKPT_DIR"
@@ -85,7 +91,7 @@ mkdir -p "$CKPT_DIR"
 TRAIN_LOG="${CKPT_DIR}/train.log"
 echo "[run_all4] starting training; logs → $TRAIN_LOG"
 
-PROBE_SCRIPT="${PROBE_SCRIPT:-/Data/lyw/le-wm/quick_probe_eval.py}"
+PROBE_SCRIPT="${PROBE_SCRIPT:-$(pwd)/quick_probe_eval.py}"
 PROBE_TRIGGER="${PROBE_TRIGGER:-20000}"
 PROBE_ENABLED="${PROBE_ENABLED:-true}"
 
@@ -99,6 +105,7 @@ python train.py \
     data.dataset.hdf5_dir="$FLAT_DIR" \
     loss.pred_weight="$PRED" \
     loss.sigreg_weight="$SIGREG" \
+    predictor.state_prediction_arch="$STATE_ARCH" \
     projector.norm_type="$NORM" \
     scheduler.warmup_steps="$WARMUP_STEPS" \
     trainer.devices=1 \

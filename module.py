@@ -222,6 +222,12 @@ class ARPredictor(nn.Module):
     Inference (`generate()`) does NOT construct STATE_QUERY tokens regardless
     of the flag, so eval_libero.py flow `[lang, z_ag, z_hd, z_pr, BOS] →
     autoregressive` is unchanged.
+
+    ``state_prediction_arch="mot"`` switches state prediction to a separate
+    Transformer stack. The action stack then never sees STATE_QUERY tokens; the
+    state stack consumes the same teacher-forced prefix+action+query sequence
+    with its own parameters. This keeps the auxiliary next-state objective from
+    competing with action-token modeling inside the same Transformer blocks.
     """
 
     def __init__(
@@ -243,6 +249,7 @@ class ARPredictor(nn.Module):
         visual_pool_grid: int = 0,
         use_gripper_aux: bool = False,
         gripper_chunk_size: int = 20,
+        state_prediction_arch: str = "shared",
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -251,6 +258,17 @@ class ARPredictor(nn.Module):
         self.proprio_dim = proprio_dim
         self.use_state_prediction = use_state_prediction
         self.n_state_query = 3 if use_state_prediction else 0
+        if state_prediction_arch not in ("shared", "mot"):
+            raise ValueError(
+                "state_prediction_arch must be 'shared' or 'mot', got "
+                f"'{state_prediction_arch}'"
+            )
+        if state_prediction_arch == "mot" and not use_state_prediction:
+            raise ValueError(
+                "state_prediction_arch='mot' requires use_state_prediction=True "
+                "(set loss.pred_weight > 0)."
+            )
+        self.state_prediction_arch = state_prediction_arch
 
         # Visual-token layout (CLS-only by default, opt-in to CLS+pooled patches).
         # If visual_pool_grid > 0 the encoder is expected to deliver CLS + G*G
@@ -371,6 +389,17 @@ class ARPredictor(nn.Module):
                 proprio_dim,
                 norm_fn=head_norm_fn,
             )
+            if self.state_prediction_arch == "mot":
+                self.state_pos_embedding = nn.Parameter(
+                    torch.randn(1, self.max_seq_len, embed_dim)
+                )
+                self.state_blocks = nn.ModuleList(
+                    [
+                        Block(embed_dim, heads, dim_head, mlp_dim, dropout)
+                        for _ in range(depth)
+                    ]
+                )
+                self.state_norm = nn.LayerNorm(embed_dim)
 
         # Transformer blocks
         self.blocks = nn.ModuleList(
@@ -628,7 +657,9 @@ class ARPredictor(nn.Module):
         bos_action = torch.cat([bos, action_tokens], dim=1)  # (B, 1+max_action_tokens)
         action_emb = self.action_embedding(bos_action) + self.type_embedding.weight[3]
 
-        # 4. Concatenate prefix + action zones
+        # 4. Concatenate prefix + action zones. In the MoT state-prediction
+        # architecture the action branch stops here; STATE_QUERY tokens are
+        # appended only to the separate state branch below.
         x = torch.cat(
             [prefix, action_emb], dim=1
         )  # (B, n_prefix + 1 + max_action_tokens, D)
@@ -636,11 +667,13 @@ class ARPredictor(nn.Module):
         # 4b. (Optional) Append STATE_QUERY tokens at the very end. Each
         # query is a learnable embedding plus the type embedding (index 4).
         # Index 4 only exists when use_state_prediction is True (n_type=5).
+        q_emb = None
         if self.use_state_prediction:
             # state_query_embeddings: (3, D) → (1, 3, D) → (B, 3, D)
             q_base = self.state_query_embeddings.unsqueeze(0).expand(B, -1, -1)
             q_emb = q_base + self.type_embedding.weight[4]  # broadcast over (B, 3, D)
-            x = torch.cat([x, q_emb], dim=1)
+            if self.state_prediction_arch == "shared":
+                x = torch.cat([x, q_emb], dim=1)
 
         L = x.size(1)
 
@@ -687,7 +720,21 @@ class ARPredictor(nn.Module):
         #    the target is the un-encoded proprio so the loss is in physical
         #    units).
         query_start = n_prefix + 1 + self.max_action_tokens
-        q_out = x[:, query_start : query_start + 3]  # (B, 3, D)
+        if self.state_prediction_arch == "shared":
+            q_out = x[:, query_start : query_start + 3]  # (B, 3, D)
+        else:
+            assert q_emb is not None
+            state_x = torch.cat([prefix, action_emb, q_emb], dim=1)
+            state_L = state_x.size(1)
+            state_x = state_x + self.state_pos_embedding[:, :state_L]
+            state_x = self.dropout(state_x)
+            state_attn_mask = self._build_attn_mask(
+                n_lang, lang_lengths, action_tokens, state_L, device
+            )
+            for block in self.state_blocks:
+                state_x = block(state_x, attn_mask=state_attn_mask)
+            state_x = self.state_norm(state_x)
+            q_out = state_x[:, query_start : query_start + 3]  # (B, 3, D)
         pred_ag = self.state_pred_head_ag(q_out[:, 0])  # (B, D)
         pred_hd = self.state_pred_head_hd(q_out[:, 1])  # (B, D)
         pred_pr = self.state_pred_head_pr(q_out[:, 2])  # (B, proprio_dim)
