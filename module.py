@@ -109,6 +109,141 @@ class Block(nn.Module):
         return x
 
 
+class ModalityLayerNorm(nn.Module):
+    """Apply a separate LayerNorm to each token modality."""
+
+    def __init__(self, num_modalities: int, dim: int, eps: float = 1e-6):
+        super().__init__()
+        self.norms = nn.ModuleList(
+            [
+                nn.LayerNorm(dim, elementwise_affine=True, eps=eps)
+                for _ in range(num_modalities)
+            ]
+        )
+
+    def forward(self, x: torch.Tensor, modality_ids: torch.Tensor) -> torch.Tensor:
+        out = torch.empty_like(x)
+        for modality, norm in enumerate(self.norms):
+            mask = modality_ids == modality
+            if mask.any():
+                out[mask] = norm(x[mask])
+        return out
+
+
+class MoTAttention(nn.Module):
+    """Meta MoT-style attention: modality-specific projections, global SDPA."""
+
+    def __init__(
+        self,
+        dim: int,
+        num_modalities: int,
+        heads: int = 8,
+        dim_head: int = 64,
+        dropout: float = 0.0,
+    ):
+        super().__init__()
+        inner_dim = dim_head * heads
+        self.heads = heads
+        self.dropout = dropout
+        self.to_qkv = nn.ModuleList(
+            [nn.Linear(dim, inner_dim * 3, bias=False) for _ in range(num_modalities)]
+        )
+        self.to_out = nn.ModuleList(
+            [
+                nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+                for _ in range(num_modalities)
+            ]
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        modality_ids: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        B, T, _ = x.shape
+        device = x.device
+        inner_dim = self.to_qkv[0].out_features // 3
+
+        q = torch.empty(B, T, inner_dim, device=device, dtype=x.dtype)
+        k = torch.empty_like(q)
+        v = torch.empty_like(q)
+        for modality, proj in enumerate(self.to_qkv):
+            mask = modality_ids == modality
+            if mask.any():
+                q_m, k_m, v_m = proj(x[mask]).chunk(3, dim=-1)
+                q[mask] = q_m
+                k[mask] = k_m
+                v[mask] = v_m
+
+        q = rearrange(q, "b t (h d) -> b h t d", h=self.heads)
+        k = rearrange(k, "b t (h d) -> b h t d", h=self.heads)
+        v = rearrange(v, "b t (h d) -> b h t d", h=self.heads)
+        drop = self.dropout if self.training else 0.0
+        attn_out = F.scaled_dot_product_attention(
+            q,
+            k,
+            v,
+            attn_mask=attn_mask,
+            dropout_p=drop,
+        )
+        attn_out = rearrange(attn_out, "b h t d -> b t (h d)")
+
+        out = torch.empty(B, T, self.to_out[0][0].out_features, device=device, dtype=x.dtype)
+        for modality, proj in enumerate(self.to_out):
+            mask = modality_ids == modality
+            if mask.any():
+                out[mask] = proj(attn_out[mask])
+        return out
+
+
+class MoTBlock(nn.Module):
+    """Mixture-of-Transformers block with modality-specific non-embedding params.
+
+    Mirrors Meta's MoT rule-based routing: each token uses parameters selected
+    by its modality for layer normalization, QKV/O attention projections, and
+    FFN, while attention is still computed globally over the full sequence.
+    """
+
+    def __init__(
+        self,
+        dim: int,
+        heads: int,
+        dim_head: int,
+        mlp_dim: int,
+        dropout: float = 0.0,
+        num_modalities: int = 4,
+    ):
+        super().__init__()
+        self.norm1 = ModalityLayerNorm(num_modalities, dim, eps=1e-6)
+        self.attn = MoTAttention(
+            dim,
+            num_modalities,
+            heads=heads,
+            dim_head=dim_head,
+            dropout=dropout,
+        )
+        self.norm2 = ModalityLayerNorm(num_modalities, dim, eps=1e-6)
+        self.mlp = nn.ModuleList(
+            [FeedForward(dim, mlp_dim, dropout=dropout) for _ in range(num_modalities)]
+        )
+
+    def forward(
+        self,
+        x: torch.Tensor,
+        modality_ids: torch.Tensor,
+        attn_mask: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        x = x + self.attn(self.norm1(x, modality_ids), modality_ids, attn_mask=attn_mask)
+        y = self.norm2(x, modality_ids)
+        mlp_out = torch.empty_like(x)
+        for modality, mlp in enumerate(self.mlp):
+            mask = modality_ids == modality
+            if mask.any():
+                mlp_out[mask] = mlp(y[mask])
+        return x + mlp_out
+
+
 class Transformer(nn.Module):
     """Standard Transformer"""
 
@@ -195,6 +330,12 @@ PAD_TOKEN_ID = 1026
 TOTAL_VOCAB_SIZE = FAST_VOCAB_SIZE + 3  # 1027: 0..1023 FAST + BOS + EOS + PAD
 ACTION_HEAD_SIZE = FAST_VOCAB_SIZE + 2  # 1026: predict 0..1025, PAD excluded
 
+MOT_LANG = 0
+MOT_VISUAL = 1
+MOT_PROPRIO = 2
+MOT_ACTION = 3
+MOT_NUM_MODALITIES = 4
+
 
 class ARPredictor(nn.Module):
     """Autoregressive predictor for VLA baseline + optional state prediction.
@@ -223,11 +364,12 @@ class ARPredictor(nn.Module):
     of the flag, so eval_libero.py flow `[lang, z_ag, z_hd, z_pr, BOS] →
     autoregressive` is unchanged.
 
-    ``state_prediction_arch="mot"`` switches state prediction to a separate
-    Transformer stack. The action stack then never sees STATE_QUERY tokens; the
-    state stack consumes the same teacher-forced prefix+action+query sequence
-    with its own parameters. This keeps the auxiliary next-state objective from
-    competing with action-token modeling inside the same Transformer blocks.
+    ``state_prediction_arch="mot"`` enables a Meta MoT-style transformer:
+    language, visual, proprio, and action tokens use modality-specific
+    layer norms, attention projection matrices, and FFNs, while attention is
+    still computed globally over the full sequence. STATE_QUERY tokens are
+    routed by target modality: Q_ag/Q_hd use the visual expert, Q_pr uses the
+    proprio expert.
     """
 
     def __init__(
@@ -263,12 +405,8 @@ class ARPredictor(nn.Module):
                 "state_prediction_arch must be 'shared' or 'mot', got "
                 f"'{state_prediction_arch}'"
             )
-        if state_prediction_arch == "mot" and not use_state_prediction:
-            raise ValueError(
-                "state_prediction_arch='mot' requires use_state_prediction=True "
-                "(set loss.pred_weight > 0)."
-            )
         self.state_prediction_arch = state_prediction_arch
+        self.use_mot_transformer = state_prediction_arch == "mot"
 
         # Visual-token layout (CLS-only by default, opt-in to CLS+pooled patches).
         # If visual_pool_grid > 0 the encoder is expected to deliver CLS + G*G
@@ -389,23 +527,33 @@ class ARPredictor(nn.Module):
                 proprio_dim,
                 norm_fn=head_norm_fn,
             )
-            if self.state_prediction_arch == "mot":
-                self.state_pos_embedding = nn.Parameter(
-                    torch.randn(1, self.max_seq_len, embed_dim)
-                )
-                self.state_blocks = nn.ModuleList(
-                    [
-                        Block(embed_dim, heads, dim_head, mlp_dim, dropout)
-                        for _ in range(depth)
-                    ]
-                )
-                self.state_norm = nn.LayerNorm(embed_dim)
-
-        # Transformer blocks
-        self.blocks = nn.ModuleList(
-            [Block(embed_dim, heads, dim_head, mlp_dim, dropout) for _ in range(depth)]
-        )
-        self.norm = nn.LayerNorm(embed_dim)
+        # Transformer blocks. The Meta MoT variant keeps global attention over
+        # the full sequence but routes non-embedding parameters by token
+        # modality inside each block.
+        block_cls = MoTBlock if self.use_mot_transformer else Block
+        if self.use_mot_transformer:
+            self.blocks = nn.ModuleList(
+                [
+                    block_cls(
+                        embed_dim,
+                        heads,
+                        dim_head,
+                        mlp_dim,
+                        dropout,
+                        num_modalities=MOT_NUM_MODALITIES,
+                    )
+                    for _ in range(depth)
+                ]
+            )
+            self.norm = ModalityLayerNorm(MOT_NUM_MODALITIES, embed_dim)
+        else:
+            self.blocks = nn.ModuleList(
+                [
+                    block_cls(embed_dim, heads, dim_head, mlp_dim, dropout)
+                    for _ in range(depth)
+                ]
+            )
+            self.norm = nn.LayerNorm(embed_dim)
         self.dropout = nn.Dropout(emb_dropout)
 
     def _build_attn_mask(
@@ -561,6 +709,87 @@ class ARPredictor(nn.Module):
 
         return mask.unsqueeze(1)
 
+    def _build_train_modality_ids(
+        self,
+        B: int,
+        n_lang: int,
+        nv: int,
+        include_queries: bool,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return per-token MoT modality ids for teacher-forced training."""
+        chunks = []
+        if n_lang > 0:
+            chunks.append(
+                torch.full((B, n_lang), MOT_LANG, device=device, dtype=torch.long)
+            )
+        chunks.extend(
+            [
+                torch.full((B, nv), MOT_VISUAL, device=device, dtype=torch.long),
+                torch.full((B, nv), MOT_VISUAL, device=device, dtype=torch.long),
+                torch.full((B, 1), MOT_PROPRIO, device=device, dtype=torch.long),
+                torch.full(
+                    (B, 1 + self.max_action_tokens),
+                    MOT_ACTION,
+                    device=device,
+                    dtype=torch.long,
+                ),
+            ]
+        )
+        if include_queries:
+            query_ids = torch.tensor(
+                [MOT_VISUAL, MOT_VISUAL, MOT_PROPRIO],
+                device=device,
+                dtype=torch.long,
+            ).expand(B, -1)
+            chunks.append(query_ids)
+        return torch.cat(chunks, dim=1)
+
+    def _build_generate_modality_ids(
+        self,
+        B: int,
+        n_lang: int,
+        nv: int,
+        n_action_positions: int,
+        device: torch.device,
+    ) -> torch.Tensor:
+        """Return per-token MoT modality ids for generation-time sequences."""
+        chunks = []
+        if n_lang > 0:
+            chunks.append(
+                torch.full((B, n_lang), MOT_LANG, device=device, dtype=torch.long)
+            )
+        chunks.extend(
+            [
+                torch.full((B, nv), MOT_VISUAL, device=device, dtype=torch.long),
+                torch.full((B, nv), MOT_VISUAL, device=device, dtype=torch.long),
+                torch.full((B, 1), MOT_PROPRIO, device=device, dtype=torch.long),
+                torch.full(
+                    (B, n_action_positions),
+                    MOT_ACTION,
+                    device=device,
+                    dtype=torch.long,
+                ),
+            ]
+        )
+        return torch.cat(chunks, dim=1)
+
+    def _run_blocks(
+        self,
+        x: torch.Tensor,
+        attn_mask: torch.Tensor,
+        modality_ids: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Run shared or MoT-routed transformer blocks."""
+        if self.use_mot_transformer:
+            assert modality_ids is not None
+            for block in self.blocks:
+                x = block(x, modality_ids, attn_mask=attn_mask)
+            return self.norm(x, modality_ids)
+        for block in self.blocks:
+            x = block(x, attn_mask=attn_mask)
+        return self.norm(x)
+
     def forward(
         self,
         z_agent: torch.Tensor,
@@ -657,9 +886,7 @@ class ARPredictor(nn.Module):
         bos_action = torch.cat([bos, action_tokens], dim=1)  # (B, 1+max_action_tokens)
         action_emb = self.action_embedding(bos_action) + self.type_embedding.weight[3]
 
-        # 4. Concatenate prefix + action zones. In the MoT state-prediction
-        # architecture the action branch stops here; STATE_QUERY tokens are
-        # appended only to the separate state branch below.
+        # 4. Concatenate prefix + action zones.
         x = torch.cat(
             [prefix, action_emb], dim=1
         )  # (B, n_prefix + 1 + max_action_tokens, D)
@@ -667,15 +894,24 @@ class ARPredictor(nn.Module):
         # 4b. (Optional) Append STATE_QUERY tokens at the very end. Each
         # query is a learnable embedding plus the type embedding (index 4).
         # Index 4 only exists when use_state_prediction is True (n_type=5).
-        q_emb = None
         if self.use_state_prediction:
             # state_query_embeddings: (3, D) → (1, 3, D) → (B, 3, D)
             q_base = self.state_query_embeddings.unsqueeze(0).expand(B, -1, -1)
             q_emb = q_base + self.type_embedding.weight[4]  # broadcast over (B, 3, D)
-            if self.state_prediction_arch == "shared":
-                x = torch.cat([x, q_emb], dim=1)
+            x = torch.cat([x, q_emb], dim=1)
 
         L = x.size(1)
+        modality_ids = (
+            self._build_train_modality_ids(
+                B,
+                n_lang,
+                nv,
+                include_queries=self.use_state_prediction,
+                device=device,
+            )
+            if self.use_mot_transformer
+            else None
+        )
 
         # 5. Positional embedding + dropout
         x = x + self.pos_embedding[:, :L]
@@ -687,9 +923,7 @@ class ARPredictor(nn.Module):
         )
 
         # 7. Transformer blocks
-        for block in self.blocks:
-            x = block(x, attn_mask=attn_mask)
-        x = self.norm(x)
+        x = self._run_blocks(x, attn_mask, modality_ids)
 
         # 8. Extract action zone output: BOS + action token positions
         n_prefix = n_lang + 2 * nv + 1
@@ -720,21 +954,7 @@ class ARPredictor(nn.Module):
         #    the target is the un-encoded proprio so the loss is in physical
         #    units).
         query_start = n_prefix + 1 + self.max_action_tokens
-        if self.state_prediction_arch == "shared":
-            q_out = x[:, query_start : query_start + 3]  # (B, 3, D)
-        else:
-            assert q_emb is not None
-            state_x = torch.cat([prefix, action_emb, q_emb], dim=1)
-            state_L = state_x.size(1)
-            state_x = state_x + self.state_pos_embedding[:, :state_L]
-            state_x = self.dropout(state_x)
-            state_attn_mask = self._build_attn_mask(
-                n_lang, lang_lengths, action_tokens, state_L, device
-            )
-            for block in self.state_blocks:
-                state_x = block(state_x, attn_mask=state_attn_mask)
-            state_x = self.state_norm(state_x)
-            q_out = state_x[:, query_start : query_start + 3]  # (B, 3, D)
+        q_out = x[:, query_start : query_start + 3]  # (B, 3, D)
         pred_ag = self.state_pred_head_ag(q_out[:, 0])  # (B, D)
         pred_hd = self.state_pred_head_hd(q_out[:, 1])  # (B, D)
         pred_pr = self.state_pred_head_pr(q_out[:, 2])  # (B, proprio_dim)
@@ -820,10 +1040,18 @@ class ARPredictor(nn.Module):
 
             # Build generate-time mask (prefix bidir, action causal, no PAD)
             attn_mask = self._build_generate_mask(n_lang, lang_lengths, B, L, device)
-
-            for block in self.blocks:
-                x = block(x, attn_mask=attn_mask)
-            x = self.norm(x)
+            modality_ids = (
+                self._build_generate_modality_ids(
+                    B,
+                    n_lang,
+                    nv,
+                    n_action_positions=L - (n_lang + 2 * nv + 1),
+                    device=device,
+                )
+                if self.use_mot_transformer
+                else None
+            )
+            x = self._run_blocks(x, attn_mask, modality_ids)
 
             # Logits at last position
             logits = self.action_head(x[:, -1])  # (B, ACTION_HEAD_SIZE)
@@ -952,10 +1180,18 @@ class ARPredictor(nn.Module):
         L = seq.size(1)
         x = seq + self.pos_embedding[:, :L]
         attn_mask = self._build_generate_mask(n_lang, lang_lengths, B, L, device)
-
-        for block in self.blocks:
-            x = block(x, attn_mask=attn_mask)
-        x = self.norm(x)
+        modality_ids = (
+            self._build_generate_modality_ids(
+                B,
+                n_lang,
+                nv,
+                n_action_positions=L - (n_lang + 2 * nv + 1),
+                device=device,
+            )
+            if self.use_mot_transformer
+            else None
+        )
+        x = self._run_blocks(x, attn_mask, modality_ids)
 
         n_prefix = n_lang + 2 * nv + 1
         return self.gripper_aux_head(x[:, n_prefix])  # (B, gripper_chunk_size)

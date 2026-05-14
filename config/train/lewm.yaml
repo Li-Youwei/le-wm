@@ -51,9 +51,10 @@ predictor:
   dim_head: 64
   dropout: 0.2
   emb_dropout: 0.0
-  # shared: legacy SP path; state-query tokens share the action Transformer.
-  # mot: separate Transformer stack for next-state prediction, while action
-  # logits keep the legacy action-only stack. Use with loss.pred_weight > 0.
+  # shared: legacy dense predictor Transformer.
+  # mot: Meta MoT-style modality routing. Language, visual, proprio, and
+  # action tokens use separate non-embedding transformer parameters while
+  # retaining global self-attention over the full sequence.
   state_prediction_arch: shared
 
 # Projector normalization layer — see CLAUDE.md "Known caveats of switching to
