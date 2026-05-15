@@ -13,6 +13,7 @@ class JEPA(nn.Module):
         lang_encoder=None,
         lang_proj=None,
         visual_pool_grid: int = 0,
+        freeze_encoder: bool = False,
     ):
         super().__init__()
 
@@ -24,6 +25,11 @@ class JEPA(nn.Module):
         # visual_pool_grid > 0 enables CLS + G*G adaptive-avg-pooled patch
         # tokens per view; 0 keeps the legacy CLS-only output.
         self.visual_pool_grid = int(visual_pool_grid)
+        self.freeze_encoder = bool(freeze_encoder)
+        if self.freeze_encoder:
+            self.encoder.eval()
+            for p in self.encoder.parameters():
+                p.requires_grad_(False)
 
     @property
     def use_language(self) -> bool:
@@ -39,6 +45,8 @@ class JEPA(nn.Module):
         super().train(mode)
         if self.lang_encoder is not None:
             self.lang_encoder.eval()
+        if self.freeze_encoder:
+            self.encoder.eval()
         return self
 
     def encode(
@@ -74,7 +82,7 @@ class JEPA(nn.Module):
         """
         # Visual: cat both views, single ViT pass, then split.
         visual_cat = torch.cat([pixels_agent, pixels_hand], dim=0)  # (2B, C, H, W)
-        visual_out = self.encoder(visual_cat, interpolate_pos_encoding=True)
+        visual_out = self._encode_visual_cat(visual_cat)
         # tokens_2b: (2B, N, D) with CLS at index 0 and (optionally) pooled patches
         # at indices 1..N-1. The projector wants a 2D (batch, channel) input —
         # BatchNorm1d(2048) interprets a 3D (2B, N, 2048) as (N_batch, C=N, L)
@@ -173,12 +181,18 @@ class JEPA(nn.Module):
             [pixels_agent_future, pixels_hand_future],
             dim=0,
         )  # (2B, C, H, W)
-        visual_out = self.encoder(visual_cat, interpolate_pos_encoding=True)
+        visual_out = self._encode_visual_cat(visual_cat)
         # CLS-only path for SP / SIGReg: take last_hidden_state[:, 0] before
         # the projector to skip the pooling-and-reshape codepath entirely.
         visual_z = self.projector(visual_out.last_hidden_state[:, 0])  # (2B, D)
         z_agent_future, z_hand_future = visual_z.chunk(2, dim=0)
         return z_agent_future, z_hand_future
+
+    def _encode_visual_cat(self, visual_cat: torch.Tensor):
+        if self.freeze_encoder:
+            with torch.no_grad():
+                return self.encoder(visual_cat, interpolate_pos_encoding=True)
+        return self.encoder(visual_cat, interpolate_pos_encoding=True)
 
     def _pool_visual_tokens(self, hidden: torch.Tensor) -> torch.Tensor:
         """Extract CLS + (optional) spatially-pooled patches from a ViT output.

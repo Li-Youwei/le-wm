@@ -13,6 +13,16 @@ patch_size: 14
 encoder_scale: tiny
 dump_object: True
 
+vision_encoder:
+  # spt_vit: repo's original ViT factory. hf: AutoModel.from_pretrained(...)
+  # returning last_hidden_state, e.g. a local DINOv2/ViT directory.
+  source: spt_vit
+  pretrained: false
+  model_name_or_path: null
+  freeze: false
+  local_files_only: true
+  trust_remote_code: false
+
 trainer:
   max_epochs: 100
   devices: auto

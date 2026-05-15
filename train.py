@@ -14,6 +14,7 @@ from transformers import T5EncoderModel
 from jepa import JEPA
 from module import ARPredictor, MLP, SIGReg, ACTION_HEAD_SIZE, EOS_TOKEN_ID
 from utils import ModelObjectCallBack, PeriodicPrintCallback
+from vision_backbone import build_visual_encoder
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -432,15 +433,7 @@ def run(cfg):
     ##       model / optim      ##
     ##############################
 
-    encoder = spt.backbone.utils.vit_hf(
-        cfg.encoder_scale,
-        patch_size=cfg.patch_size,
-        image_size=cfg.img_size,
-        pretrained=False,
-        use_mask_token=False,
-    )
-
-    hidden_dim = encoder.config.hidden_size
+    encoder, hidden_dim, freeze_visual_encoder = build_visual_encoder(cfg, spt)
     embed_dim = cfg.wm.get("embed_dim", hidden_dim)
 
     # ARPredictor with language + proprio support.
@@ -501,6 +494,7 @@ def run(cfg):
         lang_encoder=lang_encoder,
         lang_proj=lang_proj,
         visual_pool_grid=visual_pool_grid,
+        freeze_encoder=freeze_visual_encoder,
     )
 
     # Cosine-annealing scheduler with explicit warmup_steps / max_steps.
