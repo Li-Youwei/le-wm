@@ -1,16 +1,41 @@
 #!/usr/bin/env bash
 # run_all4_pretrained_vision.sh - 4-suite LIBERO training with a frozen
-# HuggingFace vision backbone. Default is a clean action-only baseline with
-# frozen DINOv2, used to isolate whether object failures come from visual
-# representation rather than SP/SIGReg/MoT.
+# HuggingFace vision backbone. Default runs SP+SIGReg with frozen DINOv2.
 set -euo pipefail
 
-ARM="${ARM:-all4_dinov2_frozen}"
+ARM="${ARM:-all4_sp_sigreg_dinov2_frozen}"
+case "$ARM" in
+  all4_dinov2_frozen)
+    PRED=0
+    SIGREG=0
+    NORM=layer
+    STATE_ARCH_DEFAULT=shared
+    ;;
+  all4_sp_sigreg_dinov2_frozen)
+    PRED=1.0
+    SIGREG=0.1
+    NORM=batch
+    STATE_ARCH_DEFAULT=shared
+    ;;
+  all4_sp_sigreg_dinov2_frozen_mot)
+    PRED=1.0
+    SIGREG=0.1
+    NORM=batch
+    STATE_ARCH_DEFAULT=mot
+    ;;
+  *)
+    echo "Unknown ARM: $ARM" >&2
+    echo "Expected all4_dinov2_frozen|all4_sp_sigreg_dinov2_frozen|all4_sp_sigreg_dinov2_frozen_mot" >&2
+    exit 1
+    ;;
+esac
+
 SEED="${SEED:-3072}"
 MAX_STEPS="${MAX_STEPS:-100000}"
 VAL_INTERVAL="${VAL_INTERVAL:-4000}"
 WARMUP_STEPS="${WARMUP_STEPS:-2000}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
+STATE_ARCH="${STATE_ARCH:-$STATE_ARCH_DEFAULT}"
 
 FLAT_DIR="${FLAT_DIR:-/Data/lyw/libero_processed_v5/all4_flat}"
 TOKENIZER="${TOKENIZER:-/Data/lyw/fast_tokenizer_all4}"
@@ -28,7 +53,8 @@ source "$HOME/miniconda3/etc/profile.d/conda.sh"
 conda activate vla
 
 echo "=========================================================="
-echo "[all4_pretrained_vision] ARM=$ARM SEED=$SEED MAX_STEPS=$MAX_STEPS"
+echo "[all4_pretrained_vision] ARM=$ARM STATE_ARCH=$STATE_ARCH SEED=$SEED MAX_STEPS=$MAX_STEPS"
+echo "[all4_pretrained_vision] PRED=$PRED SIGREG=$SIGREG NORM=$NORM"
 echo "[all4_pretrained_vision] FLAT_DIR=$FLAT_DIR"
 echo "[all4_pretrained_vision] TOKENIZER=$TOKENIZER"
 echo "[all4_pretrained_vision] PROCESSED_ROOT=$PROCESSED_ROOT"
@@ -60,10 +86,10 @@ python train.py \
     vision_encoder.model_name_or_path="$VISION_ENCODER" \
     vision_encoder.freeze=true \
     vision_encoder.local_files_only=true \
-    loss.pred_weight=0 \
-    loss.sigreg_weight=0 \
-    predictor.state_prediction_arch=shared \
-    projector.norm_type=layer \
+    loss.pred_weight="$PRED" \
+    loss.sigreg_weight="$SIGREG" \
+    predictor.state_prediction_arch="$STATE_ARCH" \
+    projector.norm_type="$NORM" \
     scheduler.warmup_steps="$WARMUP_STEPS" \
     trainer.devices=1 \
     +trainer.max_steps="$MAX_STEPS" \
