@@ -34,6 +34,7 @@ from transformers import T5Tokenizer
 
 # Reuse helpers from eval_libero / fast_utils.
 from eval_libero import (
+    _denormalize_gripper_aux,
     _read_osc_scales,
     build_model,
     find_processed_h5,
@@ -52,15 +53,25 @@ ROT_SCALE_FALLBACK = 0.5
 def gather_gt_chunks(
     h5_path: Path, demo_idx: int, n_chunks: int
 ) -> dict[str, np.ndarray]:
-    """Pull the first n_chunks from `demo_idx` in the preprocessed HDF5.
+    """Pull rollout-aligned chunks from `demo_idx` in the preprocessed HDF5.
 
     `continuous_actions` is stored normalized to [-1, 1] (see preprocess_libero.py).
     Denormalize back to physical units using the per-task action_low/high attrs.
+
+    Rollout diagnostics execute one H-step action chunk, then query the policy
+    again. Compare against GT anchors at raw steps 0, H, 2H, ... rather than
+    consecutive sliding-window anchors 0, 1, 2, ... .
     """
     with h5py.File(h5_path, "r") as f:
         demo_arr = f["demo_idx"][()]
-        mask = demo_arr == demo_idx
-        idx = np.where(mask)[0][:n_chunks]
+        chunk_idx_arr = f["chunk_idx"][()]
+        chunk_size = int(f.attrs["chunk_size"])
+        selected: list[int] = []
+        for anchor in range(0, n_chunks * chunk_size, chunk_size):
+            matches = np.where((demo_arr == demo_idx) & (chunk_idx_arr == anchor))[0]
+            if matches.size:
+                selected.append(int(matches[0]))
+        idx = np.array(selected, dtype=np.int64)
         if idx.size == 0:
             raise ValueError(f"No samples in {h5_path} with demo_idx=={demo_idx}")
         chunks_norm = f["continuous_actions"][idx]  # (n, H, 7) in [-1, 1]
@@ -69,7 +80,6 @@ def gather_gt_chunks(
         chunk_idx = f["chunk_idx"][idx]
         action_low = np.array(f.attrs["action_low"])
         action_high = np.array(f.attrs["action_high"])
-        chunk_size = int(f.attrs["chunk_size"])
         proprio = f["proprio"][idx]  # (n, 9)
 
     # Denormalize to physical units (same formula eval_libero uses).
@@ -133,6 +143,8 @@ def run_diag_rollout(
     pred_lengths_list: list[int] = []
     pred_norm_chunks: list[np.ndarray] = []
     pred_phys_chunks: list[np.ndarray] = []
+    pred_fast_phys_chunks: list[np.ndarray] = []
+    pred_aux_grip_chunks: list[np.ndarray] = []
     anchor_pos_list: list[np.ndarray] = []
     anchor_quat_list: list[np.ndarray] = []
     rewards_at_chunk: list[float] = []
@@ -179,6 +191,24 @@ def run_diag_rollout(
             action_dim=action_dim,
         )  # (B, H, D) in [-1, 1]
         actions_phys = denormalize_actions(actions_norm, action_low, action_high)
+        pred_fast_phys_chunks.append(actions_phys[0].astype(np.float32).copy())
+
+        if getattr(model.predictor, "use_gripper_aux", False):
+            pred_grip = model.predict_gripper_aux(
+                z_agent,
+                z_hand,
+                proprio_t,
+                lang_embeds,
+                lang_lengths,
+            )
+            aux_grip = _denormalize_gripper_aux(
+                pred_grip[0].detach().cpu().numpy(),
+                action_low,
+                action_high,
+            )
+            actions_phys[0, :, 6] = aux_grip
+            pred_aux_grip_chunks.append(aux_grip.astype(np.float32))
+
         pred_norm_chunks.append(actions_norm[0].astype(np.float32))
         pred_phys_chunks.append(actions_phys[0].astype(np.float32))
 
@@ -232,6 +262,7 @@ def run_diag_rollout(
         "pred_token_lengths": np.array(pred_lengths_list, dtype=np.int32),
         "pred_norm_chunks": np.stack(pred_norm_chunks),  # (n, H, 7)
         "pred_phys_chunks": np.stack(pred_phys_chunks),  # (n, H, 7)
+        "pred_fast_phys_chunks": np.stack(pred_fast_phys_chunks),  # before aux override
         "anchor_pos": np.stack(anchor_pos_list),  # (n, 3)
         "anchor_quat": np.stack(anchor_quat_list),  # (n, 4)
         "chunk_start_gripper": np.stack(gripper_joints_at_chunk),  # (n, 2)
@@ -244,6 +275,8 @@ def run_diag_rollout(
             dtype=np.float32,
         ),
     }
+    if pred_aux_grip_chunks:
+        out["pred_aux_grip_chunks"] = np.stack(pred_aux_grip_chunks)
     return out
 
 
@@ -277,6 +310,9 @@ def summarize_comparison(pred: dict, gt: dict, n_show: int = 5) -> None:
         p = pred["pred_phys_chunks"][i, :, 6]
         g = gt["gt_chunks_phys"][i, :, 6]
         print(f"  chunk {i} PRED grip:  [{' '.join(f'{x:+5.2f}' for x in p)}]")
+        if "pred_aux_grip_chunks" in pred:
+            f = pred["pred_fast_phys_chunks"][i, :, 6]
+            print(f"  chunk {i} FAST grip:  [{' '.join(f'{x:+5.2f}' for x in f)}]")
         print(f"  chunk {i}  GT  grip:  [{' '.join(f'{x:+5.2f}' for x in g)}]")
 
     print()

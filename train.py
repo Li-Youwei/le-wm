@@ -632,11 +632,22 @@ def run(cfg):
         enable_checkpointing=True,
     )
 
+    # Overfit mode is a fast pipeline sanity check. Passing a weights ckpt path
+    # makes stable_pretraining add a Lightning ModelCheckpoint, which saves at
+    # epoch cadence; on tiny overfit loaders that can mean one large checkpoint
+    # every couple of steps. Keep overfit runs lightweight and rely on the
+    # object callback's step-based checkpoints when a snapshot is needed.
+    manager_ckpt_path = (
+        None
+        if overfit_demo is not None
+        else run_dir / f"{cfg.output_model_name}_weights.ckpt"
+    )
+
     manager = spt.Manager(
         trainer=trainer,
         module=world_model,
         data=data_module,
-        ckpt_path=run_dir / f"{cfg.output_model_name}_weights.ckpt",
+        ckpt_path=manager_ckpt_path,
     )
 
     manager()
