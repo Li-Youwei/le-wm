@@ -145,13 +145,22 @@ def lejepa_forward(self, batch, stage, cfg):
         # in step 2) and the target path (here) get gradients — that's
         # the LeWM "no heuristics" recipe; SIGReg is the only thing
         # holding off collapse.
+        # NB: after Bug #1 fix, encode_future_visual returns (B, N, D)
+        # symmetric with encode(); take CLS slice for the SP MSE target
+        # (SP head still predicts a single per-view embedding).
         z_agent_future, z_hand_future = self.model.encode_future_visual(
             pixels_agent_future,
             pixels_hand_future,
         )
+        z_ag_future_cls = (
+            z_agent_future[:, 0] if z_agent_future.dim() == 3 else z_agent_future
+        )
+        z_hd_future_cls = (
+            z_hand_future[:, 0] if z_hand_future.dim() == 3 else z_hand_future
+        )
 
-        loss_pred_ag = F.mse_loss(pred_ag, z_agent_future)
-        loss_pred_hd = F.mse_loss(pred_hd, z_hand_future)
+        loss_pred_ag = F.mse_loss(pred_ag, z_ag_future_cls)
+        loss_pred_hd = F.mse_loss(pred_hd, z_hd_future_cls)
         loss_pred_pr = F.mse_loss(pred_pr, proprio_future)
 
         output["pred_loss"] = loss_pred_ag + loss_pred_hd + loss_pred_pr
@@ -165,10 +174,9 @@ def lejepa_forward(self, batch, stage, cfg):
     # The 4-stream stack maps to LeWM's `emb` over 2 timesteps × 2 views.
     # Predictor outputs (pred_ag/pred_hd) are intentionally NOT included
     # — see paper Algorithm 1 + upstream `train.py::lejepa_forward`.
-    # `encode()` returns (B, N, D); for SIGReg we use the CLS slice only
-    # (see encode_future_visual docstring — SP heads + SIGReg both operate
-    # on a single per-view embedding, multi-token prefix is a predictor
-    # concern). encode_future_visual already returns (B, D).
+    # Both `encode()` and `encode_future_visual()` return (B, N, D) after
+    # the Bug #1 fix; SIGReg uses the CLS slice only (per-view single
+    # embedding constraint, patch tokens remain a predictor-side concern).
     if sigreg_weight > 0:
         z_ag_cls = z_agent[:, 0] if z_agent.dim() == 3 else z_agent
         z_hd_cls = z_hand[:, 0] if z_hand.dim() == 3 else z_hand
@@ -178,8 +186,7 @@ def lejepa_forward(self, batch, stage, cfg):
             sigreg_input = torch.stack([z_ag_cls, z_hd_cls], dim=0)
         else:
             sigreg_input = torch.stack(
-                [z_ag_cls, z_hd_cls, z_agent_future, z_hand_future],
-                dim=0,
+                [z_ag_cls, z_hd_cls, z_ag_future_cls, z_hd_future_cls], dim=0
             )
         output["sigreg_loss"] = self.sigreg(sigreg_input)
         total_loss = total_loss + sigreg_weight * output["sigreg_loss"]

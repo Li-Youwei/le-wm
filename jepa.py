@@ -152,31 +152,43 @@ class JEPA(nn.Module):
         (train.py) must also avoid stop-grad. SIGReg on the encoder outputs
         is what prevents collapse, not stop-gradient.
 
+        BN-bias note (post-fix for Bug #1): this method now mirrors
+        ``encode()`` exactly — pool + projector with the same reshape adapter.
+        When ``visual_pool_grid > 0`` the projector receives (B*N, D) from
+        BOTH source (encode) and target (encode_future_visual) calls, so the
+        BN1d running mean/var is updated from a single homogeneous
+        distribution. Previously the target path went through ``[:, 0]`` only,
+        feeding (B, D) instead, which biased BN stats toward source-mixed
+        CLS+patch features and caused the SP MSE to measure distances in a
+        space the encoder was never trained on (pred_loss 8.6x worse under
+        V17). Caller takes the CLS slice ``[:, 0]`` for SP head + SIGReg.
+
         Performance note: same cat-then-split optimization as ``encode()``;
         the two future views go through the ViT in one forward pass. Total
-        ViT calls per training step in SP mode = 2 (down from 4).
+        ViT calls per training step in SP mode = 2 (down from 4). Multi-token
+        adds zero ViT compute (encoder already produces all patches); only
+        the projector now runs on N tokens instead of 1.
 
         Args:
             pixels_agent_future: (B, 3, H, W) agentview image at raw step t+H.
             pixels_hand_future: (B, 3, H, W) hand-cam image at raw step t+H.
 
         Returns:
-            z_agent_future: (B, D) future agentview CLS latent.
-            z_hand_future: (B, D) future hand-cam CLS latent.
-
-        Note: even when visual_pool_grid>0 (multi-token prefix), the future
-        target stays CLS-only because the SP heads are MLP(D→D) and SIGReg
-        operates on a single per-view embedding. Per-patch SP would require
-        head + loss redesign — left for a follow-up.
+            z_agent_future: (B, N, D) future agentview tokens, projected.
+                N=1 (CLS only) when ``visual_pool_grid <= 0``, else
+                N = 1 + grid*grid (CLS + spatially-pooled patches).
+            z_hand_future: same layout as z_agent_future.
         """
         visual_cat = torch.cat(
             [pixels_agent_future, pixels_hand_future],
             dim=0,
         )  # (2B, C, H, W)
         visual_out = self.encoder(visual_cat, interpolate_pos_encoding=True)
-        # CLS-only path for SP / SIGReg: take last_hidden_state[:, 0] before
-        # the projector to skip the pooling-and-reshape codepath entirely.
-        visual_z = self.projector(visual_out.last_hidden_state[:, 0])  # (2B, D)
+        # Mirror encode(): pool → reshape adapter → projector → reshape back.
+        tokens_2b = self._pool_visual_tokens(visual_out.last_hidden_state)
+        B_total, N_per, D_in = tokens_2b.shape
+        visual_z_flat = self.projector(tokens_2b.reshape(B_total * N_per, D_in))
+        visual_z = visual_z_flat.reshape(B_total, N_per, -1)  # (2B, N, D)
         z_agent_future, z_hand_future = visual_z.chunk(2, dim=0)
         return z_agent_future, z_hand_future
 
