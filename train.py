@@ -41,6 +41,9 @@ def lejepa_forward(self, batch, stage, cfg):
     gripper_aux_weight = float(loss_cfg.get("gripper_aux_weight", 0.0))
     use_state_pred = pred_weight > 0
     use_gripper_aux = gripper_aux_weight > 0
+    visual_cfg = cfg.get("visual_tokens", {}) or {}
+    patch_sp = bool(visual_cfg.get("patch_sp", False))
+    patch_sp_weight = float(visual_cfg.get("patch_sp_weight", 1.0))
 
     # Pre-initialize future-frame latents so the SIGReg block can reference
     # them unconditionally without static-analysis warnings, and so the
@@ -149,10 +152,44 @@ def lejepa_forward(self, batch, stage, cfg):
         z_agent_future, z_hand_future = self.model.encode_future_visual(
             pixels_agent_future,
             pixels_hand_future,
+            return_all_tokens=patch_sp,
         )
 
-        loss_pred_ag = F.mse_loss(pred_ag, z_agent_future)
-        loss_pred_hd = F.mse_loss(pred_hd, z_hand_future)
+        if patch_sp:
+            if pred_ag.dim() != 3 or z_agent_future.dim() != 3:
+                raise RuntimeError(
+                    "visual_tokens.patch_sp=True requires pred_ag/z_agent_future "
+                    f"to be (B,N,D), got {tuple(pred_ag.shape)} and "
+                    f"{tuple(z_agent_future.shape)}"
+                )
+            loss_pred_ag_cls = F.mse_loss(pred_ag[:, 0], z_agent_future[:, 0])
+            loss_pred_hd_cls = F.mse_loss(pred_hd[:, 0], z_hand_future[:, 0])
+            if pred_ag.size(1) > 1:
+                loss_pred_ag_patch = F.mse_loss(
+                    pred_ag[:, 1:],
+                    z_agent_future[:, 1:],
+                )
+                loss_pred_hd_patch = F.mse_loss(
+                    pred_hd[:, 1:],
+                    z_hand_future[:, 1:],
+                )
+            else:
+                loss_pred_ag_patch = pred_ag.new_zeros(())
+                loss_pred_hd_patch = pred_hd.new_zeros(())
+            denom = 1.0 + patch_sp_weight
+            loss_pred_ag = (
+                loss_pred_ag_cls + patch_sp_weight * loss_pred_ag_patch
+            ) / denom
+            loss_pred_hd = (
+                loss_pred_hd_cls + patch_sp_weight * loss_pred_hd_patch
+            ) / denom
+            output["pred_loss_ag_cls"] = loss_pred_ag_cls
+            output["pred_loss_hd_cls"] = loss_pred_hd_cls
+            output["pred_loss_ag_patch"] = loss_pred_ag_patch
+            output["pred_loss_hd_patch"] = loss_pred_hd_patch
+        else:
+            loss_pred_ag = F.mse_loss(pred_ag, z_agent_future)
+            loss_pred_hd = F.mse_loss(pred_hd, z_hand_future)
         loss_pred_pr = F.mse_loss(pred_pr, proprio_future)
 
         output["pred_loss"] = loss_pred_ag + loss_pred_hd + loss_pred_pr
@@ -166,10 +203,10 @@ def lejepa_forward(self, batch, stage, cfg):
     # The 4-stream stack maps to LeWM's `emb` over 2 timesteps × 2 views.
     # Predictor outputs (pred_ag/pred_hd) are intentionally NOT included
     # — see paper Algorithm 1 + upstream `train.py::lejepa_forward`.
-    # `encode()` returns (B, N, D); for SIGReg we use the CLS slice only
-    # (see encode_future_visual docstring — SP heads + SIGReg both operate
-    # on a single per-view embedding, multi-token prefix is a predictor
-    # concern). encode_future_visual already returns (B, D).
+    # `encode()` returns (B, N, D); for SIGReg we use the CLS slice only.
+    # SIGReg remains CLS-only even when patch-level SP is enabled; patch
+    # tokens get direct supervision through the SP MSE above, while SIGReg
+    # preserves the original LeWM 4-stream embedding regularizer.
     if sigreg_weight > 0:
         z_ag_cls = z_agent[:, 0] if z_agent.dim() == 3 else z_agent
         z_hd_cls = z_hand[:, 0] if z_hand.dim() == 3 else z_hand
@@ -178,8 +215,14 @@ def lejepa_forward(self, batch, stage, cfg):
             # SIGReg degenerates to 2 streams (current views only).
             sigreg_input = torch.stack([z_ag_cls, z_hd_cls], dim=0)
         else:
+            z_ag_future_cls = (
+                z_agent_future[:, 0] if z_agent_future.dim() == 3 else z_agent_future
+            )
+            z_hd_future_cls = (
+                z_hand_future[:, 0] if z_hand_future.dim() == 3 else z_hand_future
+            )
             sigreg_input = torch.stack(
-                [z_ag_cls, z_hd_cls, z_agent_future, z_hand_future],
+                [z_ag_cls, z_hd_cls, z_ag_future_cls, z_hd_future_cls],
                 dim=0,
             )
         output["sigreg_loss"] = self.sigreg(sigreg_input)
@@ -216,6 +259,15 @@ def lejepa_forward(self, batch, stage, cfg):
         log_dict[f"{stage}/pred_loss_ag"] = output["pred_loss_ag"].detach()
         log_dict[f"{stage}/pred_loss_hd"] = output["pred_loss_hd"].detach()
         log_dict[f"{stage}/pred_loss_pr"] = output["pred_loss_pr"].detach()
+    if "pred_loss_ag_patch" in output:
+        log_dict[f"{stage}/pred_loss_ag_cls"] = output["pred_loss_ag_cls"].detach()
+        log_dict[f"{stage}/pred_loss_hd_cls"] = output["pred_loss_hd_cls"].detach()
+        log_dict[f"{stage}/pred_loss_ag_patch"] = output[
+            "pred_loss_ag_patch"
+        ].detach()
+        log_dict[f"{stage}/pred_loss_hd_patch"] = output[
+            "pred_loss_hd_patch"
+        ].detach()
     if "sigreg_loss" in output:
         log_dict[f"{stage}/sigreg_loss"] = output["sigreg_loss"].detach()
     if "gripper_aux_loss" in output:
@@ -304,13 +356,22 @@ def run(cfg):
     patch_projector_norm_type = str(
         visual_cfg.get("patch_projector_norm_type", "layer")
     ).lower()
+    patch_sp = bool(visual_cfg.get("patch_sp", False))
+    patch_sp_weight = float(visual_cfg.get("patch_sp_weight", 1.0))
+    if patch_sp and not use_state_prediction:
+        raise ValueError("visual_tokens.patch_sp=True requires loss.pred_weight > 0")
+    if patch_sp_weight < 0:
+        raise ValueError(
+            f"visual_tokens.patch_sp_weight must be >= 0, got {patch_sp_weight}"
+        )
     n_visual_per_view = (
         1 + visual_pool_grid * visual_pool_grid if visual_pool_grid > 0 else 1
     )
     print(
         f"[visual_tokens] pool_grid={visual_pool_grid}, "
         f"n_visual_per_view={n_visual_per_view}, "
-        f"patch_projector_norm_type={patch_projector_norm_type}"
+        f"patch_projector_norm_type={patch_projector_norm_type}, "
+        f"patch_sp={patch_sp}, patch_sp_weight={patch_sp_weight}"
     )
 
     # Multi-GPU + plain BatchNorm = silent divergence. nn.BatchNorm1d computes
@@ -462,6 +523,7 @@ def run(cfg):
         # Multi-token visual prefix. 0 = CLS-only legacy layout, matches
         # spatial-65% / sp_sigreg-67.8% checkpoints exactly.
         visual_pool_grid=visual_pool_grid,
+        state_pred_visual_tokens=patch_sp,
         use_gripper_aux=use_gripper_aux,
         gripper_chunk_size=gripper_chunk_size,
         **cfg.predictor,

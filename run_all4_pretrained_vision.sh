@@ -11,6 +11,7 @@ case "$ARM" in
     NORM=layer
     STATE_ARCH_DEFAULT=shared
     POOL_GRID_DEFAULT=0
+    PATCH_SP_DEFAULT=false
     ;;
   all4_sp_sigreg_dinov2_frozen)
     PRED=1.0
@@ -18,6 +19,7 @@ case "$ARM" in
     NORM=batch
     STATE_ARCH_DEFAULT=shared
     POOL_GRID_DEFAULT=0
+    PATCH_SP_DEFAULT=false
     ;;
   all4_sp_sigreg_dinov2_frozen_visual17)
     PRED=1.0
@@ -25,6 +27,7 @@ case "$ARM" in
     NORM=batch
     STATE_ARCH_DEFAULT=shared
     POOL_GRID_DEFAULT=4
+    PATCH_SP_DEFAULT=false
     ;;
   all4_sp_sigreg_dinov2_frozen_visual17_sep_proj)
     PRED=1.0
@@ -32,6 +35,15 @@ case "$ARM" in
     NORM=batch
     STATE_ARCH_DEFAULT=shared
     POOL_GRID_DEFAULT=4
+    PATCH_SP_DEFAULT=false
+    ;;
+  all4_sp_sigreg_dinov2_frozen_visual17_patch_sp)
+    PRED=1.0
+    SIGREG=0.1
+    NORM=batch
+    STATE_ARCH_DEFAULT=shared
+    POOL_GRID_DEFAULT=4
+    PATCH_SP_DEFAULT=true
     ;;
   all4_sp_sigreg_dinov2_frozen_mot)
     PRED=1.0
@@ -39,10 +51,11 @@ case "$ARM" in
     NORM=batch
     STATE_ARCH_DEFAULT=mot
     POOL_GRID_DEFAULT=0
+    PATCH_SP_DEFAULT=false
     ;;
   *)
     echo "Unknown ARM: $ARM" >&2
-    echo "Expected all4_dinov2_frozen|all4_sp_sigreg_dinov2_frozen|all4_sp_sigreg_dinov2_frozen_visual17|all4_sp_sigreg_dinov2_frozen_visual17_sep_proj|all4_sp_sigreg_dinov2_frozen_mot" >&2
+    echo "Expected all4_dinov2_frozen|all4_sp_sigreg_dinov2_frozen|all4_sp_sigreg_dinov2_frozen_visual17|all4_sp_sigreg_dinov2_frozen_visual17_sep_proj|all4_sp_sigreg_dinov2_frozen_visual17_patch_sp|all4_sp_sigreg_dinov2_frozen_mot" >&2
     exit 1
     ;;
 esac
@@ -54,6 +67,8 @@ WARMUP_STEPS="${WARMUP_STEPS:-2000}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 STATE_ARCH="${STATE_ARCH:-$STATE_ARCH_DEFAULT}"
 POOL_GRID="${POOL_GRID:-$POOL_GRID_DEFAULT}"
+PATCH_SP="${PATCH_SP:-$PATCH_SP_DEFAULT}"
+PATCH_SP_WEIGHT="${PATCH_SP_WEIGHT:-1.0}"
 
 FLAT_DIR="${FLAT_DIR:-/Data/lyw/libero_processed_v5/all4_flat}"
 TOKENIZER="${TOKENIZER:-/Data/lyw/fast_tokenizer_all4}"
@@ -73,7 +88,7 @@ conda activate vla
 echo "=========================================================="
 echo "[all4_pretrained_vision] ARM=$ARM STATE_ARCH=$STATE_ARCH SEED=$SEED MAX_STEPS=$MAX_STEPS"
 echo "[all4_pretrained_vision] PRED=$PRED SIGREG=$SIGREG NORM=$NORM"
-echo "[all4_pretrained_vision] POOL_GRID=$POOL_GRID"
+echo "[all4_pretrained_vision] POOL_GRID=$POOL_GRID PATCH_SP=$PATCH_SP PATCH_SP_WEIGHT=$PATCH_SP_WEIGHT"
 echo "[all4_pretrained_vision] FLAT_DIR=$FLAT_DIR"
 echo "[all4_pretrained_vision] TOKENIZER=$TOKENIZER"
 echo "[all4_pretrained_vision] PROCESSED_ROOT=$PROCESSED_ROOT"
@@ -120,6 +135,8 @@ python train.py \
     subdir="" \
     output_model_name=lewm \
     +visual_tokens.pool_grid="$POOL_GRID" \
+    +visual_tokens.patch_sp="$PATCH_SP" \
+    +visual_tokens.patch_sp_weight="$PATCH_SP_WEIGHT" \
     2>&1 | tee "$TRAIN_LOG"
 
 PICK_OUT=$(python pick_best_ckpt.py --ckpt-dir "$CKPT_DIR" --top-k 3)

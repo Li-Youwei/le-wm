@@ -9,6 +9,7 @@ import torch
 from torch import nn
 
 from jepa import JEPA
+from module import ACTION_HEAD_SIZE, ARPredictor
 
 
 class FakeEncoder(nn.Module):
@@ -69,6 +70,58 @@ class VisualTokenProjectionTest(unittest.TestCase):
         self.assertEqual(tuple(future_hand.shape), (2, 4))
         self.assertEqual(cls_projector.calls, [(4, 4), (4, 4)])
         self.assertEqual(patch_projector.calls, [(16, 4)])
+
+        future_agent_tokens, future_hand_tokens = model.encode_future_visual(
+            pixels_agent,
+            pixels_hand,
+            return_all_tokens=True,
+        )
+        self.assertEqual(tuple(future_agent_tokens.shape), (2, 5, 4))
+        self.assertEqual(tuple(future_hand_tokens.shape), (2, 5, 4))
+        self.assertEqual(cls_projector.calls, [(4, 4), (4, 4), (4, 4)])
+        self.assertEqual(patch_projector.calls, [(16, 4), (16, 4)])
+
+    def test_patch_level_state_prediction_outputs_visual_token_set(self) -> None:
+        torch.manual_seed(0)
+        B, D, N = 2, 16, 5
+        predictor = ARPredictor(
+            embed_dim=D,
+            depth=1,
+            heads=2,
+            dim_head=8,
+            mlp_dim=32,
+            max_action_tokens=6,
+            max_lang_tokens=4,
+            proprio_dim=9,
+            dropout=0.0,
+            emb_dropout=0.0,
+            use_state_prediction=True,
+            visual_pool_grid=2,
+            state_pred_visual_tokens=True,
+        )
+
+        z_agent = torch.randn(B, N, D)
+        z_hand = torch.randn(B, N, D)
+        proprio = torch.randn(B, 9)
+        lang = torch.randn(B, 4, D)
+        lang_lengths = torch.tensor([4, 2])
+        actions = torch.randint(0, 100, (B, 6))
+        action_lengths = torch.tensor([4, 5])
+
+        logits, pred_ag, pred_hd, pred_pr = predictor(
+            z_agent,
+            z_hand,
+            proprio,
+            lang,
+            lang_lengths,
+            actions,
+            action_lengths,
+        )
+
+        self.assertEqual(tuple(logits.shape), (B, 7, ACTION_HEAD_SIZE))
+        self.assertEqual(tuple(pred_ag.shape), (B, N, D))
+        self.assertEqual(tuple(pred_hd.shape), (B, N, D))
+        self.assertEqual(tuple(pred_pr.shape), (B, 9))
 
 
 if __name__ == "__main__":

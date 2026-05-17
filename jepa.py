@@ -150,7 +150,13 @@ class JEPA(nn.Module):
             action_lengths,
         )
 
-    def encode_future_visual(self, pixels_agent_future, pixels_hand_future):
+    def encode_future_visual(
+        self,
+        pixels_agent_future,
+        pixels_hand_future,
+        *,
+        return_all_tokens: bool = False,
+    ):
         """Encode future-frame visual inputs through the SHARED ViT + projector.
 
         Used by the state-prediction branch (``use_state_prediction=True``).
@@ -169,20 +175,29 @@ class JEPA(nn.Module):
             pixels_agent_future: (B, 3, H, W) agentview image at raw step t+H.
             pixels_hand_future: (B, 3, H, W) hand-cam image at raw step t+H.
 
-        Returns:
-            z_agent_future: (B, D) future agentview CLS latent.
-            z_hand_future: (B, D) future hand-cam CLS latent.
+        Args:
+            return_all_tokens: when True, return the same CLS+pooled-patch
+                layout as ``encode()`` for patch-level state prediction.
 
-        Note: even when visual_pool_grid>0 (multi-token prefix), the future
-        target stays CLS-only because the SP heads are MLP(D→D) and SIGReg
-        operates on a single per-view embedding. Per-patch SP would require
-        head + loss redesign — left for a follow-up.
+        Returns:
+            When ``return_all_tokens`` is False:
+                z_agent_future: (B, D) future agentview CLS latent.
+                z_hand_future: (B, D) future hand-cam CLS latent.
+            When True:
+                z_agent_future: (B, N, D) future agentview tokens.
+                z_hand_future: (B, N, D) future hand-cam tokens.
         """
         visual_cat = torch.cat(
             [pixels_agent_future, pixels_hand_future],
             dim=0,
         )  # (2B, C, H, W)
         visual_out = self._encode_visual_cat(visual_cat)
+        if return_all_tokens:
+            tokens_2b = self._pool_visual_tokens(visual_out.last_hidden_state)
+            visual_z = self._project_visual_tokens(tokens_2b)  # (2B, N, D)
+            z_agent_future, z_hand_future = visual_z.chunk(2, dim=0)
+            return z_agent_future, z_hand_future
+
         # CLS-only path for SP / SIGReg: take last_hidden_state[:, 0] before
         # the projector to skip the pooling-and-reshape codepath entirely.
         visual_z = self.projector(visual_out.last_hidden_state[:, 0])  # (2B, D)
