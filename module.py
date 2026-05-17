@@ -455,16 +455,25 @@ class ARPredictor(nn.Module):
             self.state_query_embeddings = nn.Parameter(torch.randn(3, embed_dim))
             # Per-stream projector: matches the encoder-side projector
             # signature (LeWM paper Sec. 3 + upstream pattern).
+            # NB (Bug #2 fix): for multi-token visual prefix (nv > 1), the
+            # visual SP heads predict ALL nv target tokens in one shot, with
+            # output dim = embed_dim * nv. forward() reshapes to (B, nv, D)
+            # before the MSE. This routes SP gradient to every source visual
+            # patch (Q_ag attends to all source patches, and must encode
+            # spatial info about all nv targets — so patches that carry
+            # useful spatial info get direct gradient flow).
+            # For nv = 1 (CLS-only legacy) the output dim collapses to D
+            # and behavior matches the original frozen baseline bit-by-bit.
             self.state_pred_head_ag = MLP(
                 embed_dim,
                 2048,
-                embed_dim,
+                embed_dim * nv,
                 norm_fn=head_norm_fn,
             )
             self.state_pred_head_hd = MLP(
                 embed_dim,
                 2048,
-                embed_dim,
+                embed_dim * nv,
                 norm_fn=head_norm_fn,
             )
             self.state_pred_head_pr = MLP(
@@ -840,14 +849,20 @@ class ARPredictor(nn.Module):
             return action_logits
 
         # 9. Read out the three STATE_QUERY positions and run them through
-        #    their respective heads. Q_ag/Q_hd predict latent (D,), Q_pr
-        #    predicts the raw 9d proprio vector at t+H (NOT an embedding —
-        #    the target is the un-encoded proprio so the loss is in physical
-        #    units).
+        #    their respective heads. Q_ag/Q_hd predict per-token visual
+        #    latents at t+H, shape (B, nv, D) — collapses to (B, 1, D) ≡
+        #    (B, D) for legacy CLS-only mode. Q_pr predicts the raw 9d
+        #    proprio vector at t+H (NOT an embedding — the target is the
+        #    un-encoded proprio so the loss is in physical units).
         query_start = n_prefix + 1 + self.max_action_tokens
         q_out = x[:, query_start : query_start + 3]  # (B, 3, D)
-        pred_ag = self.state_pred_head_ag(q_out[:, 0])  # (B, D)
-        pred_hd = self.state_pred_head_hd(q_out[:, 1])  # (B, D)
+        nv = self.n_visual_per_view
+        pred_ag = self.state_pred_head_ag(q_out[:, 0]).reshape(
+            B, nv, self.embed_dim
+        )  # (B, nv, D)
+        pred_hd = self.state_pred_head_hd(q_out[:, 1]).reshape(
+            B, nv, self.embed_dim
+        )  # (B, nv, D)
         pred_pr = self.state_pred_head_pr(q_out[:, 2])  # (B, proprio_dim)
 
         if self.use_gripper_aux:

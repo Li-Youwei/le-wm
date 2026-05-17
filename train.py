@@ -145,22 +145,26 @@ def lejepa_forward(self, batch, stage, cfg):
         # in step 2) and the target path (here) get gradients — that's
         # the LeWM "no heuristics" recipe; SIGReg is the only thing
         # holding off collapse.
-        # NB: after Bug #1 fix, encode_future_visual returns (B, N, D)
-        # symmetric with encode(); take CLS slice for the SP MSE target
-        # (SP head still predicts a single per-view embedding).
+        # Post Bug #1 + Bug #2: encode_future_visual returns (B, N, D)
+        # symmetric with encode(); SP heads also produce (B, N, D), so
+        # MSE matches token-by-token and every source visual patch
+        # receives direct SP gradient via Q_ag/Q_hd attention. SIGReg
+        # below still constrains the CLS slice only (per-view single
+        # embedding anti-collapse).
         z_agent_future, z_hand_future = self.model.encode_future_visual(
             pixels_agent_future,
             pixels_hand_future,
         )
-        z_ag_future_cls = (
-            z_agent_future[:, 0] if z_agent_future.dim() == 3 else z_agent_future
-        )
-        z_hd_future_cls = (
-            z_hand_future[:, 0] if z_hand_future.dim() == 3 else z_hand_future
-        )
+        # Normalize shape: ensure (B, N, D) for both sides of the MSE.
+        if z_agent_future.dim() == 2:
+            z_agent_future = z_agent_future.unsqueeze(1)
+        if z_hand_future.dim() == 2:
+            z_hand_future = z_hand_future.unsqueeze(1)
+        z_ag_future_cls = z_agent_future[:, 0]  # for SIGReg below
+        z_hd_future_cls = z_hand_future[:, 0]
 
-        loss_pred_ag = F.mse_loss(pred_ag, z_ag_future_cls)
-        loss_pred_hd = F.mse_loss(pred_hd, z_hd_future_cls)
+        loss_pred_ag = F.mse_loss(pred_ag, z_agent_future)
+        loss_pred_hd = F.mse_loss(pred_hd, z_hand_future)
         loss_pred_pr = F.mse_loss(pred_pr, proprio_future)
 
         output["pred_loss"] = loss_pred_ag + loss_pred_hd + loss_pred_pr
