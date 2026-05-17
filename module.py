@@ -438,6 +438,11 @@ class ARPredictor(nn.Module):
             self.n_visual_per_view = max(1, int(n_visual_tokens_per_view))
         self.visual_pool_grid = int(visual_pool_grid)
         nv = self.n_visual_per_view
+        if nv > 1 and self.visual_pool_grid <= 0:
+            raise ValueError(
+                "n_visual_tokens_per_view > 1 requires visual_pool_grid > 0 "
+                "so view/2D patch positional embeddings have a defined grid."
+            )
 
         # max_seq_len = lang + 2*nv (visual prefix) + 1 (proprio) + 1 (BOS) + actions
         # (+ Q_ag + Q_hd + Q_pr when use_state_prediction is True).
@@ -875,6 +880,17 @@ class ARPredictor(nn.Module):
         if z_hand.dim() == 2:
             z_hand = z_hand.unsqueeze(1)  # (B, 1, D)
         nv = z_agent.size(1)
+        if (
+            z_hand.size(0) != B
+            or z_hand.size(1) != nv
+            or z_agent.size(-1) != self.embed_dim
+            or z_hand.size(-1) != self.embed_dim
+        ):
+            raise ValueError(
+                "ARPredictor.forward expected matching visual tensors with shape "
+                f"(B,N,{self.embed_dim}), got z_agent={tuple(z_agent.shape)} and "
+                f"z_hand={tuple(z_hand.shape)}."
+            )
         if nv != self.n_visual_per_view:
             raise ValueError(
                 f"ARPredictor.forward got z_agent with N_visual={nv}, but the "
@@ -1039,6 +1055,17 @@ class ARPredictor(nn.Module):
         if z_hand.dim() == 2:
             z_hand = z_hand.unsqueeze(1)
         nv = z_agent.size(1)
+        if (
+            z_hand.size(0) != B
+            or z_hand.size(1) != nv
+            or z_agent.size(-1) != self.embed_dim
+            or z_hand.size(-1) != self.embed_dim
+        ):
+            raise ValueError(
+                "ARPredictor.generate expected matching visual tensors with shape "
+                f"(B,N,{self.embed_dim}), got z_agent={tuple(z_agent.shape)} and "
+                f"z_hand={tuple(z_hand.shape)}."
+            )
         if nv != self.n_visual_per_view:
             raise ValueError(
                 f"ARPredictor.generate got z_agent with N_visual={nv}, but the "
@@ -1189,6 +1216,17 @@ class ARPredictor(nn.Module):
         if z_hand.dim() == 2:
             z_hand = z_hand.unsqueeze(1)
         nv = z_agent.size(1)
+        if (
+            z_hand.size(0) != B
+            or z_hand.size(1) != nv
+            or z_agent.size(-1) != self.embed_dim
+            or z_hand.size(-1) != self.embed_dim
+        ):
+            raise ValueError(
+                "ARPredictor.predict_gripper_aux expected matching visual tensors "
+                f"with shape (B,N,{self.embed_dim}), got "
+                f"z_agent={tuple(z_agent.shape)} and z_hand={tuple(z_hand.shape)}."
+            )
         if nv != self.n_visual_per_view:
             raise ValueError(
                 f"ARPredictor.predict_gripper_aux got z_agent with N_visual="

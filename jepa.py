@@ -174,8 +174,6 @@ class JEPA(nn.Module):
         Args:
             pixels_agent_future: (B, 3, H, W) agentview image at raw step t+H.
             pixels_hand_future: (B, 3, H, W) hand-cam image at raw step t+H.
-
-        Args:
             return_all_tokens: when True, return the same CLS+pooled-patch
                 layout as ``encode()`` for patch-level state prediction.
 

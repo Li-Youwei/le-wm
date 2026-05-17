@@ -17,6 +17,19 @@ from utils import ModelObjectCallBack, PeriodicPrintCallback
 from vision_backbone import build_visual_encoder
 
 
+def _cfg_bool(value, *, name: str) -> bool:
+    """Parse Hydra/OmegaConf bools without treating 'false' as truthy."""
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, str):
+        normalized = value.strip().lower()
+        if normalized in {"true", "1", "yes", "y", "on"}:
+            return True
+        if normalized in {"false", "0", "no", "n", "off"}:
+            return False
+    raise ValueError(f"{name} must be a boolean, got {value!r}")
+
+
 def lejepa_forward(self, batch, stage, cfg):
     """VLA training step.
 
@@ -42,7 +55,7 @@ def lejepa_forward(self, batch, stage, cfg):
     use_state_pred = pred_weight > 0
     use_gripper_aux = gripper_aux_weight > 0
     visual_cfg = cfg.get("visual_tokens", {}) or {}
-    patch_sp = bool(visual_cfg.get("patch_sp", False))
+    patch_sp = _cfg_bool(visual_cfg.get("patch_sp", False), name="visual_tokens.patch_sp")
     patch_sp_weight = float(visual_cfg.get("patch_sp_weight", 1.0))
 
     # Pre-initialize future-frame latents so the SIGReg block can reference
@@ -156,11 +169,27 @@ def lejepa_forward(self, batch, stage, cfg):
         )
 
         if patch_sp:
-            if pred_ag.dim() != 3 or z_agent_future.dim() != 3:
+            if (
+                pred_ag.dim() != 3
+                or pred_hd.dim() != 3
+                or z_agent_future.dim() != 3
+                or z_hand_future.dim() != 3
+            ):
                 raise RuntimeError(
-                    "visual_tokens.patch_sp=True requires pred_ag/z_agent_future "
-                    f"to be (B,N,D), got {tuple(pred_ag.shape)} and "
-                    f"{tuple(z_agent_future.shape)}"
+                    "visual_tokens.patch_sp=True requires pred_ag/pred_hd and "
+                    "future visual targets to be (B,N,D), got "
+                    f"pred_ag={tuple(pred_ag.shape)}, "
+                    f"pred_hd={tuple(pred_hd.shape)}, "
+                    f"z_agent_future={tuple(z_agent_future.shape)}, "
+                    f"z_hand_future={tuple(z_hand_future.shape)}"
+                )
+            if pred_ag.shape != z_agent_future.shape or pred_hd.shape != z_hand_future.shape:
+                raise RuntimeError(
+                    "Patch-level SP prediction/target shapes must match exactly, got "
+                    f"pred_ag={tuple(pred_ag.shape)} vs "
+                    f"z_agent_future={tuple(z_agent_future.shape)}, "
+                    f"pred_hd={tuple(pred_hd.shape)} vs "
+                    f"z_hand_future={tuple(z_hand_future.shape)}"
                 )
             loss_pred_ag_cls = F.mse_loss(pred_ag[:, 0], z_agent_future[:, 0])
             loss_pred_hd_cls = F.mse_loss(pred_hd[:, 0], z_hand_future[:, 0])
@@ -176,12 +205,13 @@ def lejepa_forward(self, batch, stage, cfg):
             else:
                 loss_pred_ag_patch = pred_ag.new_zeros(())
                 loss_pred_hd_patch = pred_hd.new_zeros(())
-            denom = 1.0 + patch_sp_weight
+            active_patch_weight = patch_sp_weight if pred_ag.size(1) > 1 else 0.0
+            denom = 1.0 + active_patch_weight
             loss_pred_ag = (
-                loss_pred_ag_cls + patch_sp_weight * loss_pred_ag_patch
+                loss_pred_ag_cls + active_patch_weight * loss_pred_ag_patch
             ) / denom
             loss_pred_hd = (
-                loss_pred_hd_cls + patch_sp_weight * loss_pred_hd_patch
+                loss_pred_hd_cls + active_patch_weight * loss_pred_hd_patch
             ) / denom
             output["pred_loss_ag_cls"] = loss_pred_ag_cls
             output["pred_loss_hd_cls"] = loss_pred_hd_cls
@@ -347,19 +377,23 @@ def run(cfg):
 
     # Multi-token visual prefix (CLS + grid-pooled patches). Off by default
     # (visual_pool_grid=0 → CLS only, same as legacy single-token prefix).
-    # When > 0, the encoder output is fed as (B, 1 + G*G, D) per view through
-    # the projector. JEPA.encode now reshapes (B, N, D) → (B*N, D) before the
-    # projector so BatchNorm1d sees a flat (Batch, Channels) input — the
-    # combo multi-token + BN is therefore unblocked.
+    # When > 0, JEPA.encode returns (B, 1 + G*G, D) per view. CLS and
+    # patches use separate projectors so the BatchNorm CLS path used by
+    # SIGReg is not mixed with patch-token statistics.
     visual_cfg = cfg.get("visual_tokens", {}) or {}
     visual_pool_grid = int(visual_cfg.get("pool_grid", 0))
     patch_projector_norm_type = str(
         visual_cfg.get("patch_projector_norm_type", "layer")
     ).lower()
-    patch_sp = bool(visual_cfg.get("patch_sp", False))
+    patch_sp = _cfg_bool(visual_cfg.get("patch_sp", False), name="visual_tokens.patch_sp")
     patch_sp_weight = float(visual_cfg.get("patch_sp_weight", 1.0))
     if patch_sp and not use_state_prediction:
         raise ValueError("visual_tokens.patch_sp=True requires loss.pred_weight > 0")
+    if patch_sp and visual_pool_grid <= 0:
+        raise ValueError(
+            "visual_tokens.patch_sp=True requires visual_tokens.pool_grid > 0 "
+            "so patch targets actually exist."
+        )
     if patch_sp_weight < 0:
         raise ValueError(
             f"visual_tokens.patch_sp_weight must be >= 0, got {patch_sp_weight}"

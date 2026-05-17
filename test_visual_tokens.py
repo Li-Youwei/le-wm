@@ -123,6 +123,56 @@ class VisualTokenProjectionTest(unittest.TestCase):
         self.assertEqual(tuple(pred_hd.shape), (B, N, D))
         self.assertEqual(tuple(pred_pr.shape), (B, 9))
 
+    def test_multi_visual_token_predictor_requires_grid_layout(self) -> None:
+        with self.assertRaisesRegex(ValueError, "visual_pool_grid > 0"):
+            ARPredictor(
+                embed_dim=16,
+                depth=1,
+                heads=2,
+                dim_head=8,
+                mlp_dim=32,
+                max_action_tokens=6,
+                max_lang_tokens=4,
+                proprio_dim=9,
+                n_visual_tokens_per_view=5,
+                visual_pool_grid=0,
+            )
+
+    def test_visual_pair_shape_mismatch_fails_fast(self) -> None:
+        predictor = ARPredictor(
+            embed_dim=16,
+            depth=1,
+            heads=2,
+            dim_head=8,
+            mlp_dim=32,
+            max_action_tokens=6,
+            max_lang_tokens=4,
+            proprio_dim=9,
+            dropout=0.0,
+            emb_dropout=0.0,
+            visual_pool_grid=2,
+        )
+
+        B, D = 2, 16
+        z_agent = torch.randn(B, 5, D)
+        z_hand = torch.randn(B, 4, D)
+        proprio = torch.randn(B, 9)
+        lang = torch.randn(B, 4, D)
+        lang_lengths = torch.tensor([4, 2])
+        actions = torch.randint(0, 100, (B, 6))
+        action_lengths = torch.tensor([4, 5])
+
+        with self.assertRaisesRegex(ValueError, "matching visual tensors"):
+            predictor(
+                z_agent,
+                z_hand,
+                proprio,
+                lang,
+                lang_lengths,
+                actions,
+                action_lengths,
+            )
+
 
 if __name__ == "__main__":
     unittest.main()
