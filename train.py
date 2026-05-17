@@ -301,12 +301,16 @@ def run(cfg):
     # combo multi-token + BN is therefore unblocked.
     visual_cfg = cfg.get("visual_tokens", {}) or {}
     visual_pool_grid = int(visual_cfg.get("pool_grid", 0))
+    patch_projector_norm_type = str(
+        visual_cfg.get("patch_projector_norm_type", "layer")
+    ).lower()
     n_visual_per_view = (
         1 + visual_pool_grid * visual_pool_grid if visual_pool_grid > 0 else 1
     )
     print(
         f"[visual_tokens] pool_grid={visual_pool_grid}, "
-        f"n_visual_per_view={n_visual_per_view}"
+        f"n_visual_per_view={n_visual_per_view}, "
+        f"patch_projector_norm_type={patch_projector_norm_type}"
     )
 
     # Multi-GPU + plain BatchNorm = silent divergence. nn.BatchNorm1d computes
@@ -470,6 +474,29 @@ def run(cfg):
         hidden_dim=2048,
         norm_fn=norm_fn,
     )
+    patch_projector = None
+    if visual_pool_grid > 0:
+        if patch_projector_norm_type == "layer":
+            patch_norm_fn = torch.nn.LayerNorm
+        elif patch_projector_norm_type == "batch":
+            patch_norm_fn = torch.nn.BatchNorm1d
+        elif patch_projector_norm_type in ("none", "identity"):
+            patch_norm_fn = None
+        else:
+            raise ValueError(
+                "visual_tokens.patch_projector_norm_type must be one of "
+                f"'layer', 'batch', or 'none', got {patch_projector_norm_type!r}"
+            )
+        patch_projector = MLP(
+            input_dim=hidden_dim,
+            output_dim=embed_dim,
+            hidden_dim=2048,
+            norm_fn=patch_norm_fn,
+        )
+        print(
+            "[visual_tokens] using separate patch_projector; CLS projector "
+            f"norm={projector_norm}, patch projector norm={patch_projector_norm_type}"
+        )
 
     if use_language:
         # T5-small encoder (frozen)
@@ -491,6 +518,7 @@ def run(cfg):
         encoder=encoder,
         predictor=predictor,
         projector=projector,
+        patch_projector=patch_projector,
         lang_encoder=lang_encoder,
         lang_proj=lang_proj,
         visual_pool_grid=visual_pool_grid,

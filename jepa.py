@@ -10,6 +10,7 @@ class JEPA(nn.Module):
         encoder,
         predictor,
         projector=None,
+        patch_projector=None,
         lang_encoder=None,
         lang_proj=None,
         visual_pool_grid: int = 0,
@@ -20,6 +21,10 @@ class JEPA(nn.Module):
         self.encoder = encoder  # Shared ViT encoder (both views)
         self.predictor = predictor  # ARPredictor instance
         self.projector = projector or nn.Identity()
+        # Optional projector for visual patch tokens. CLS stays on
+        # self.projector because SP/SIGReg targets also use that path; keeping
+        # patches separate avoids mixing patch-token statistics into CLS BatchNorm.
+        self.patch_projector = patch_projector
         self.lang_encoder = lang_encoder  # T5EncoderModel, frozen
         self.lang_proj = lang_proj  # nn.Linear(T5_hidden, embed_dim)
         # visual_pool_grid > 0 enables CLS + G*G adaptive-avg-pooled patch
@@ -61,9 +66,7 @@ class JEPA(nn.Module):
         Performance note: the two views are concatenated along the batch
         dimension and run through the SHARED ViT in **one** forward pass
         instead of two sequential calls. This roughly halves the visual
-        wall-clock time (one CUDA kernel launch + better GPU utilization)
-        and gives a BatchNorm projector 2× the samples per call to estimate
-        running statistics.
+        wall-clock time (one CUDA kernel launch + better GPU utilization).
 
         Args:
             pixels_agent: (B, C, H, W) agentview image.
@@ -83,16 +86,14 @@ class JEPA(nn.Module):
         # Visual: cat both views, single ViT pass, then split.
         visual_cat = torch.cat([pixels_agent, pixels_hand], dim=0)  # (2B, C, H, W)
         visual_out = self._encode_visual_cat(visual_cat)
-        # tokens_2b: (2B, N, D) with CLS at index 0 and (optionally) pooled patches
-        # at indices 1..N-1. The projector wants a 2D (batch, channel) input —
-        # BatchNorm1d(2048) interprets a 3D (2B, N, 2048) as (N_batch, C=N, L)
-        # and breaks when N != 2048. LayerNorm works on any (..., D) shape
-        # but flattening costs nothing; reshape unconditionally to keep both
-        # paths identical. (B*N, D) → projector → (B, N, D').
+        # tokens_2b: (2B, N, D) with CLS at index 0 and (optionally) pooled
+        # patches at indices 1..N-1. CLS and patches are projected separately:
+        # CLS uses self.projector, matching encode_future_visual() and SIGReg;
+        # patches use self.patch_projector when provided. This prevents the
+        # BatchNorm projector used by SIGReg from seeing a mixed CLS/patch
+        # distribution.
         tokens_2b = self._pool_visual_tokens(visual_out.last_hidden_state)
-        B_total, N_per, D_in = tokens_2b.shape
-        visual_z_flat = self.projector(tokens_2b.reshape(B_total * N_per, D_in))
-        visual_z = visual_z_flat.reshape(B_total, N_per, -1)  # (2B, N, D)
+        visual_z = self._project_visual_tokens(tokens_2b)  # (2B, N, D)
         z_agent, z_hand = visual_z.chunk(2, dim=0)  # (B, N, D), (B, N, D)
 
         # Language: only when encoder is present AND tokens are provided
@@ -223,6 +224,31 @@ class JEPA(nn.Module):
         pooled = torch.nn.functional.adaptive_avg_pool2d(feat, (G, G))  # (B, D, G, G)
         pooled = pooled.reshape(B, D, G * G).transpose(1, 2)  # (B, G*G, D)
         return torch.cat([cls, pooled], dim=1)  # (B, 1+G*G, D)
+
+    def _project_visual_tokens(self, tokens: torch.Tensor) -> torch.Tensor:
+        """Project CLS and optional patch tokens without mixing norm stats.
+
+        Args:
+            tokens: (B, N, D_in), CLS first.
+
+        Returns:
+            (B, N, D_out), preserving token order.
+        """
+        cls_z = self.projector(tokens[:, 0])  # (B, D_out)
+        if tokens.size(1) == 1:
+            return cls_z.unsqueeze(1)
+
+        patch_projector = getattr(self, "patch_projector", None)
+        if patch_projector is None:
+            # Backward-compatible fallback for older pickled visual-prefix
+            # checkpoints that do not have a patch_projector attribute.
+            patch_projector = self.projector
+
+        patches = tokens[:, 1:]
+        B, N_patch, D_in = patches.shape
+        patch_z = patch_projector(patches.reshape(B * N_patch, D_in))
+        patch_z = patch_z.reshape(B, N_patch, -1)
+        return torch.cat([cls_z.unsqueeze(1), patch_z], dim=1)
 
     def predict_actions(
         self,
