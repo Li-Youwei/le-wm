@@ -566,7 +566,7 @@ def evaluate_task(
             # auxiliary gripper-command head, bypass FAST for dim 6 and
             # take the direct regression head's output instead. This
             # addresses the libero_object 0% failure where FAST joint BPE
-            # diluted the gripper signal — see CLAUDE.md diagnostic notes.
+            # diluted the gripper signal — see AGENTS.md diagnostic notes.
             if getattr(model.predictor, "use_gripper_aux", False):
                 pred_grip = model.predict_gripper_aux(
                     z_agent,

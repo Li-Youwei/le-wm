@@ -920,7 +920,7 @@ def main() -> None:
         load_tokenizer_path=args.load_tokenizer,
     )
 
-    # Token length assertion (CRITICAL — see CLAUDE.md)
+    # Token length assertion (CRITICAL — see AGENTS.md)
     # Do NOT silently truncate; raise an error so max_action_tokens can be increased.
     max_observed = max(len(t) for t in tokens_list)
     print(f"  Max observed token length: {max_observed}")

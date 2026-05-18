@@ -67,8 +67,8 @@ predictor:
   # retaining global self-attention over the full sequence.
   state_prediction_arch: shared
 
-# Projector normalization layer — see CLAUDE.md "Known caveats of switching to
-# BatchNorm projector". Default 'layer' reproduces the frozen baseline.
+# Projector normalization layer — see AGENTS.md for SIGReg/BatchNorm notes.
+# Default 'layer' reproduces the frozen baseline.
 # Switch to 'batch' when sigreg_weight > 0 (LeWM paper Section 3 requires
 # BatchNorm because LayerNorm prevents SIGReg from optimizing the latent
 # distribution toward isotropic Gaussian). train.py errors out if this

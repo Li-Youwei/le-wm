@@ -82,6 +82,7 @@ class RepositoryContractsTest(unittest.TestCase):
             "run_visual17.sh",
             "slides",
             "config/eval",
+            "CLAUDE.md",
         ]
         for relpath in removed:
             with self.subTest(relpath=relpath):

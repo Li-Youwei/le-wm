@@ -375,8 +375,7 @@ def run(cfg):
             f"sigreg_weight={sigreg_weight} > 0 requires projector.norm_type='batch'. "
             f"Got '{projector_norm}'. LeWM paper Section 3: LayerNorm projector "
             "prevents SIGReg from optimizing the latent distribution toward "
-            "isotropic Gaussian. See CLAUDE.md 'Known caveats of switching to "
-            "BatchNorm projector' before flipping this on."
+            "isotropic Gaussian. See AGENTS.md before flipping this on."
         )
 
     # Multi-token visual prefix (CLS + grid-pooled patches). Off by default
