@@ -116,7 +116,7 @@ for suite in libero_spatial libero_object libero_goal libero_10; do
         --num-episodes 20 \
         --max-steps 300 \
         --device cuda \
-        --seed 42 \
+        --seed "$SEED" \
         2>&1 | tee "$EVAL_LOG"
 done
 

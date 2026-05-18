@@ -338,7 +338,11 @@ def run(cfg):
     ##       dataset       ##
     #########################
 
-    rnd_gen = torch.Generator().manual_seed(cfg.seed)
+    seed = int(cfg.seed)
+    # Seed before dataset/model construction so split, sampler order, model
+    # initialization, dropout, and dataloader workers use the same run seed.
+    pl.seed_everything(seed, workers=True)
+    rnd_gen = torch.Generator().manual_seed(seed)
 
     # Single source of truth for max_action_tokens and max_lang_tokens
     max_action_tokens = cfg.data.dataset.get("max_action_tokens", 80)
@@ -765,6 +769,7 @@ def run(cfg):
         trainer=trainer,
         module=world_model,
         data=data_module,
+        seed=seed,
         ckpt_path=manager_ckpt_path,
     )
 

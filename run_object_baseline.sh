@@ -93,7 +93,7 @@ python eval_libero.py \
     --num-episodes 20 \
     --max-steps 300 \
     --device cuda \
-    --seed 42 \
+    --seed "$SEED" \
     2>&1 | tee "$EVAL_LOG"
 
 echo "[obj_baseline] ALL DONE — see logs under $CKPT_DIR/"

@@ -63,6 +63,28 @@ class RepositoryContractsTest(unittest.TestCase):
         self.assertIn("zero_range = half_range < 1e-8", source)
         self.assertIn("np.where(zero_range, mid, restored)", source)
 
+    def test_training_seed_is_used_globally(self) -> None:
+        source = (ROOT / "train.py").read_text()
+        self.assertIn("seed = int(cfg.seed)", source)
+        self.assertIn("pl.seed_everything(seed, workers=True)", source)
+        self.assertIn("seed=seed", source)
+
+    def test_eval_scripts_use_run_seed(self) -> None:
+        scripts = [
+            "run_all4.sh",
+            "run_all4_grip.sh",
+            "run_all4_pretrained_vision.sh",
+            "run_all4_visual17.sh",
+            "run_object_baseline.sh",
+            "run_object_pretrained_vision.sh",
+            "run_visual17.sh",
+        ]
+        for script in scripts:
+            with self.subTest(script=script):
+                source = (ROOT / script).read_text()
+                self.assertNotIn("--seed 42", source)
+                self.assertIn('--seed "$SEED"', source)
+
 
 if __name__ == "__main__":
     unittest.main()
