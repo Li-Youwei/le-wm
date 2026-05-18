@@ -266,6 +266,15 @@ def run(cfg):
     ##       dataset       ##
     #########################
 
+    # Seed the global torch / numpy / random / hash RNG BEFORE constructing
+    # encoder, predictor, projector, lang_proj, etc. — otherwise their
+    # parameter init draws from whatever state numpy/torch happen to be in,
+    # which makes runs non-reproducible across reboots. workers=True propagates
+    # the seed into DataLoader worker processes for deterministic shuffling.
+    # spt.Manager re-seeds again inside its __call__, so we ALSO pass seed
+    # there (below) to make that second seeding deterministic and aligned.
+    pl.seed_everything(cfg.seed, workers=True)
+
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
 
     # Single source of truth for max_action_tokens and max_lang_tokens
@@ -640,6 +649,7 @@ def run(cfg):
         trainer=trainer,
         module=world_model,
         data=data_module,
+        seed=cfg.seed,
         ckpt_path=run_dir / f"{cfg.output_model_name}_weights.ckpt",
     )
 
