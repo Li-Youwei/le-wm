@@ -147,7 +147,7 @@ python train.py \
     seed="$SEED" \
     subdir="" \
     output_model_name=lewm \
-    ckpt_top_k="$CKPT_SELECT_TOP_K" \
+    +ckpt_top_k="$CKPT_SELECT_TOP_K" \
     +visual_tokens.pool_grid="$POOL_GRID" \
     +visual_tokens.patch_sp="$PATCH_SP" \
     +visual_tokens.patch_sp_weight="$PATCH_SP_WEIGHT" \
