@@ -353,6 +353,7 @@ The active server runner is `run_all4_pretrained_vision.sh`. Its supported
 - `all4_sp_sigreg_dinov2_frozen_visual17`
 - `all4_sp_sigreg_dinov2_frozen_visual17_sep_proj`
 - `all4_sp_sigreg_dinov2_frozen_visual17_patch_sp`
+- `all4_sp_sigreg_dinov2_frozen_visual17_patch_sp_mot`
 - `all4_sp_sigreg_dinov2_frozen_mot`
 
 The runner requires:
