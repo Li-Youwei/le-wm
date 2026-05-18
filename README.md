@@ -1,127 +1,76 @@
+# LeWM LIBERO VLA Experiments
 
-# LeWorldModel
-### Stable End-to-End Joint-Embedding Predictive Architecture from Pixels
+This repository is a LIBERO-focused fork of LeWorldModel for
+vision-language-action experiments. The active model takes two RGB views,
+9D proprioception, and a language instruction, then autoregressively predicts
+FAST action tokens. Current experiments compare CLS-only and CLS+pooled-patch
+visual prefixes, state prediction, SIGReg, frozen DINOv2, and the MoT predictor
+variant.
 
-[Lucas Maes*](https://x.com/lucasmaes_), [Quentin Le Lidec*](https://quentinll.github.io/), [Damien Scieur](https://scholar.google.com/citations?user=hNscQzgAAAAJ&hl=fr), [Yann LeCun](https://yann.lecun.com/) and [Randall Balestriero](https://randallbalestriero.github.io/)
+## Setup
 
-**Abstract:** Joint Embedding Predictive Architectures (JEPAs) offer a compelling framework for learning world models in compact latent spaces, yet existing methods remain fragile, relying on complex multi-term losses, exponential moving averages, pretrained encoders, or auxiliary supervision to avoid representation collapse. In this work, we introduce LeWorldModel (LeWM), the first JEPA that trains stably end-to-end from raw pixels using only two loss terms: a next-embedding prediction loss and a regularizer enforcing Gaussian-distributed latent embeddings. This reduces tunable loss hyperparameters from six to one compared to the only existing end-to-end alternative. With ~15M parameters trainable on a single GPU in a few hours, LeWM plans up to 48× faster than foundation-model-based world models while remaining competitive across diverse 2D and 3D control tasks. Beyond control, we show that LeWM's latent space encodes meaningful physical structure through probing of physical quantities. Surprise evaluation confirms that the model reliably detects physically implausible events.
-
-<p align="center">
-   <b>[ <a href="https://arxiv.org/pdf/2603.19312v1">Paper</a> | <a href="https://drive.google.com/drive/folders/1r31os0d4-rR0mdHc7OlY_e5nh3XT4r4e?usp=sharing">Checkpoints</a> | <a href="https://huggingface.co/collections/quentinll/lewm">Data</a> | <a href="https://le-wm.github.io/">Website</a> ]</b>
-</p>
-
-<br>
-
-<p align="center">
-  <img src="assets/lewm.gif" width="80%">
-</p>
-
-If you find this code useful, please reference it in your paper:
-```
-@article{maes_lelidec2026lewm,
-  title={LeWorldModel: Stable End-to-End Joint-Embedding Predictive Architecture from Pixels},
-  author={Maes, Lucas and Le Lidec, Quentin and Scieur, Damien and LeCun, Yann and Balestriero, Randall},
-  journal={arXiv preprint},
-  year={2026}
-}
-```
-
-## Using the code
-This codebase builds on [stable-worldmodel](https://github.com/galilai-group/stable-worldmodel) for environment management, planning, and evaluation, and [stable-pretraining](https://github.com/galilai-group/stable-pretraining) for training. Together they reduce this repository to its core contribution: the model architecture and training objective.
-
-**Installation:**
-```bash
-uv venv --python=3.10
-source .venv/bin/activate
-uv pip install stable-worldmodel[train,env]
-```
-
-## Data
-
-Datasets use the HDF5 format for fast loading. Download the data from [HuggingFace](https://huggingface.co/collections/quentinll/lewm) and decompress with:
+Use Python 3.10 and the `vla` conda environment used on the training server:
 
 ```bash
-tar --zstd -xvf archive.tar.zst
+conda activate vla
+pip install -r requirements.txt
 ```
 
-Place the extracted `.h5` files under `$STABLEWM_HOME` (defaults to `~/.stable-wm/`). You can override this path:
-```bash
-export STABLEWM_HOME=/path/to/your/storage
-```
+`transformers>=4.48,<5` is required for the FAST tokenizer stack. Server runs
+expect preprocessed data and checkpoints under writable `/Data/lyw` paths. Treat
+the raw LIBERO root `/nas_data_new/caz/data_ssd/libero` as read-only.
 
-Dataset names are specified without the `.h5` extension. For example, `config/train/data/pusht.yaml` references `pusht_expert_train`, which resolves to `$STABLEWM_HOME/pusht_expert_train.h5`.
+## Data Pipeline
 
-## Training
-
-`jepa.py` contains the PyTorch implementation of LeWM. Training is configured via [Hydra](https://hydra.cc/) config files under `config/train/`.
-
-Before training, set your WandB `entity` and `project` in `config/train/lewm.yaml`:
-```yaml
-wandb:
-  config:
-    entity: your_entity
-    project: your_project
-```
-
-To launch training:
-```bash
-python train.py data=pusht
-```
-
-Checkpoints are saved to `$STABLEWM_HOME` upon completion.
-
-For baseline scripts, see the stable-worldmodel [scripts](https://github.com/galilai-group/stable-worldmodel/tree/main/scripts/train) folder.
-
-## Planning
-
-Evaluation configs live under `config/eval/`. Set the `policy` field to the checkpoint path **relative to `$STABLEWM_HOME`**, without the `_object.ckpt` suffix:
+Raw LIBERO demos are preprocessed into HDF5 task files. Each sample stores
+agentview RGB, eye-in-hand RGB, 9D proprio, FAST action tokens, normalized
+continuous actions, language instruction metadata, and, for state prediction,
+future-frame visual/proprio targets at `t+H`.
 
 ```bash
-# ✓ correct
-python eval.py --config-name=pusht.yaml policy=pusht/lewm
-
-# ✗ incorrect
-python eval.py --config-name=pusht.yaml policy=pusht/lewm_object.ckpt
+bash preprocess_all4.sh
+python check_fast_roundtrip.py --processed-dir /path/to/processed --tokenizer /path/to/tokenizer
 ```
 
-## Pretrained Checkpoints
+For 4-suite training, the runner expects a flat directory with 40 `.h5` files
+and a fitted all-suite FAST tokenizer.
 
-Pre-trained checkpoints are available on [Google Drive](https://drive.google.com/drive/folders/1r31os0d4-rR0mdHc7OlY_e5nh3XT4r4e). Download the checkpoint archive and place the extracted files under `$STABLEWM_HOME/`.
+## Training And Evaluation
 
-<div align="center">
+The active end-to-end launcher is:
 
-| Method | two-room | pusht | cube | reacher |
-|:---:|:---:|:---:|:---:|:---:|
-| pldm | ✓ | ✓ | ✓ | ✓ |
-| lejepa | ✓ | ✓ | ✓ | ✓ |
-| ivl | ✓ | ✓ | ✓ | — |
-| iql | ✓ | ✓ | ✓ | — |
-| gcbc | ✓ | ✓ | ✓ | — |
-| dinowm | ✓ | ✓ | — | — |
-| dinowm_noprop | ✓ | ✓ | ✓ | ✓ |
-
-</div>
-
-## Loading a checkpoint
-
-Each tar archive contains two files per checkpoint:
-- `<name>_object.ckpt` — a serialized Python object for convenient loading; this is what `eval.py` and the `stable_worldmodel` API use
-- `<name>_weight.ckpt` — a weights-only checkpoint (`state_dict`) for cases where you want to load weights into your own model instance
-
-To load the object checkpoint via the `stable_worldmodel` API:
-
-```python
-import stable_worldmodel as swm
-
-# Load the cost model (for MPC)
-cost = swm.policy.AutoCostModel('pusht/lewm')
+```bash
+ARM=all4_sp_sigreg_dinov2_frozen_visual17_patch_sp \
+SEED=3072 \
+CUDA_VISIBLE_DEVICES=1 \
+bash run_all4_pretrained_vision.sh
 ```
 
-This function accepts:
-- `run_name` — checkpoint path **relative to `$STABLEWM_HOME`**, without the `_object.ckpt` suffix
-- `cache_dir` — optional override for the checkpoint root (defaults to `$STABLEWM_HOME`)
+The script trains on all four LIBERO suites, selects the best checkpoint by
+task-balanced validation CE, then evaluates `libero_spatial`, `libero_object`,
+`libero_goal`, and `libero_10` with the same run seed. Key overrides include
+`MAX_STEPS`, `VAL_INTERVAL`, `BATCH_SIZE`, `CKPT_ROOT`, `FLAT_DIR`, `TOKENIZER`,
+`PROCESSED_ROOT`, and `VISION_ENCODER`.
 
-The returned module is in `eval` mode with its PyTorch weights accessible via `.state_dict()`.
+## Main Files
 
-## Contact & Contributions
-Feel free to open [issues](https://github.com/lucas-maes/le-wm/issues)! For questions or collaborations, please contact `lucas.maes@mila.quebec`
+- `jepa.py`, `module.py`: visual/language/proprio encoders and AR predictor.
+- `vision_backbone.py`: SPT ViT or HuggingFace vision backbone construction.
+- `train.py`: Hydra + Lightning training loop and loss composition.
+- `libero_dataset.py`, `preprocess_libero.py`: HDF5 data loading and preprocessing.
+- `eval_libero.py`: closed-loop LIBERO rollout evaluation.
+- `run_all4_pretrained_vision.sh`: current server training/eval workflow.
+
+## Checks
+
+There is no CI pipeline. Run lightweight local checks before pushing model or
+runner changes:
+
+```bash
+python -m unittest test_visual_tokens.py test_attn_mask.py test_mot_predictor.py test_repo_contracts.py
+bash -n preprocess_all4.sh run_all4_pretrained_vision.sh
+python -m py_compile train.py jepa.py module.py eval_libero.py
+```
+
+Large artifacts such as checkpoints, TensorBoard logs, videos, preprocessed
+HDF5 files, and Hydra outputs should remain outside git.

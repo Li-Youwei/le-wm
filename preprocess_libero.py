@@ -117,7 +117,7 @@ def inspect_hdf5(f: h5py.File, image_key: str, hand_image_key: str, demo_keys: l
     grip_dim = f[f"data/{demo_keys[0]}/obs/gripper_states"].shape[1]
     print(f"  robot_states: {rs_dim}d (using [5:9] as xyzw quaternion)")
     print(f"  gripper_states: {grip_dim}d (both raw finger positions, no averaging)")
-    print(f"  proprio layout: ee_pos(3) + xyzw_quat(4) + gripper_raw(2) = 9d")
+    print("  proprio layout: ee_pos(3) + xyzw_quat(4) + gripper_raw(2) = 9d")
 
 
 # ---------------------------------------------------------------------------
@@ -756,7 +756,7 @@ def print_statistics(
     """Print detailed statistics about the processed dataset."""
     N = len(tokens_list)
     print(f"\n{'=' * 60}")
-    print(f"[Step 6] Dataset Statistics")
+    print("[Step 6] Dataset Statistics")
     print(f"{'=' * 60}")
 
     # --- Sample counts ---
@@ -785,7 +785,7 @@ def print_statistics(
     # --- Action stats (after normalization) ---
     all_actions = np.stack(samples["continuous_actions"], axis=0)  # (N, H, 7)
     flat_actions = all_actions.reshape(-1, all_actions.shape[-1])  # (N*H, 7)
-    print(f"\n  Normalized action stats (should be in [-1, 1]):")
+    print("\n  Normalized action stats (should be in [-1, 1]):")
     for d in range(flat_actions.shape[1]):
         col = flat_actions[:, d]
         print(f"    Dim {d}: min={col.min():.4f}, max={col.max():.4f}, "
@@ -793,7 +793,7 @@ def print_statistics(
 
     # --- Token statistics ---
     lengths = np.array([len(t) for t in tokens_list])
-    print(f"\n  FAST token lengths:")
+    print("\n  FAST token lengths:")
     print(f"    min={lengths.min()}, max={lengths.max()}, "
           f"mean={lengths.mean():.1f}, median={np.median(lengths):.0f}, "
           f"std={lengths.std():.1f}")
@@ -807,7 +807,7 @@ def print_statistics(
     unique_tokens = len(token_counter)
     print(f"\n  Vocab usage: {unique_tokens} unique token IDs out of "
           f"{total_tokens} total tokens")
-    print(f"  Top-20 most frequent token IDs:")
+    print("  Top-20 most frequent token IDs:")
     for token_id, count in token_counter.most_common(20):
         pct = 100.0 * count / total_tokens
         print(f"    ID {token_id:>5d}: {count:>8d} ({pct:5.2f}%)")

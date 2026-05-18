@@ -368,11 +368,11 @@ def main() -> None:
             print("  Per-step per-dim detail (physical, anchor-relative):")
             header_dims = "  ".join(f"{'d' + str(d):>8}" for d in range(action_dim))
             print(f"    step      {header_dims}")
-            print(f"    " + "-" * (11 + len(header_dims)))
+            print("    " + "-" * (11 + len(header_dims)))
             for h in range(chunk_size):
                 print(f"    {h:>3d}  P | {format_row(decoded_phys[h])}")
                 print(f"        G | {format_row(gt_chunk_phys[h])}")
-                print(f"        E | "
+                print("        E | "
                       + " ".join(f"{v:>+8.3f}" for v in raw_err[h]))
 
     # ---- Step 4: Aggregate summary ----

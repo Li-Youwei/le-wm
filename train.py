@@ -724,22 +724,6 @@ def run(cfg):
 
     callbacks.append(TaskBalancedCEMetric())
 
-    # Online health probe at step 20K (Stage A: full 40-rollout breadth sweep).
-    # Disabled by default; opt in via cfg.probe.enabled=true on the CLI.
-    probe_cfg = cfg.get("probe", {}) or {}
-    if probe_cfg.get("enabled", False):
-        from utils import EarlyProbeCallback
-
-        callbacks.append(
-            EarlyProbeCallback(
-                trigger_steps=tuple(probe_cfg.get("trigger_steps", (20000,))),
-                tokenizer_path=str(probe_cfg["tokenizer_path"]),
-                processed_root=str(probe_cfg["processed_root"]),
-                ckpt_dir=str(run_dir),
-                script_path=str(probe_cfg.get("script", "quick_probe_eval.py")),
-            )
-        )
-
     if overfit_demo is not None:
         # Terminal progress line every N epochs — easier to eyeball than
         # scrolling Lightning progress bars over 2k epochs.

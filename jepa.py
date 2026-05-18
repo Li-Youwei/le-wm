@@ -124,8 +124,8 @@ class JEPA(nn.Module):
         """Training: run predictor with teacher forcing.
 
         Args:
-            z_agent: (B, D) agentview visual latent.
-            z_hand: (B, D) hand visual latent.
+            z_agent: (B, N, D) agentview visual tokens, or legacy (B, D).
+            z_hand: (B, N, D) hand visual tokens, or legacy (B, D).
             proprio: (B, 9) raw proprioceptive state
                 [ee_pos(3) + xyzw_quat(4) + gripper_raw(2)].
             lang_embeds: (B, max_lang_tokens, D) language embeddings.

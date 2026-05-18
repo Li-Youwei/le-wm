@@ -7,7 +7,7 @@
 # Or with uv:   uv pip install -r requirements.txt
 # =============================================================================
 
-# --- Core (module.py, jepa.py, libero_dataset.py, smoke_test.py) ---
+# --- Core (module.py, jepa.py, libero_dataset.py, eval_libero.py) ---
 torch>=2.1
 einops>=0.7
 numpy>=1.24

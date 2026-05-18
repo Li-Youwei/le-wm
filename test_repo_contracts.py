@@ -18,8 +18,8 @@ class RepositoryContractsTest(unittest.TestCase):
         config_text = (ROOT / "config/train/data/libero.yaml").read_text()
         self.assertIn("chunk_size:", config_text)
 
-    def test_run_all4_forwards_warmup_steps_to_hydra(self) -> None:
-        script_text = (ROOT / "run_all4.sh").read_text()
+    def test_pretrained_vision_runner_forwards_warmup_steps_to_hydra(self) -> None:
+        script_text = (ROOT / "run_all4_pretrained_vision.sh").read_text()
         self.assertIn("scheduler.warmup_steps", script_text)
 
     def test_saved_fast_tokenizer_patch_copies_processor_module_fallback(self) -> None:
@@ -34,10 +34,6 @@ class RepositoryContractsTest(unittest.TestCase):
         self.assertIn("view_embedding", source)
         self.assertIn("agent_patch_2d_pos", source)
         self.assertIn("visual-prefix", source)
-
-    def test_smoke_test_matches_training_dropout_contract(self) -> None:
-        source = (ROOT / "smoke_test.py").read_text()
-        self.assertIn("dropout=0.2", source)
 
     def test_predict_actions_defaults_to_predictor_token_budget(self) -> None:
         source = (ROOT / "jepa.py").read_text()
@@ -70,20 +66,26 @@ class RepositoryContractsTest(unittest.TestCase):
         self.assertIn("seed=seed", source)
 
     def test_eval_scripts_use_run_seed(self) -> None:
-        scripts = [
-            "run_all4.sh",
-            "run_all4_grip.sh",
-            "run_all4_pretrained_vision.sh",
-            "run_all4_visual17.sh",
-            "run_object_baseline.sh",
-            "run_object_pretrained_vision.sh",
-            "run_visual17.sh",
-        ]
+        scripts = ["run_all4_pretrained_vision.sh"]
         for script in scripts:
             with self.subTest(script=script):
                 source = (ROOT / script).read_text()
                 self.assertNotIn("--seed 42", source)
                 self.assertIn('--seed "$SEED"', source)
+
+    def test_removed_legacy_entrypoints_stay_removed(self) -> None:
+        removed = [
+            "eval.py",
+            "smoke_test.py",
+            "run_all4.sh",
+            "run_ablation.sh",
+            "run_visual17.sh",
+            "slides",
+            "config/eval",
+        ]
+        for relpath in removed:
+            with self.subTest(relpath=relpath):
+                self.assertFalse((ROOT / relpath).exists())
 
 
 if __name__ == "__main__":

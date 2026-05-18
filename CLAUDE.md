@@ -41,12 +41,15 @@ instruction):
 
 | Input | Source | Encoder | Output | Frozen? |
 |-------|--------|---------|--------|---------|
-| Agentview image | `agentview_rgb` stored at 128×128 | ViT (LeWM encoder, patch_size=14) | `z_agent` (D,) | No, end-to-end |
-| Eye-in-hand image | `eye_in_hand_rgb` stored at 128×128 | Same ViT (shared weights) | `z_hand` (D,) | No, end-to-end |
+| Agentview image | `agentview_rgb` stored at 128×128 | Shared visual backbone: original SPT ViT or HF DINOv2 | `z_agent` (N,D) | Configurable |
+| Eye-in-hand image | `eye_in_hand_rgb` stored at 128×128 | Same visual backbone (shared weights) | `z_hand` (N,D) | Configurable |
 | Proprioception | Base-frame EE position(3) + base-frame EE orientation quaternion(4) + gripper state(2) = 9d | MLP → D | `z_proprio` (D,) | No |
 | Language instruction | Task description string | T5-small encoder | `l_1...l_n` (n, D) | **Yes, frozen** |
 
-`D` = embed_dim = 192 (LeWM default for ViT-Tiny). Two image views share the same ViT encoder (weight sharing). T5-small outputs are projected to D via a learned linear layer.
+`D` = embed_dim = 192 by default. Two image views share the same visual
+encoder (weight sharing). T5-small outputs are projected to D via a learned
+linear layer. `N=1` for the legacy CLS-only visual prefix; with
+`visual_tokens.pool_grid=4`, `N=17` (`1 CLS + 4x4` pooled patch tokens).
 
 **Image resolution chain**: Raw LIBERO images are 128×128. The ViT uses `patch_size=14`, which requires the input to be divisible by 14. The dataset transform must **resize 128→224** (matching LeWM's original training resolution of 224×224, where 224/14=16 patches per side). Do NOT feed 128×128 directly to the ViT — it won't divide evenly.
 
@@ -61,13 +64,13 @@ instruction):
 
 Training-time input sequence:
 ```
-[l_1, l_2, ..., l_n, z_agent, z_hand, z_proprio, BOS, T_1^GT, T_2^GT, ..., T_k^GT, PAD, ..., PAD]
+[l_1, ..., l_n, V_ag[1:N], V_hd[1:N], z_proprio, BOS, T_1^GT, ..., T_k^GT, PAD...]
  ←── perception prefix (bidirectional) ──→       ←── action tokens (causal) + padding ──→
 ```
 
 Inference:
 ```
-[l_1, ..., l_n, z_agent, z_hand, z_proprio, BOS] → autoregressively generate T_1, ..., T_k, <EOS>
+[l_1, ..., l_n, V_ag[1:N], V_hd[1:N], z_proprio, BOS] → autoregressively generate T_1, ..., T_k, <EOS>
 → FAST decode → continuous action chunk (H=20 steps × 7 dims, anchor-relative)
 → closed-loop execution (see "Closed-loop chunk execution" below)
 ```
@@ -81,8 +84,9 @@ Inference:
 
 Where:
 - `l_1...l_n`: language token embeddings from frozen T5-small (variable length, typically 5-15 tokens)
-- `z_agent`: CLS token from ViT encoding of agentview image
-- `z_hand`: CLS token from ViT encoding of eye-in-hand image
+- `V_ag[1:N]`: projected agentview visual tokens. `N=1` is CLS-only;
+  `N=17` is CLS plus `4x4` adaptive-avg-pooled patch tokens.
+- `V_hd[1:N]`: projected eye-in-hand visual tokens with the same layout.
 - `z_proprio`: MLP encoding of 9d proprioceptive state: base-frame EE position(3) + xyzw quaternion(4) + raw gripper finger positions(2)
 - `BOS`: beginning-of-action token (id=1024)
 - `T_1...T_k`: FAST action tokens (discrete, vocab=0..1023, variable-length). On LIBERO with H=20 the observed max across all 4 suites is 75 tokens per chunk; `max_action_tokens=80` gives a small margin. Preprocessing asserts `max(fast_length) <= max_action_tokens` and errors out if the bound is ever breached.
@@ -93,10 +97,10 @@ Where:
 **Prefix-bidirectional + action-causal hybrid mask.** Three zones:
 
 ```
-           lang  z_ag  z_hd  z_pr  BOS   T_i   PAD
+           lang  V_ag  V_hd  z_pr  BOS   T_i   PAD
 lang     [  Y     Y     Y     Y     -     -     -  ]
-z_ag     [  Y     Y     Y     Y     -     -     -  ]
-z_hd     [  Y     Y     Y     Y     -     -     -  ]
+V_ag     [  Y     Y     Y     Y     -     -     -  ]
+V_hd     [  Y     Y     Y     Y     -     -     -  ]
 z_pr     [  Y     Y     Y     Y     -     -     -  ]
 BOS      [  Y     Y     Y     Y     Y     -     -  ]
 T_i      [  Y     Y     Y     Y     Y    csl    -  ]
@@ -106,7 +110,7 @@ PAD      [  -     -     -     -     -     -     -  ]
 Y = can attend, - = blocked, csl = causal (attend to left only within action group)
 
 Rules:
-- **Perception prefix** (lang + z_ag + z_hd + z_pr): fully bidirectional among themselves, cannot see action tokens or PAD
+- **Perception prefix** (lang + visual tokens + z_pr): fully bidirectional among themselves, cannot see action tokens or PAD
 - **Action tokens** (BOS + T_1...T_k): can see all real prefix tokens, causal within action group (each T_i sees BOS, T_1...T_i but not T_{i+1}...T_k), cannot see PAD
 - **PAD tokens** (both action PAD and language PAD): attend to nothing, no other token attends to them
 - **Language padding**: T5 tokenizer produces variable-length output. Shorter instructions are padded. Language PAD tokens must also be masked out — no real token should attend to them. Use `lang_lengths` to determine which language positions are real.
@@ -119,7 +123,7 @@ Standard causal teacher forcing within action zone: position i's target is the n
 
 **Output and target shapes — read carefully:**
 
-`action_logits` is extracted **only from action-zone positions** (BOS + T_1...T_k + PAD positions), NOT from the full sequence. The prefix positions (lang, z_ag, z_hd, z_pr) do NOT go through `action_head` and do NOT produce logits.
+`action_logits` is extracted **only from action-zone positions** (BOS + T_1...T_k + PAD positions), NOT from the full sequence. The prefix positions (lang, visual tokens, z_pr) do NOT go through `action_head` and do NOT produce logits.
 
 ```
 action_logits shape: (B, 1 + max_action_tokens, 1026)
@@ -317,11 +321,12 @@ When `use_state_prediction=True` (auto-set by `train.py` from
 are appended at the **end** of the training-time sequence:
 
 ```
-[lang..., z_ag, z_hd, z_pr, BOS, T_1...T_k, PAD..., Q_ag, Q_hd, Q_pr]
+[lang..., V_ag[1:N], V_hd[1:N], z_pr, BOS, T_1...T_k, PAD..., Q_ag, Q_hd, Q_pr]
 ```
 
-Sequence length grows from `n_lang + 3 + 1 + max_action_tokens` (109 by
-default) to `... + 3` (112 by default). `pos_embedding` is sized
+Sequence length grows from `n_lang + 2*N + 1 + 1 + max_action_tokens`
+to `... + 3`. With `max_lang_tokens=25`, `max_action_tokens=80`, and
+`N=17`, the SP training sequence length is 144. `pos_embedding` is sized
 accordingly when the flag is on.
 
 **Attention rules for STATE_QUERY rows** (extends the prefix-bidir +
@@ -348,8 +353,8 @@ from `cfg.projector.norm_type`.
 
 | Head | Input | Output | Target |
 |------|-------|--------|--------|
-| `state_pred_head_ag` | `h_{Q_ag} ∈ ℝ^D` | `pred_ag ∈ ℝ^D` | `z_ag_{t+H}` (future agentview latent, **NOT detached**) |
-| `state_pred_head_hd` | `h_{Q_hd} ∈ ℝ^D` | `pred_hd ∈ ℝ^D` | `z_hd_{t+H}` (future hand-cam latent, **NOT detached**) |
+| `state_pred_head_ag` | `h_{Q_ag} ∈ ℝ^D` | `pred_ag ∈ ℝ^D` or `ℝ^(N×D)` | future agentview latent(s), **NOT detached** |
+| `state_pred_head_hd` | `h_{Q_hd} ∈ ℝ^D` | `pred_hd ∈ ℝ^D` or `ℝ^(N×D)` | future hand-cam latent(s), **NOT detached** |
 | `state_pred_head_pr` | `h_{Q_pr} ∈ ℝ^D` | `pred_pr ∈ ℝ^9` | re-normalized `proprio_{t+H}` (9d, same `normalize_proprio` treatment as the predictor input) |
 
 The visual heads' output dim matches the encoder projector's output
@@ -364,10 +369,15 @@ treatment so the MSE target's scale matches the predictor input's scale).
 ### `L_pred` (state-prediction loss)
 
 ```
-L_pred = MSE(pred_ag, z_ag_{t+H})        # gradients flow through both branches
+L_pred = MSE(pred_ag, z_ag_{t+H})        # CLS-only or CLS+patch tokens
        + MSE(pred_hd, z_hd_{t+H})        # gradients flow through both branches
        + MSE(pred_pr, proprio_{t+H})     # raw 9d MSE
 ```
+
+When `visual_tokens.patch_sp=true`, `pred_ag` and `pred_hd` are reshaped to
+`(B, N, D)` and matched against the future CLS+patch targets. The code logs
+CLS and patch MSE separately and combines them with
+`visual_tokens.patch_sp_weight` (default `1.0`). SIGReg remains CLS-only.
 
 **No `target.detach()`.** Per LeWM paper Section 3:
 > "We do not employ stop-gradient, exponential moving averages, or
@@ -484,10 +494,10 @@ introduces three side effects worth knowing about:
 |-----------|---------------------------------------------|
 | `preprocess_libero.py` | Extracts and stores `image_agent_future`, `image_hand_future`, `proprio_future` (the t+H frame) alongside the existing fields. Old preprocessed HDF5 must be regenerated. |
 | `libero_dataset.py` | Asserts the future fields exist in HDF5; loads them in `__getitem__` and yields `pixels_*_future` and `proprio_future` as part of the batch. Old HDF5 still works when `use_state_prediction=False`. |
-| `module.py::ARPredictor` | Adds `state_query_embeddings` (3,D), three prediction heads, an extended attention mask, and an extra type embedding row (5 instead of 4). `forward()` returns `(action_logits, pred_ag, pred_hd, pred_pr)` instead of just `action_logits`. `generate()` is **unchanged** — STATE_QUERY tokens are training-only. |
-| `jepa.py::JEPA` | Adds `encode_future_visual()` that runs the SHARED ViT + projector on the t+H frames with NO `.detach()`. |
+| `module.py::ARPredictor` | Adds `state_query_embeddings` (3,D), three prediction heads, an extended attention mask, optional MoT routing, and optional visual-token prediction. `forward()` returns action logits plus SP outputs when enabled. `generate()` is **unchanged** — STATE_QUERY tokens are training-only. |
+| `jepa.py::JEPA` | Adds `encode_future_visual()` that runs the shared visual backbone + projector on the t+H frames with NO `.detach()`. Also supports CLS+pooled-patch visual tokens via `visual_tokens.pool_grid`. |
 | `train.py::lejepa_forward` | Computes `L_pred` (3 MSE) when `pred_weight > 0`, computes `L_sigreg` on the encoder-only 4-stream stack when `sigreg_weight > 0`, sums into `L_total`. Validates `projector.norm_type == 'batch'` when SIGReg is on. |
-| `eval_libero.py` | Inference flow `[lang, z_ag, z_hd, z_pr, BOS] → AR decode → FAST` is unchanged. The only delta is `load_checkpoint()` now hard-rejects non-baseline `_weights.ckpt` payloads (SP keys OR BatchNorm projector running stats) with a clear message pointing at `_object.ckpt`. Both SP-trained and "SIGReg-only no SP" ablation checkpoints must be evaluated via the per-epoch `_object.ckpt` produced by `ModelObjectCallBack`. |
+| `eval_libero.py` | Inference flow `[lang, visual tokens, z_pr, BOS] → AR decode → FAST` is unchanged by SP queries. The only delta is `load_checkpoint()` now hard-rejects non-baseline `_weights.ckpt` payloads (SP keys OR BatchNorm projector running stats) with a clear message pointing at `_object.ckpt`. Both SP-trained and "SIGReg-only no SP" ablation checkpoints must be evaluated via the per-epoch `_object.ckpt` produced by `ModelObjectCallBack`. |
 
 ### How to enable
 
@@ -549,22 +559,28 @@ the canonicalized version (use a separate processed-dir).
 
 - **OS**: macOS (development / debugging), Linux GPU server (training, `ssh zju`).
 - **Conda**: miniforge, environment name `vla`, Python 3.10.
-- **Project path**: `~/Documents/le-wm/`.
+- **Project path**: local worktree under `~/Documents/le-wm/worktrees/`; server
+  training copy under `/Data/lyw/le-wm-codex-clever-black`.
 
 ```bash
 conda activate vla
 pip install -r requirements.txt   # transformers pin >=4.48,<5 matters for FAST
 
-python train.py data=libero       # joint training over a directory of preprocessed .h5 (see run_all4.sh)
+python train.py data=libero       # direct Hydra entry point
+bash run_all4_pretrained_vision.sh  # active 4-suite train/eval workflow
 
 export STABLEWM_HOME=/path/to/storage
 ```
 
-There is no pytest suite or CI pipeline, but three standalone scripts provide
-end-to-end validation:
+There is no CI pipeline. Lightweight local validation is kept in `unittest`
+files plus shell syntax checks:
 
-- **`smoke_test.py`** — full VLA model on a real preprocessed HDF5 sample: forward, backward, gradient-flow checks, T5 frozen-params check, autoregressive generation, VRAM profile at batch sizes 128/64/32/16.
+- **`test_visual_tokens.py`** — checks CLS+pooled-patch visual layout, patch
+  projector behavior, and patch-level SP shape contracts.
+- **`test_mot_predictor.py`** — checks MoT routing and generation paths.
 - **`test_attn_mask.py`** — unit-level check that `_build_attn_mask()` produces the expected prefix-bidir + action-causal + PAD-isolated pattern on a hand-crafted example (lang PAD, action PAD, 4 real action tokens).
+- **`test_repo_contracts.py`** — file/script invariants that catch stale
+  launcher and config assumptions.
 - **`check_fast_roundtrip.py`** — recomputes the GT anchor-relative chunk from the raw LIBERO HDF5 (using the same formulas as `preprocess_libero.py`), decodes the stored FAST tokens, and reports per-dim / per-step L1 error in normalized space (pure codec error) and physical space (what the robot sees).
 
 ## Baseline Implementation (frozen @ `7008f15`)
@@ -578,15 +594,13 @@ end-to-end validation:
 | `preprocess_libero.py` | Anchor-relative chunks + stride=1 sliding window + FAST BPE. `normalize_proprio` is the single source of truth for the 9D layout and is re-used by `eval_libero.py::preprocess_obs`. |
 | `eval_libero.py` | Closed-loop chunk execution. OSC `pos_scale` / `rot_scale` are read from the running controller at runtime (not hardcoded) with uniformity assertions. Supports both `_weights.ckpt` (Lightning) and `_object.ckpt` (pickled JEPA) formats, plus `--no-language` ablation. |
 | `fast_utils.py` | `fast_decode` with pad/truncate fallback (the built-in FAST decoder silently zeros the chunk on length mismatch, which freezes the robot; our wrapper preserves as much of the signal as possible) + `denormalize_actions`. |
-| `run_all4.sh` | End-to-end driver for 4-suite joint training: trains a single ckpt on the flat 40-task dir, picks best ckpt by `validate/ce_loss_taskbal`, runs per-suite eval. Optional grip-aux / V17 variants live in sibling scripts. |
+| `vision_backbone.py` | Builds the original SPT ViT or a HuggingFace vision backbone such as frozen DINOv2. |
+| `run_all4_pretrained_vision.sh` | Active 4-suite driver: trains on the flat 40-task dir with a frozen HF vision backbone, picks best ckpt by `validate/ce_loss_taskbal`, then runs per-suite eval. |
 | `config/train/lewm.yaml` | Baseline training config with regularization defaults. |
 | `config/train/overfit.yaml` | 1-demo pipeline sanity-check config. |
 | `config/train/data/libero.yaml` | Dataset config + `use_language` ablation switch + proprio layout. |
 | `utils.py` | `ModelObjectCallBack` (per-epoch pickled model dump) + `PeriodicPrintCallback` (terminal progress every N epochs for long overfit runs). |
 | `requirements.txt` | Pinned deps. `transformers>=4.48,<5` is critical (earlier misses `TimmWrapperModel`; v5 breaks the FAST processor). |
-
-`eval.py` is the original LeWM CEM / Adam latent-planning entry point — kept
-for reference only, never imported by the VLA baseline.
 
 ## Hyperparameters (Frozen Baseline)
 
@@ -597,7 +611,7 @@ for reference only, never imported by the VLA baseline.
 | FAST vocab | 1024 | BPE fitted on LIBERO-Spatial via `--fit-tokenizer`, then reused across all 4 suites |
 | `max_action_tokens` | 80 | Observed max = 75 across all suites |
 | `max_lang_tokens` | 25 | Covers the longest T5-tokenized LIBERO instruction |
-| Embed dim `D` | 192 | ViT-Tiny hidden |
+| Embed dim `D` | 192 | Predictor/projector width; HF vision backbones are projected down to this width |
 | Predictor (depth / heads / dim_head / mlp_dim) | 6 / 16 / 64 / 2048 | |
 | Predictor dropout | 0.2 | Config overrides the class default of 0.1 |
 | `emb_dropout` | 0.0 | |
@@ -622,7 +636,7 @@ All four are wired end-to-end (preprocess / train / eval) and baseline-compatibl
 
 ### 1. `use_language=False` (no-language)
 
-Drops T5 entirely. Prefix becomes `[z_agent, z_hand, z_proprio, BOS, ...]`;
+Drops T5 entirely. Prefix becomes `[V_ag[1:N], V_hd[1:N], z_proprio, BOS, ...]`;
 neither `lang_encoder` nor `lang_proj` is constructed. The `_build_attn_mask`
 and `_build_generate_mask` paths both branch on `n_lang > 0`.
 
@@ -706,7 +720,7 @@ that case (`z_ag_t`, `z_hd_t`).
 
 ## Key Details
 
-- **Data layout**: training HDF5 under `${STABLEWM_HOME}/libero/`; per-suite preprocessed output under `${DATA_ROOT}/libero_processed/<suite>/` (one `.h5` per task — the **directory** is what `LiberoDataset` consumes for joint training, not individual files). Frozen baseline checkpoint lives at `/Data/lyw/checkpoints/multitask_ln_100ep/lewm_weights.ckpt` (single ckpt joint-trained on the suite). 4-suite joint training uses a flat-symlink dir `${DATA_ROOT}/libero_processed_v5/all4_flat/` so `LiberoDataset` can glob all 40 `.h5` from one root — see `run_all4.sh`.
+- **Data layout**: per-suite preprocessed output lives under `${DATA_ROOT}/libero_processed/<suite>/` or `/Data/lyw/libero_processed_v5/<suite>/` on the server (one `.h5` per task — the **directory** is what `LiberoDataset` consumes for joint training, not individual files). 4-suite joint training uses a flat-symlink dir such as `/Data/lyw/libero_processed_v5/all4_flat/` so `LiberoDataset` can glob all 40 `.h5` from one root — see `run_all4_pretrained_vision.sh`.
 - **FAST tokens**: variable-length int32 (`h5py.vlen_dtype`) per sample; each preprocessed HDF5 stores its own `action_low` / `action_high` percentile bounds (for inverse normalization at eval time), `chunk_size`, `chunk_stride`, and `language_instruction` in the file attrs.
 - **Device handling**: no hardcoded `cuda` — tensor device is inferred from inputs; the caller moves `JEPA` to the target device.
 - **Checkpoint formats**:

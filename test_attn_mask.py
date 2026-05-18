@@ -41,7 +41,6 @@ def main():
         max_action_tokens=6, max_lang_tokens=5, proprio_dim=9,
     )
 
-    B = 1
     n_lang = 5
     lang_lengths = torch.tensor([3])  # only first 3 are real
 
@@ -62,7 +61,7 @@ def main():
     ]
 
     # Print matrix
-    header = "        " + " ".join(f"{l:>6s}" for l in labels)
+    header = "        " + " ".join(f"{label:>6s}" for label in labels)
     print(header)
     print("        " + "-" * (7 * len(labels)))
     for i in range(L):
