@@ -585,9 +585,6 @@ end-to-end validation:
 | `utils.py` | `ModelObjectCallBack` (per-epoch pickled model dump) + `PeriodicPrintCallback` (terminal progress every N epochs for long overfit runs). |
 | `requirements.txt` | Pinned deps. `transformers>=4.48,<5` is critical (earlier misses `TimmWrapperModel`; v5 breaks the FAST processor). |
 
-`eval.py` is the original LeWM CEM / Adam latent-planning entry point — kept
-for reference only, never imported by the VLA baseline.
-
 ## Hyperparameters (Frozen Baseline)
 
 | Parameter | Value | Notes |
