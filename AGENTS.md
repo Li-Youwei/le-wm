@@ -89,6 +89,7 @@ From `config/train/lewm.yaml` and `config/train/data/libero.yaml`:
 | `eval_libero.py` | LIBERO rollout evaluation with closed-loop chunk execution, optional videos, object checkpoint loading, and baseline weights loading. |
 | `run_all4_pretrained_vision.sh` | Active 4-suite train/eval runner for frozen HuggingFace vision backbones. |
 | `pick_best_ckpt.py` | Reads TensorBoard scalars, selects best object checkpoint by validation metric, emits JSON. |
+| `select_light_eval_ckpt.py` | Reads light rollout-eval logs for CE top-K checkpoints and selects the highest 4-suite success-rate checkpoint. |
 | `aggregate_all4_results.py` | Parses per-suite eval logs and renders a markdown summary. |
 | `verify_sampler_balance.py` | Checks 3-level weighted sampler behavior over a flat 4-suite HDF5 directory. |
 | `check_fast_roundtrip.py` | Recomputes GT chunks from raw/preprocessed data and checks FAST encode/decode roundtrip error. |
@@ -363,9 +364,11 @@ The runner requires:
 - local HuggingFace vision model dir
 - conda env `vla`
 
-It exports offline HuggingFace env vars by default, trains, selects the best
-checkpoint using `pick_best_ckpt.py`, then evaluates all four suites with the
-same `SEED`.
+It exports offline HuggingFace env vars by default, trains, selects CE top-K
+checkpoints using `pick_best_ckpt.py`, runs light rollout evals for those
+checkpoints, selects the best rollout checkpoint with `select_light_eval_ckpt.py`,
+then evaluates all four suites with the same `SEED`. Control this with
+`CKPT_SELECT_TOP_K`, `LIGHT_EVAL_EPISODES`, and `FINAL_EVAL_EPISODES`.
 
 ## Evaluation Flow
 
