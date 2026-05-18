@@ -29,10 +29,8 @@ Run locally; reads from slides/tb_events/<run_name>/version_*.
 """
 from __future__ import annotations
 
-import os
 from collections import defaultdict
 from pathlib import Path
-from typing import Iterable
 
 import matplotlib
 

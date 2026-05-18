@@ -25,7 +25,6 @@ import os
 import sys
 from pathlib import Path
 
-import numpy as np
 import torch
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
