@@ -13,6 +13,14 @@ case "$ARM" in
     POOL_GRID_DEFAULT=0
     PATCH_SP_DEFAULT=false
     ;;
+  all4_dinov2_frozen_visual17)
+    PRED=0
+    SIGREG=0
+    NORM=layer
+    STATE_ARCH_DEFAULT=shared
+    POOL_GRID_DEFAULT=4
+    PATCH_SP_DEFAULT=false
+    ;;
   all4_sp_sigreg_dinov2_frozen)
     PRED=1.0
     SIGREG=0.1
@@ -63,7 +71,7 @@ case "$ARM" in
     ;;
   *)
     echo "Unknown ARM: $ARM" >&2
-    echo "Expected all4_dinov2_frozen|all4_sp_sigreg_dinov2_frozen|all4_sp_sigreg_dinov2_frozen_visual17|all4_sp_sigreg_dinov2_frozen_visual17_sep_proj|all4_sp_sigreg_dinov2_frozen_visual17_patch_sp|all4_sp_sigreg_dinov2_frozen_visual17_patch_sp_mot|all4_sp_sigreg_dinov2_frozen_mot" >&2
+    echo "Expected all4_dinov2_frozen|all4_dinov2_frozen_visual17|all4_sp_sigreg_dinov2_frozen|all4_sp_sigreg_dinov2_frozen_visual17|all4_sp_sigreg_dinov2_frozen_visual17_sep_proj|all4_sp_sigreg_dinov2_frozen_visual17_patch_sp|all4_sp_sigreg_dinov2_frozen_visual17_patch_sp_mot|all4_sp_sigreg_dinov2_frozen_mot" >&2
     exit 1
     ;;
 esac

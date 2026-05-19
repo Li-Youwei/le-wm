@@ -350,6 +350,7 @@ The active server runner is `run_all4_pretrained_vision.sh`. Its supported
 `ARM` values are:
 
 - `all4_dinov2_frozen`
+- `all4_dinov2_frozen_visual17`
 - `all4_sp_sigreg_dinov2_frozen`
 - `all4_sp_sigreg_dinov2_frozen_visual17`
 - `all4_sp_sigreg_dinov2_frozen_visual17_sep_proj`
