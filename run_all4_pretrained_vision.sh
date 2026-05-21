@@ -89,6 +89,8 @@ CKPT_SELECT_TOP_K="${CKPT_SELECT_TOP_K:-3}"
 LIGHT_EVAL_EPISODES="${LIGHT_EVAL_EPISODES:-5}"
 LIGHT_EVAL_MAX_STEPS="${LIGHT_EVAL_MAX_STEPS:-300}"
 FINAL_EVAL_EPISODES="${FINAL_EVAL_EPISODES:-20}"
+FINAL_EVAL_MAX_STEPS="${FINAL_EVAL_MAX_STEPS:-300}"
+TRAIN_SPLIT="${TRAIN_SPLIT:-0.9}"
 
 FLAT_DIR="${FLAT_DIR:-/Data/lyw/libero_processed_v5/all4_flat}"
 TOKENIZER="${TOKENIZER:-/Data/lyw/fast_tokenizer_all4}"
@@ -115,7 +117,8 @@ echo "[all4_pretrained_vision] PROCESSED_ROOT=$PROCESSED_ROOT"
 echo "[all4_pretrained_vision] VISION_ENCODER=$VISION_ENCODER"
 echo "[all4_pretrained_vision] CKPT_DIR=$CKPT_DIR"
 echo "[all4_pretrained_vision] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
-echo "[all4_pretrained_vision] CKPT_SELECT_TOP_K=$CKPT_SELECT_TOP_K LIGHT_EVAL_EPISODES=$LIGHT_EVAL_EPISODES FINAL_EVAL_EPISODES=$FINAL_EVAL_EPISODES"
+echo "[all4_pretrained_vision] TRAIN_SPLIT=$TRAIN_SPLIT"
+echo "[all4_pretrained_vision] CKPT_SELECT_TOP_K=$CKPT_SELECT_TOP_K LIGHT_EVAL_EPISODES=$LIGHT_EVAL_EPISODES FINAL_EVAL_EPISODES=$FINAL_EVAL_EPISODES FINAL_EVAL_MAX_STEPS=$FINAL_EVAL_MAX_STEPS"
 echo "=========================================================="
 
 [[ -d "$FLAT_DIR" ]] || { echo "ERROR: FLAT_DIR missing: $FLAT_DIR" >&2; exit 1; }
@@ -152,6 +155,7 @@ python train.py \
     +trainer.val_check_interval="$VAL_INTERVAL" \
     +trainer.check_val_every_n_epoch=null \
     loader.batch_size="$BATCH_SIZE" \
+    train_split="$TRAIN_SPLIT" \
     seed="$SEED" \
     subdir="" \
     output_model_name=lewm \
@@ -161,13 +165,21 @@ python train.py \
     +visual_tokens.patch_sp_weight="$PATCH_SP_WEIGHT" \
     2>&1 | tee "$TRAIN_LOG"
 
-PICK_JSON="${CKPT_DIR}/ckpt_ce_topk.json"
-PICK_OUT=$(python pick_best_ckpt.py --ckpt-dir "$CKPT_DIR" --top-k "$CKPT_SELECT_TOP_K")
-echo "[all4_pretrained_vision] pick_best_ckpt output:"
-echo "$PICK_OUT"
-echo "$PICK_OUT" > "$PICK_JSON"
+if [[ "$TRAIN_SPLIT" == "1" || "$TRAIN_SPLIT" == "1.0" ]]; then
+    BEST_CKPT="${CKPT_DIR}/lewm_latest_object.ckpt"
+    if [[ ! -f "$BEST_CKPT" ]]; then
+        echo "ERROR: full-train latest checkpoint missing: $BEST_CKPT" >&2
+        exit 2
+    fi
+    echo "[all4_pretrained_vision] full-train mode: skip val-CE/light selection; using $BEST_CKPT"
+else
+    PICK_JSON="${CKPT_DIR}/ckpt_ce_topk.json"
+    PICK_OUT=$(python pick_best_ckpt.py --ckpt-dir "$CKPT_DIR" --top-k "$CKPT_SELECT_TOP_K")
+    echo "[all4_pretrained_vision] pick_best_ckpt output:"
+    echo "$PICK_OUT"
+    echo "$PICK_OUT" > "$PICK_JSON"
 
-mapfile -t CANDIDATE_CKPTS < <(python - "$PICK_JSON" <<'PY'
+    mapfile -t CANDIDATE_CKPTS < <(python - "$PICK_JSON" <<'PY'
 import json
 import sys
 
@@ -181,50 +193,51 @@ for row in data.get("all", []):
         seen.add(ckpt)
         print(ckpt)
 PY
-)
-if [[ "${#CANDIDATE_CKPTS[@]}" -eq 0 ]]; then
-    echo "ERROR: pick_best_ckpt returned no candidate checkpoints" >&2
-    exit 2
-fi
-
-for candidate_ckpt in "${CANDIDATE_CKPTS[@]}"; do
-    if [[ ! -f "$candidate_ckpt" ]]; then
-        echo "ERROR: candidate ckpt missing: $candidate_ckpt" >&2
+    )
+    if [[ "${#CANDIDATE_CKPTS[@]}" -eq 0 ]]; then
+        echo "ERROR: pick_best_ckpt returned no candidate checkpoints" >&2
         exit 2
     fi
-    candidate_stem="$(basename "$candidate_ckpt" .ckpt)"
-    echo "[all4_pretrained_vision] light eval candidate: $candidate_ckpt"
-    for suite in libero_spatial libero_object libero_goal libero_10; do
-        EVAL_LOG="${CKPT_DIR}/light_eval_${candidate_stem}_${suite}.log"
-        PROC_DIR="${PROCESSED_ROOT}/${suite}"
-        [[ -d "$PROC_DIR" ]] || { echo "ERROR: processed suite dir missing: $PROC_DIR" >&2; exit 1; }
-        echo "[all4_pretrained_vision] light eval $suite -> $EVAL_LOG"
-        python eval_libero.py \
-            --checkpoint "$candidate_ckpt" \
-            --tokenizer "$TOKENIZER" \
-            --processed-dir "$PROC_DIR" \
-            --suite "$suite" \
-            --num-episodes "$LIGHT_EVAL_EPISODES" \
-            --max-steps "$LIGHT_EVAL_MAX_STEPS" \
-            --device cuda \
-            --seed "$SEED" \
-            2>&1 | tee "$EVAL_LOG"
-    done
-done
 
-SELECT_JSON="${CKPT_DIR}/ckpt_light_eval_selection.json"
-SELECT_OUT=$(python select_light_eval_ckpt.py \
-    --ckpt-dir "$CKPT_DIR" \
-    --candidates-json "$PICK_JSON" \
-    --out "$SELECT_JSON")
-echo "[all4_pretrained_vision] select_light_eval_ckpt output:"
-echo "$SELECT_OUT"
-BEST_CKPT=$(echo "$SELECT_OUT" | python -c "import sys, json; d=json.load(sys.stdin); print(d.get('top_1') or '')")
-if [[ -z "$BEST_CKPT" || ! -f "$BEST_CKPT" ]]; then
-    echo "ERROR: light rollout selection returned no usable ckpt" >&2
-    exit 2
+    for candidate_ckpt in "${CANDIDATE_CKPTS[@]}"; do
+        if [[ ! -f "$candidate_ckpt" ]]; then
+            echo "ERROR: candidate ckpt missing: $candidate_ckpt" >&2
+            exit 2
+        fi
+        candidate_stem="$(basename "$candidate_ckpt" .ckpt)"
+        echo "[all4_pretrained_vision] light eval candidate: $candidate_ckpt"
+        for suite in libero_spatial libero_object libero_goal libero_10; do
+            EVAL_LOG="${CKPT_DIR}/light_eval_${candidate_stem}_${suite}.log"
+            PROC_DIR="${PROCESSED_ROOT}/${suite}"
+            [[ -d "$PROC_DIR" ]] || { echo "ERROR: processed suite dir missing: $PROC_DIR" >&2; exit 1; }
+            echo "[all4_pretrained_vision] light eval $suite -> $EVAL_LOG"
+            python eval_libero.py \
+                --checkpoint "$candidate_ckpt" \
+                --tokenizer "$TOKENIZER" \
+                --processed-dir "$PROC_DIR" \
+                --suite "$suite" \
+                --num-episodes "$LIGHT_EVAL_EPISODES" \
+                --max-steps "$LIGHT_EVAL_MAX_STEPS" \
+                --device cuda \
+                --seed "$SEED" \
+                2>&1 | tee "$EVAL_LOG"
+        done
+    done
+
+    SELECT_JSON="${CKPT_DIR}/ckpt_light_eval_selection.json"
+    SELECT_OUT=$(python select_light_eval_ckpt.py \
+        --ckpt-dir "$CKPT_DIR" \
+        --candidates-json "$PICK_JSON" \
+        --out "$SELECT_JSON")
+    echo "[all4_pretrained_vision] select_light_eval_ckpt output:"
+    echo "$SELECT_OUT"
+    BEST_CKPT=$(echo "$SELECT_OUT" | python -c "import sys, json; d=json.load(sys.stdin); print(d.get('top_1') or '')")
+    if [[ -z "$BEST_CKPT" || ! -f "$BEST_CKPT" ]]; then
+        echo "ERROR: light rollout selection returned no usable ckpt" >&2
+        exit 2
+    fi
+    echo "[all4_pretrained_vision] best ckpt by light rollout: $BEST_CKPT"
 fi
-echo "[all4_pretrained_vision] best ckpt by light rollout: $BEST_CKPT"
 
 for suite in libero_spatial libero_object libero_goal libero_10; do
     EVAL_LOG="${CKPT_DIR}/eval_${suite}.log"
@@ -237,7 +250,7 @@ for suite in libero_spatial libero_object libero_goal libero_10; do
         --processed-dir "$PROC_DIR" \
         --suite "$suite" \
         --num-episodes "$FINAL_EVAL_EPISODES" \
-        --max-steps 300 \
+        --max-steps "$FINAL_EVAL_MAX_STEPS" \
         --device cuda \
         --seed "$SEED" \
         2>&1 | tee "$EVAL_LOG"

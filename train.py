@@ -492,6 +492,13 @@ def run(cfg):
 
     train_set = torch.utils.data.Subset(dataset, train_indices)
     val_set = torch.utils.data.Subset(dataset, val_indices)
+    has_validation = len(val_indices) > 0
+    if not has_validation:
+        print(
+            "[Split] train_split produced 0 validation chunks; running in "
+            "full-train mode with no validation loader. Object checkpoints "
+            "will be ranked by training step."
+        )
 
     # In overfit mode, keep every sample each epoch — drop_last=True could
     # discard the only batch when the sample count is smaller than batch_size.
@@ -527,8 +534,12 @@ def run(cfg):
             drop_last=train_drop_last,
             generator=rnd_gen,
         )
-    val = torch.utils.data.DataLoader(
-        val_set, **cfg.loader, shuffle=False, drop_last=False
+    val = (
+        torch.utils.data.DataLoader(
+            val_set, **cfg.loader, shuffle=False, drop_last=False
+        )
+        if has_validation
+        else None
     )
 
     ##############################
@@ -712,6 +723,8 @@ def run(cfg):
         epoch_interval=1,
         step_interval=step_save_interval,
         top_k=int(cfg.get("ckpt_top_k", 3)),
+        save_on_train_step_end=not has_validation,
+        rank_by_step=not has_validation,
     )
 
     callbacks = [object_dump_callback]
@@ -732,7 +745,7 @@ def run(cfg):
     trainer = pl.Trainer(
         **cfg.trainer,
         callbacks=callbacks,
-        num_sanity_val_steps=1,
+        num_sanity_val_steps=1 if has_validation else 0,
         logger=logger,
         enable_checkpointing=True,
     )

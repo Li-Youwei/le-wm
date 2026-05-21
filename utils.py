@@ -30,6 +30,8 @@ class ModelObjectCallBack(Callback):
         epoch_interval: int = 1,
         step_interval: int | None = None,
         top_k: int = 3,
+        save_on_train_step_end: bool = False,
+        rank_by_step: bool = False,
     ):
         super().__init__()
         self.dirpath = Path(dirpath)
@@ -37,6 +39,8 @@ class ModelObjectCallBack(Callback):
         self.epoch_interval = epoch_interval
         self.step_interval = step_interval
         self.top_k = max(1, int(top_k))
+        self.save_on_train_step_end = bool(save_on_train_step_end)
+        self.rank_by_step = bool(rank_by_step)
         # (score, step, path) — kept sorted by score ascending; lower CE = better.
         self._top_k_heap: list[tuple[float, int, Path]] = []
 
@@ -62,8 +66,32 @@ class ModelObjectCallBack(Callback):
     def on_validation_end(self, trainer, pl_module):
         if self.step_interval is None:
             return
+        if self.save_on_train_step_end:
+            return
         if not trainer.is_global_zero:
             return
+        self._save_step_checkpoint(trainer, pl_module)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if self.step_interval is None or not self.save_on_train_step_end:
+            return
+        if not trainer.is_global_zero:
+            return
+        step = int(trainer.global_step)
+        if step == 0 or step % int(self.step_interval) != 0:
+            return
+        self._save_step_checkpoint(trainer, pl_module)
+
+    def on_train_end(self, trainer, pl_module):
+        if self.step_interval is None or not self.save_on_train_step_end:
+            return
+        if not trainer.is_global_zero:
+            return
+        # Ensure non-multiple max_steps runs still leave an eval-ready final
+        # object checkpoint.
+        self._save_step_checkpoint(trainer, pl_module)
+
+    def _save_step_checkpoint(self, trainer, pl_module) -> None:
         step = int(trainer.global_step)
         # Skip Lightning's sanity-check validation pass (step==0).
         if step == 0:
@@ -72,10 +100,13 @@ class ModelObjectCallBack(Callback):
         # if the TaskBalancedCEMetric callback hasn't fired yet (e.g., very
         # first val pass).
         metrics = trainer.callback_metrics
-        score_val = metrics.get("validate/ce_loss_taskbal")
-        if score_val is None:
-            score_val = metrics.get("validate/ce_loss_epoch")
-        score = float(score_val) if score_val is not None else float("inf")
+        if self.rank_by_step:
+            score = -float(step)
+        else:
+            score_val = metrics.get("validate/ce_loss_taskbal")
+            if score_val is None:
+                score_val = metrics.get("validate/ce_loss_epoch")
+            score = float(score_val) if score_val is not None else float("inf")
 
         path = self.dirpath / f"{self.filename}_step_{step}_object.ckpt"
         self._dump_model(pl_module.model, path)
@@ -88,6 +119,9 @@ class ModelObjectCallBack(Callback):
         self._refresh_latest_link()
 
     def _update_top_k(self, score: float, step: int, path: Path) -> None:
+        self._top_k_heap = [
+            entry for entry in self._top_k_heap if entry[2] != path
+        ]
         self._top_k_heap.append((score, step, path))
         # Sort ascending — worst (highest CE) at the end.
         self._top_k_heap.sort(key=lambda x: (x[0], x[1]))
