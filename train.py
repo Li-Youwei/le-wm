@@ -717,6 +717,12 @@ def run(cfg):
         if (max_steps_cfg > 0 and val_check_int is not None)
         else None
     )
+    if not has_validation:
+        # stable_pretraining.DataModule permits val=None only when Lightning
+        # never requests val_dataloader(). Keep step_save_interval above for
+        # train-step checkpointing, but disable Lightning validation itself.
+        OmegaConf.update(cfg, "trainer.val_check_interval", 0, merge=False)
+        OmegaConf.update(cfg, "trainer.limit_val_batches", 0, force_add=True)
     object_dump_callback = ModelObjectCallBack(
         dirpath=run_dir,
         filename=cfg.output_model_name,
