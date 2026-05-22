@@ -22,6 +22,13 @@ class RepositoryContractsTest(unittest.TestCase):
         script_text = (ROOT / "run_all4_pretrained_vision.sh").read_text()
         self.assertIn("scheduler.warmup_steps", script_text)
 
+    def test_pretrained_vision_runner_declares_visual257_depth_defaults(self) -> None:
+        script_text = (ROOT / "run_all4_pretrained_vision.sh").read_text()
+        self.assertIn("all4_sp_sigreg_dinov2_frozen_visual257_patch_sp)", script_text)
+        self.assertIn("POOL_GRID_DEFAULT=16", script_text)
+        self.assertIn("PREDICTOR_DEPTH_DEFAULT=12", script_text)
+        self.assertIn('predictor.depth="$PREDICTOR_DEPTH"', script_text)
+
     def test_saved_fast_tokenizer_patch_copies_processor_module_fallback(self) -> None:
         source = (ROOT / "preprocess_libero.py").read_text()
         self.assertIn("tokenizer: Any | None = None", source)

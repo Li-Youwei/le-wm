@@ -11,6 +11,7 @@ case "$ARM" in
     NORM=layer
     STATE_ARCH_DEFAULT=shared
     POOL_GRID_DEFAULT=0
+    PREDICTOR_DEPTH_DEFAULT=6
     PATCH_SP_DEFAULT=false
     ;;
   all4_dinov2_frozen_visual17)
@@ -19,6 +20,16 @@ case "$ARM" in
     NORM=layer
     STATE_ARCH_DEFAULT=shared
     POOL_GRID_DEFAULT=4
+    PREDICTOR_DEPTH_DEFAULT=6
+    PATCH_SP_DEFAULT=false
+    ;;
+  all4_dinov2_frozen_visual257)
+    PRED=0
+    SIGREG=0
+    NORM=layer
+    STATE_ARCH_DEFAULT=shared
+    POOL_GRID_DEFAULT=16
+    PREDICTOR_DEPTH_DEFAULT=12
     PATCH_SP_DEFAULT=false
     ;;
   all4_sp_sigreg_dinov2_frozen)
@@ -27,6 +38,7 @@ case "$ARM" in
     NORM=batch
     STATE_ARCH_DEFAULT=shared
     POOL_GRID_DEFAULT=0
+    PREDICTOR_DEPTH_DEFAULT=6
     PATCH_SP_DEFAULT=false
     ;;
   all4_sp_sigreg_dinov2_frozen_visual17)
@@ -35,6 +47,16 @@ case "$ARM" in
     NORM=batch
     STATE_ARCH_DEFAULT=shared
     POOL_GRID_DEFAULT=4
+    PREDICTOR_DEPTH_DEFAULT=6
+    PATCH_SP_DEFAULT=false
+    ;;
+  all4_sp_sigreg_dinov2_frozen_visual257)
+    PRED=1.0
+    SIGREG=0.1
+    NORM=batch
+    STATE_ARCH_DEFAULT=shared
+    POOL_GRID_DEFAULT=16
+    PREDICTOR_DEPTH_DEFAULT=12
     PATCH_SP_DEFAULT=false
     ;;
   all4_sp_sigreg_dinov2_frozen_visual17_sep_proj)
@@ -43,6 +65,16 @@ case "$ARM" in
     NORM=batch
     STATE_ARCH_DEFAULT=shared
     POOL_GRID_DEFAULT=4
+    PREDICTOR_DEPTH_DEFAULT=6
+    PATCH_SP_DEFAULT=false
+    ;;
+  all4_sp_sigreg_dinov2_frozen_visual257_sep_proj)
+    PRED=1.0
+    SIGREG=0.1
+    NORM=batch
+    STATE_ARCH_DEFAULT=shared
+    POOL_GRID_DEFAULT=16
+    PREDICTOR_DEPTH_DEFAULT=12
     PATCH_SP_DEFAULT=false
     ;;
   all4_sp_sigreg_dinov2_frozen_visual17_patch_sp)
@@ -51,6 +83,16 @@ case "$ARM" in
     NORM=batch
     STATE_ARCH_DEFAULT=shared
     POOL_GRID_DEFAULT=4
+    PREDICTOR_DEPTH_DEFAULT=6
+    PATCH_SP_DEFAULT=true
+    ;;
+  all4_sp_sigreg_dinov2_frozen_visual257_patch_sp)
+    PRED=1.0
+    SIGREG=0.1
+    NORM=batch
+    STATE_ARCH_DEFAULT=shared
+    POOL_GRID_DEFAULT=16
+    PREDICTOR_DEPTH_DEFAULT=12
     PATCH_SP_DEFAULT=true
     ;;
   all4_sp_sigreg_dinov2_frozen_visual17_patch_sp_mot)
@@ -59,6 +101,16 @@ case "$ARM" in
     NORM=batch
     STATE_ARCH_DEFAULT=mot
     POOL_GRID_DEFAULT=4
+    PREDICTOR_DEPTH_DEFAULT=6
+    PATCH_SP_DEFAULT=true
+    ;;
+  all4_sp_sigreg_dinov2_frozen_visual257_patch_sp_mot)
+    PRED=1.0
+    SIGREG=0.1
+    NORM=batch
+    STATE_ARCH_DEFAULT=mot
+    POOL_GRID_DEFAULT=16
+    PREDICTOR_DEPTH_DEFAULT=12
     PATCH_SP_DEFAULT=true
     ;;
   all4_sp_sigreg_dinov2_frozen_mot)
@@ -67,11 +119,12 @@ case "$ARM" in
     NORM=batch
     STATE_ARCH_DEFAULT=mot
     POOL_GRID_DEFAULT=0
+    PREDICTOR_DEPTH_DEFAULT=6
     PATCH_SP_DEFAULT=false
     ;;
   *)
     echo "Unknown ARM: $ARM" >&2
-    echo "Expected all4_dinov2_frozen|all4_dinov2_frozen_visual17|all4_sp_sigreg_dinov2_frozen|all4_sp_sigreg_dinov2_frozen_visual17|all4_sp_sigreg_dinov2_frozen_visual17_sep_proj|all4_sp_sigreg_dinov2_frozen_visual17_patch_sp|all4_sp_sigreg_dinov2_frozen_visual17_patch_sp_mot|all4_sp_sigreg_dinov2_frozen_mot" >&2
+    echo "Expected all4_dinov2_frozen|all4_dinov2_frozen_visual17|all4_dinov2_frozen_visual257|all4_sp_sigreg_dinov2_frozen|all4_sp_sigreg_dinov2_frozen_visual17|all4_sp_sigreg_dinov2_frozen_visual257|all4_sp_sigreg_dinov2_frozen_visual17_sep_proj|all4_sp_sigreg_dinov2_frozen_visual257_sep_proj|all4_sp_sigreg_dinov2_frozen_visual17_patch_sp|all4_sp_sigreg_dinov2_frozen_visual257_patch_sp|all4_sp_sigreg_dinov2_frozen_visual17_patch_sp_mot|all4_sp_sigreg_dinov2_frozen_visual257_patch_sp_mot|all4_sp_sigreg_dinov2_frozen_mot" >&2
     exit 1
     ;;
 esac
@@ -83,6 +136,7 @@ WARMUP_STEPS="${WARMUP_STEPS:-2000}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 STATE_ARCH="${STATE_ARCH:-$STATE_ARCH_DEFAULT}"
 POOL_GRID="${POOL_GRID:-$POOL_GRID_DEFAULT}"
+PREDICTOR_DEPTH="${PREDICTOR_DEPTH:-$PREDICTOR_DEPTH_DEFAULT}"
 PATCH_SP="${PATCH_SP:-$PATCH_SP_DEFAULT}"
 PATCH_SP_WEIGHT="${PATCH_SP_WEIGHT:-1.0}"
 CKPT_SELECT_TOP_K="${CKPT_SELECT_TOP_K:-3}"
@@ -111,7 +165,7 @@ conda activate vla
 echo "=========================================================="
 echo "[all4_pretrained_vision] ARM=$ARM STATE_ARCH=$STATE_ARCH SEED=$SEED MAX_STEPS=$MAX_STEPS"
 echo "[all4_pretrained_vision] PRED=$PRED SIGREG=$SIGREG NORM=$NORM"
-echo "[all4_pretrained_vision] POOL_GRID=$POOL_GRID PATCH_SP=$PATCH_SP PATCH_SP_WEIGHT=$PATCH_SP_WEIGHT"
+echo "[all4_pretrained_vision] POOL_GRID=$POOL_GRID PREDICTOR_DEPTH=$PREDICTOR_DEPTH PATCH_SP=$PATCH_SP PATCH_SP_WEIGHT=$PATCH_SP_WEIGHT"
 echo "[all4_pretrained_vision] FLAT_DIR=$FLAT_DIR"
 echo "[all4_pretrained_vision] TOKENIZER=$TOKENIZER"
 echo "[all4_pretrained_vision] PROCESSED_ROOT=$PROCESSED_ROOT"
@@ -149,6 +203,7 @@ python train.py \
     loss.pred_weight="$PRED" \
     loss.sigreg_weight="$SIGREG" \
     predictor.state_prediction_arch="$STATE_ARCH" \
+    predictor.depth="$PREDICTOR_DEPTH" \
     projector.norm_type="$NORM" \
     scheduler.warmup_steps="$WARMUP_STEPS" \
     trainer.devices=1 \
