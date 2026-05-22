@@ -77,13 +77,11 @@ class LiberoDataset(Dataset):
         max_action_tokens: int = 80,
         max_lang_tokens: int = 25,
         img_size: int = 224,
-        use_language: bool = True,
         use_state_prediction: bool = False,
     ):
         self.max_action_tokens = max_action_tokens
         self.max_lang_tokens = max_lang_tokens
         self.img_size = img_size
-        self.use_language = use_language
         self.use_state_prediction = use_state_prediction
 
         # Discover all HDF5 files and build a global index
@@ -100,10 +98,8 @@ class LiberoDataset(Dataset):
             fpath: i for i, fpath in enumerate(self.files)
         }
 
-        # T5 tokenizer (only when language is enabled)
-        self.t5_tokenizer = (
-            T5Tokenizer.from_pretrained("t5-small") if use_language else None
-        )
+        # T5 tokenizer
+        self.t5_tokenizer = T5Tokenizer.from_pretrained("t5-small")
 
         # Pre-tokenize language instructions (one per file) and build global index
         self._index: list[tuple[Path, int]] = []
@@ -166,30 +162,26 @@ class LiberoDataset(Dataset):
                         "an inconsistent file."
                     )
 
-                # Read language instruction only if needed
-                if use_language:
-                    lang_str = f.attrs.get("language_instruction", "")
-                    if not lang_str:
-                        logger.warning(
-                            "No language_instruction attr in %s, using empty string",
-                            fpath.name,
-                        )
-                else:
-                    lang_str = None
+                # Read language instruction
+                lang_str = f.attrs.get("language_instruction", "")
+                if not lang_str:
+                    logger.warning(
+                        "No language_instruction attr in %s, using empty string",
+                        fpath.name,
+                    )
 
-            # Tokenize language instruction only if needed
-            if use_language:
-                tok_out = self.t5_tokenizer(
-                    lang_str,
-                    max_length=self.max_lang_tokens,
-                    padding="max_length",
-                    truncation=True,
-                    return_tensors="pt",
-                )
-                self._lang_cache[fpath] = (
-                    tok_out["input_ids"].squeeze(0),  # (max_lang_tokens,) long
-                    tok_out["attention_mask"].squeeze(0),  # (max_lang_tokens,) long
-                )
+            # Tokenize language instruction
+            tok_out = self.t5_tokenizer(
+                lang_str,
+                max_length=self.max_lang_tokens,
+                padding="max_length",
+                truncation=True,
+                return_tensors="pt",
+            )
+            self._lang_cache[fpath] = (
+                tok_out["input_ids"].squeeze(0),  # (max_lang_tokens,) long
+                tok_out["attention_mask"].squeeze(0),  # (max_lang_tokens,) long
+            )
 
             # Per-task / per-demo counters from demo_arr.
             unique_demos, counts = np.unique(demo_arr, return_counts=True)
@@ -247,14 +239,6 @@ class LiberoDataset(Dataset):
         fast_tokens = np.full(self.max_action_tokens, PAD_TOKEN_ID, dtype=np.int64)
         fast_tokens[:token_len] = raw_tokens[:token_len]
 
-        # Direct gripper-command supervision target — bypasses FAST tokenization
-        # to give the gripper dim a clean signal that doesn't get diluted by the
-        # 6 spatial dims when FAST jointly BPE-encodes them.
-        # `continuous_actions` is normalized to [-1, 1] per task; for gripper
-        # (dim 6) low=-1, high=+1, so the normalization is identity and the
-        # stored values are already the raw OSC gripper command per step.
-        grip_seq = np.array(f["continuous_actions"][local_idx, :, 6], dtype=np.float32)
-
         item = {
             "pixels_agent": img_agent,  # (3, 224, 224)
             "pixels_hand": img_hand,  # (3, 224, 224)
@@ -265,14 +249,12 @@ class LiberoDataset(Dataset):
                 self._file_to_task_id[fpath],
                 dtype=torch.long,
             ),  # scalar — index into sorted(self.files), stable across runs
-            "gripper_seq": torch.from_numpy(grip_seq),  # (H,) [-1, 1]
         }
 
-        # Language tokens (only when enabled)
-        if self.use_language:
-            lang_ids, lang_mask = self._lang_cache[fpath]
-            item["lang_input_ids"] = lang_ids  # (max_lang_tokens,)
-            item["lang_attention_mask"] = lang_mask  # (max_lang_tokens,)
+        # Language tokens
+        lang_ids, lang_mask = self._lang_cache[fpath]
+        item["lang_input_ids"] = lang_ids  # (max_lang_tokens,)
+        item["lang_attention_mask"] = lang_mask  # (max_lang_tokens,)
 
         # Future-frame state-prediction targets (only when enabled).
         # Existence was asserted in __init__; here we just read them.

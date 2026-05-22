@@ -324,8 +324,6 @@ class ARPredictor(nn.Module):
         state_head_norm_type: str = "layer",
         n_visual_tokens_per_view: int = 1,
         visual_pool_grid: int = 0,
-        use_gripper_aux: bool = False,
-        gripper_chunk_size: int = 20,
         use_mot: bool = False,
     ):
         super().__init__()
@@ -404,29 +402,6 @@ class ARPredictor(nn.Module):
 
         # Action classification head: predict vocab 0..1025 (PAD excluded from targets)
         self.action_head = nn.Linear(embed_dim, ACTION_HEAD_SIZE)
-
-        # Auxiliary gripper-command head. When enabled, predicts a (H,)
-        # gripper sequence directly from the BOS hidden state via a small MLP,
-        # bypassing FAST tokenization. Designed to give the gripper dim a clean
-        # signal that doesn't get diluted by the 6 spatial dims under FAST's
-        # joint BPE. Diagnostic on 4-suite sp_sigreg showed predicted gripper
-        # command oscillating ±1 (correct GT is constant -1 for early chunks)
-        # → bypass-with-direct-regression head is the surgical fix.
-        # The head reads `x[:, n_prefix]` (BOS position): BOS attends only to
-        # the prefix (lang + visual + proprio) under our causal mask, so the
-        # head's input is identical at train (full sequence) and inference
-        # (prefix-only forward) — no exposure-bias mismatch.
-        self.use_gripper_aux = use_gripper_aux
-        self.gripper_chunk_size = int(gripper_chunk_size)
-        if use_gripper_aux:
-            # Tanh output → guaranteed [-1, 1] range matching OSC gripper cmd.
-            self.gripper_aux_head = nn.Sequential(
-                nn.Linear(embed_dim, embed_dim * 2),
-                nn.GELU(),
-                nn.Dropout(dropout),
-                nn.Linear(embed_dim * 2, self.gripper_chunk_size),
-                nn.Tanh(),
-            )
 
         # State-prediction read-out (only when enabled).
         # Per LeWM paper Section 3: "The predictor is also followed by a
@@ -536,11 +511,9 @@ class ARPredictor(nn.Module):
         # --- Determine which positions are real (not padding) ---
         is_real = torch.zeros(B, L, dtype=torch.bool, device=device)
 
-        # Language: real if position < lang_lengths[b] (skipped when no language)
-        if n_lang > 0:
-            assert lang_lengths is not None, "lang_lengths required when n_lang > 0"
-            lang_pos = pos[:n_lang].unsqueeze(0).expand(B, -1)  # (B, n_lang)
-            is_real[:, :n_lang] = lang_pos < lang_lengths.unsqueeze(1)
+        # Language: real if position < lang_lengths[b]
+        lang_pos = pos[:n_lang].unsqueeze(0).expand(B, -1)  # (B, n_lang)
+        is_real[:, :n_lang] = lang_pos < lang_lengths.unsqueeze(1)
 
         # z_agent, z_hand, z_proprio: always real
         is_real[:, n_lang:n_prefix] = True
@@ -615,8 +588,7 @@ class ARPredictor(nn.Module):
         """Build (B, L) modality_ids for MoT routing.
 
         Modality assignment is by absolute position (deterministic, no learned
-        gating), matching the sequence layout used by forward() / generate() /
-        predict_gripper_aux():
+        gating), matching the sequence layout used by forward() / generate():
             0 = prefix  (lang + visual + proprio)
             1 = action  (BOS + action tokens + PAD)
             2 = state-query  (Q_ag, Q_hd, Q_pr) — only when has_query is True
@@ -657,8 +629,6 @@ class ARPredictor(nn.Module):
             [lang..., z_ag, z_hd, z_pr, BOS, T_1, T_2, ...]
         All action tokens are real (no PAD), but language may still have padding.
 
-        When n_lang == 0 the language block is skipped entirely.
-
         Returns: (B, 1, L, L) bool mask.
         """
         nv = self.n_visual_per_view
@@ -667,11 +637,9 @@ class ARPredictor(nn.Module):
 
         # Real positions: language real + visual/proprio always real + all action real
         is_real = torch.ones(B, L, dtype=torch.bool, device=device)
-        # Mask out language padding (skipped when no language)
-        if n_lang > 0:
-            assert lang_lengths is not None, "lang_lengths required when n_lang > 0"
-            lang_pos = pos[:n_lang].unsqueeze(0).expand(B, -1)
-            is_real[:, :n_lang] = lang_pos < lang_lengths.unsqueeze(1)
+        # Mask out language padding
+        lang_pos = pos[:n_lang].unsqueeze(0).expand(B, -1)
+        is_real[:, :n_lang] = lang_pos < lang_lengths.unsqueeze(1)
 
         in_prefix = pos < n_prefix  # (L,)
 
@@ -699,8 +667,8 @@ class ARPredictor(nn.Module):
         z_agent: torch.Tensor,
         z_hand: torch.Tensor,
         z_proprio_raw: torch.Tensor,
-        lang_embeds: torch.Tensor | None,
-        lang_lengths: torch.Tensor | None,
+        lang_embeds: torch.Tensor,
+        lang_lengths: torch.Tensor,
         action_tokens: torch.Tensor,
         action_lengths: torch.Tensor,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
@@ -730,7 +698,7 @@ class ARPredictor(nn.Module):
         """
         B = z_agent.size(0)
         device = z_agent.device
-        n_lang = lang_embeds.size(1) if lang_embeds is not None else 0
+        n_lang = lang_embeds.size(1)
 
         # Accept either (B, D) — legacy CLS-only encoder output — or (B, N, D)
         # multi-token output from the CLS+pooled-patches encoder. Normalize to
@@ -775,15 +743,10 @@ class ARPredictor(nn.Module):
             z_proprio.unsqueeze(1) + self.type_embedding.weight[2]
         )  # (B, 1, D)
 
-        if lang_embeds is not None:
-            lang_prefix = lang_embeds + self.type_embedding.weight[0]  # (B, n_lang, D)
-            prefix = torch.cat(
-                [lang_prefix, vis_agent, vis_hand, proprio_emb], dim=1
-            )  # (B, n_lang + 2*nv + 1, D)
-        else:
-            prefix = torch.cat(
-                [vis_agent, vis_hand, proprio_emb], dim=1
-            )  # (B, 2*nv + 1, D)
+        lang_prefix = lang_embeds + self.type_embedding.weight[0]  # (B, n_lang, D)
+        prefix = torch.cat(
+            [lang_prefix, vis_agent, vis_hand, proprio_emb], dim=1
+        )  # (B, n_lang + 2*nv + 1, D)
 
         # 3. Build action embeddings (BOS + action tokens) with type embedding
         bos = torch.full((B, 1), BOS_TOKEN_ID, dtype=torch.long, device=device)
@@ -834,18 +797,7 @@ class ARPredictor(nn.Module):
             action_output
         )  # (B, 1+max_action_tokens, ACTION_HEAD_SIZE)
 
-        # 8b. Optional gripper-aux read-out from BOS hidden state.
-        # x[:, n_prefix] is BOS — under our causal mask it only attends to the
-        # prefix tokens (lang+visual+proprio), so this is identical to the
-        # value the aux head sees during inference where no action tokens have
-        # been emitted yet.
-        pred_grip = None
-        if self.use_gripper_aux:
-            pred_grip = self.gripper_aux_head(x[:, n_prefix])  # (B, gripper_chunk_size)
-
         if not self.use_state_prediction:
-            if self.use_gripper_aux:
-                return action_logits, pred_grip
             return action_logits
 
         # 9. Read out the three STATE_QUERY positions and run them through
@@ -865,8 +817,6 @@ class ARPredictor(nn.Module):
         )  # (B, nv, D)
         pred_pr = self.state_pred_head_pr(q_out[:, 2])  # (B, proprio_dim)
 
-        if self.use_gripper_aux:
-            return action_logits, pred_ag, pred_hd, pred_pr, pred_grip
         return action_logits, pred_ag, pred_hd, pred_pr
 
     @torch.no_grad()
@@ -875,15 +825,14 @@ class ARPredictor(nn.Module):
         z_agent: torch.Tensor,
         z_hand: torch.Tensor,
         z_proprio_raw: torch.Tensor,
-        lang_embeds: torch.Tensor | None,
-        lang_lengths: torch.Tensor | None,
+        lang_embeds: torch.Tensor,
+        lang_lengths: torch.Tensor,
         max_len: int = 80,
         temperature: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
         """Autoregressively generate FAST action tokens.
 
         Sequence grows as [lang..., z_ag, z_hd, z_pr, BOS, T_1, T_2, ...]
-        (language segment absent when lang_embeds is None).
         Prefix uses bidirectional attention, action tokens use causal.
         Stops at EOS or max_len.
 
@@ -893,7 +842,7 @@ class ARPredictor(nn.Module):
         """
         B = z_agent.size(0)
         device = z_agent.device
-        n_lang = lang_embeds.size(1) if lang_embeds is not None else 0
+        n_lang = lang_embeds.size(1)
 
         # Normalize visual input layout (same handling as forward()).
         if z_agent.dim() == 2:
@@ -924,11 +873,8 @@ class ARPredictor(nn.Module):
             vis_hand[:, 1:] = vis_hand[:, 1:] + hand_pos_2d.unsqueeze(0)
         proprio_emb = z_proprio.unsqueeze(1) + self.type_embedding.weight[2]
 
-        if lang_embeds is not None:
-            lang_prefix = lang_embeds + self.type_embedding.weight[0]
-            prefix = torch.cat([lang_prefix, vis_agent, vis_hand, proprio_emb], dim=1)
-        else:
-            prefix = torch.cat([vis_agent, vis_hand, proprio_emb], dim=1)
+        lang_prefix = lang_embeds + self.type_embedding.weight[0]
+        prefix = torch.cat([lang_prefix, vis_agent, vis_hand, proprio_emb], dim=1)
 
         # 2. BOS token
         bos_ids = torch.full((B, 1), BOS_TOKEN_ID, dtype=torch.long, device=device)
@@ -1016,79 +962,3 @@ class ARPredictor(nn.Module):
                 tokens[i, :k] = raw_tokens[i, :k]
 
         return tokens, lengths
-
-    @torch.no_grad()
-    def predict_gripper_aux(
-        self,
-        z_agent: torch.Tensor,
-        z_hand: torch.Tensor,
-        z_proprio_raw: torch.Tensor,
-        lang_embeds: torch.Tensor | None,
-        lang_lengths: torch.Tensor | None,
-    ) -> torch.Tensor:
-        """Inference-time read-out of the gripper aux head.
-
-        Runs a prefix+BOS-only forward (no action tokens emitted yet) and
-        reads the BOS hidden state through ``self.gripper_aux_head``. Under
-        our causal attention mask BOS only attends to prefix tokens
-        (lang + visual + proprio), so this hidden state is identical to the
-        value the head sees during teacher-forcing training — no exposure-
-        bias mismatch.
-        """
-        if not self.use_gripper_aux:
-            raise RuntimeError(
-                "predict_gripper_aux() called but use_gripper_aux=False."
-            )
-
-        B = z_agent.size(0)
-        device = z_agent.device
-        n_lang = lang_embeds.size(1) if lang_embeds is not None else 0
-
-        if z_agent.dim() == 2:
-            z_agent = z_agent.unsqueeze(1)
-        if z_hand.dim() == 2:
-            z_hand = z_hand.unsqueeze(1)
-        nv = z_agent.size(1)
-        if nv != self.n_visual_per_view:
-            raise ValueError(
-                f"ARPredictor.predict_gripper_aux got z_agent with N_visual="
-                f"{nv}, but the predictor was constructed with "
-                f"n_visual_per_view={self.n_visual_per_view}."
-            )
-
-        z_proprio = self.proprio_encoder(z_proprio_raw)
-        vis_agent = z_agent + self.type_embedding.weight[1]
-        vis_hand = z_hand + self.type_embedding.weight[1]
-        if nv > 1:
-            G = self.visual_pool_grid
-            vis_agent = vis_agent + self.view_embedding.weight[0].view(1, 1, -1)
-            vis_hand = vis_hand + self.view_embedding.weight[1].view(1, 1, -1)
-            agent_pos_2d = self.agent_patch_2d_pos.view(G * G, -1)
-            hand_pos_2d = self.hand_patch_2d_pos.view(G * G, -1)
-            vis_agent = vis_agent.clone()
-            vis_hand = vis_hand.clone()
-            vis_agent[:, 1:] = vis_agent[:, 1:] + agent_pos_2d.unsqueeze(0)
-            vis_hand[:, 1:] = vis_hand[:, 1:] + hand_pos_2d.unsqueeze(0)
-        proprio_emb = z_proprio.unsqueeze(1) + self.type_embedding.weight[2]
-
-        if lang_embeds is not None:
-            lang_prefix = lang_embeds + self.type_embedding.weight[0]
-            prefix = torch.cat([lang_prefix, vis_agent, vis_hand, proprio_emb], dim=1)
-        else:
-            prefix = torch.cat([vis_agent, vis_hand, proprio_emb], dim=1)
-
-        bos_ids = torch.full((B, 1), BOS_TOKEN_ID, dtype=torch.long, device=device)
-        bos_emb = self.action_embedding(bos_ids) + self.type_embedding.weight[3]
-        seq = torch.cat([prefix, bos_emb], dim=1)  # (B, n_prefix+1, D)
-
-        L = seq.size(1)
-        x = seq + self.pos_embedding[:, :L]
-        attn_mask = self._build_generate_mask(n_lang, lang_lengths, B, L, device)
-        modality_ids = self._build_modality_ids(n_lang, L, B, device, has_query=False)
-
-        for block in self.blocks:
-            x = block(x, attn_mask=attn_mask, modality_ids=modality_ids)
-        x = self.norm(x)
-
-        n_prefix = n_lang + 2 * nv + 1
-        return self.gripper_aux_head(x[:, n_prefix])  # (B, gripper_chunk_size)

@@ -37,9 +37,7 @@ def lejepa_forward(self, batch, stage, cfg):
     loss_cfg = cfg.get("loss", {}) or {}
     pred_weight = float(loss_cfg.get("pred_weight", 0.0))
     sigreg_weight = float(loss_cfg.get("sigreg_weight", 0.0))
-    gripper_aux_weight = float(loss_cfg.get("gripper_aux_weight", 0.0))
     use_state_pred = pred_weight > 0
-    use_gripper_aux = gripper_aux_weight > 0
 
     # Pre-initialize future-frame latents so the SIGReg block can reference
     # them unconditionally without static-analysis warnings, and so the
@@ -56,11 +54,10 @@ def lejepa_forward(self, batch, stage, cfg):
     fast_tokens = batch["fast_tokens"]  # (B, max_action_tokens)
     fast_lengths = batch["fast_lengths"]  # (B,)
 
-    # Language batch fields may be absent in no-language ablation runs
-    lang_ids = batch.get("lang_input_ids", None)  # (B, max_lang_tokens) or None
-    lang_mask = batch.get("lang_attention_mask", None)  # (B, max_lang_tokens) or None
+    lang_ids = batch["lang_input_ids"]  # (B, max_lang_tokens)
+    lang_mask = batch["lang_attention_mask"]  # (B, max_lang_tokens)
 
-    # 2. Encode visual + language (language skipped when lang_ids is None)
+    # 2. Encode visual + language
     z_agent, z_hand, lang_embeds, lang_lengths = self.model.encode(
         pixels_agent,
         pixels_hand,
@@ -78,18 +75,11 @@ def lejepa_forward(self, batch, stage, cfg):
         fast_tokens,
         fast_lengths,
     )
-    # Unpack predictor output. Shape depends on (use_state_pred, use_gripper_aux):
-    #   (F, F) → action_logits
-    #   (F, T) → (action_logits, pred_grip)
-    #   (T, F) → (action_logits, pred_ag, pred_hd, pred_pr)
-    #   (T, T) → (action_logits, pred_ag, pred_hd, pred_pr, pred_grip)
-    pred_grip = None
-    if use_state_pred and use_gripper_aux:
-        action_logits, pred_ag, pred_hd, pred_pr, pred_grip = pred_out
-    elif use_state_pred:
+    # Unpack predictor output. Shape depends on use_state_pred:
+    #   F → action_logits
+    #   T → (action_logits, pred_ag, pred_hd, pred_pr)
+    if use_state_pred:
         action_logits, pred_ag, pred_hd, pred_pr = pred_out
-    elif use_gripper_aux:
-        action_logits, pred_grip = pred_out
     else:
         action_logits = pred_out
 
@@ -195,16 +185,6 @@ def lejepa_forward(self, batch, stage, cfg):
         output["sigreg_loss"] = self.sigreg(sigreg_input)
         total_loss = total_loss + sigreg_weight * output["sigreg_loss"]
 
-    # 7b. Gripper auxiliary loss. Direct (H,) regression against the
-    # already-normalized gripper command sequence from the dataset. The
-    # gripper dim in continuous_actions is in [-1, 1] (low=-1, high=+1 for
-    # that channel), matching the Tanh output range of the aux head, so the
-    # MSE is well-scaled with no extra normalization.
-    if use_gripper_aux:
-        gripper_seq = batch["gripper_seq"]  # (B, H) float32 in [-1, 1]
-        output["gripper_aux_loss"] = F.mse_loss(pred_grip, gripper_seq)
-        total_loss = total_loss + gripper_aux_weight * output["gripper_aux_loss"]
-
     output["loss"] = total_loss
 
     # 8. Token accuracy (diagnostic)
@@ -228,8 +208,6 @@ def lejepa_forward(self, batch, stage, cfg):
         log_dict[f"{stage}/pred_loss_pr"] = output["pred_loss_pr"].detach()
     if "sigreg_loss" in output:
         log_dict[f"{stage}/sigreg_loss"] = output["sigreg_loss"].detach()
-    if "gripper_aux_loss" in output:
-        log_dict[f"{stage}/gripper_aux_loss"] = output["gripper_aux_loss"].detach()
     # Log learning rate if available
     if hasattr(self, "trainer") and self.trainer is not None:
         opts = self.trainer.optimizers
@@ -281,7 +259,6 @@ def run(cfg):
     max_action_tokens = cfg.data.dataset.get("max_action_tokens", 80)
     max_lang_tokens = cfg.data.dataset.get("max_lang_tokens", 25)
     proprio_dim = cfg.data.dataset.get("proprio_dim", 9)
-    use_language = cfg.data.dataset.get("use_language", True)
 
     # Loss-weight-driven feature toggles. State prediction needs the
     # extra HDF5 fields (image_*_future, proprio_future) and the 3
@@ -290,9 +267,7 @@ def run(cfg):
     loss_cfg_run = cfg.get("loss", {}) or {}
     pred_weight = float(loss_cfg_run.get("pred_weight", 0.0))
     sigreg_weight = float(loss_cfg_run.get("sigreg_weight", 0.0))
-    gripper_aux_weight = float(loss_cfg_run.get("gripper_aux_weight", 0.0))
     use_state_prediction = pred_weight > 0
-    use_gripper_aux = gripper_aux_weight > 0
 
     # Projector normalization: must be 'batch' when SIGReg is enabled
     # (LeWM paper Section 3 — LayerNorm prevents the anti-collapse
@@ -358,7 +333,6 @@ def run(cfg):
         max_action_tokens=max_action_tokens,
         max_lang_tokens=max_lang_tokens,
         img_size=cfg.data.dataset.get("img_size", cfg.img_size),
-        use_language=use_language,
         use_state_prediction=use_state_prediction,
     )
 
@@ -464,13 +438,6 @@ def run(cfg):
     embed_dim = cfg.wm.get("embed_dim", hidden_dim)
 
     # ARPredictor with language + proprio support.
-    # max_lang_tokens is still passed in so pos_embedding has a large-enough max_seq_len —
-    # when use_language=False, language positions are simply never populated at runtime.
-    # Gripper aux head reads chunk_size from the dataset config so the head's
-    # output dim matches batch["gripper_seq"].shape[1]. We treat it as
-    # immutable (H=20 across the project); pull from data config to surface
-    # mismatches loudly.
-    gripper_chunk_size = int(cfg.data.dataset.get("chunk_size", 20))
     predictor = ARPredictor(
         embed_dim=embed_dim,
         max_action_tokens=max_action_tokens,
@@ -485,8 +452,6 @@ def run(cfg):
         # Multi-token visual prefix. 0 = CLS-only legacy layout, matches
         # spatial-65% / sp_sigreg-67.8% checkpoints exactly.
         visual_pool_grid=visual_pool_grid,
-        use_gripper_aux=use_gripper_aux,
-        gripper_chunk_size=gripper_chunk_size,
         **cfg.predictor,
     )
 
@@ -498,21 +463,14 @@ def run(cfg):
         norm_fn=norm_fn,
     )
 
-    if use_language:
-        # T5-small encoder (frozen)
-        lang_encoder = T5EncoderModel.from_pretrained("t5-small")
-        lang_encoder.eval()
-        for p in lang_encoder.parameters():
-            p.requires_grad_(False)
+    # T5-small encoder (frozen)
+    lang_encoder = T5EncoderModel.from_pretrained("t5-small")
+    lang_encoder.eval()
+    for p in lang_encoder.parameters():
+        p.requires_grad_(False)
 
-        # Language projection: T5 d_model (512) → embed_dim
-        lang_proj = torch.nn.Linear(lang_encoder.config.d_model, embed_dim)
-    else:
-        print(
-            "[Ablation] use_language=False — skipping T5 encoder and language projection."
-        )
-        lang_encoder = None
-        lang_proj = None
+    # Language projection: T5 d_model (512) → embed_dim
+    lang_proj = torch.nn.Linear(lang_encoder.config.d_model, embed_dim)
 
     world_model = JEPA(
         encoder=encoder,

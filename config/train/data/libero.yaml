@@ -8,9 +8,6 @@ dataset:
   # Do NOT mean/abs the gripper — fingers are symmetric around 0, averaging
   # either destroys half the info or zeros out when the sign cancels.
   proprio_dim: 9
-  # Ablation switch: set false to drop the language instruction entirely
-  # (T5 encoder is not loaded, prefix becomes [z_ag, z_hd, z_pr, BOS, ...]).
-  use_language: true
   # State-prediction switch: when true, dataset additionally loads
   # image_agent_future / image_hand_future / proprio_future from the preprocessed
   # HDF5. Old HDF5 files (preprocessed before the state-prediction extension)

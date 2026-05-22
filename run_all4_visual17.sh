@@ -8,7 +8,7 @@
 # to match the baseline all4_sp_sigreg run for direct comparison.
 #
 # Requires the jepa.py reshape adapter to handle (B, N=17, D) → (B*N, D) → BN
-# → (B, 17, D) — wired Apr 2026 alongside the gripper-aux work.
+# → (B, 17, D) — wired Apr 2026.
 #
 # Usage (server):
 #   bash run_all4_visual17.sh                       # sp_sigreg + V17, seed=3072

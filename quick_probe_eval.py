@@ -120,7 +120,6 @@ def probe_one_task(
                 video_dir=None,
                 task_name=task_name,
                 max_video_episodes=0,
-                use_language=t5_tokenizer is not None,
             )
     finally:
         env.close()
@@ -262,14 +261,8 @@ def main() -> int:
     )
     parser.add_argument("--max-steps", type=int, default=200)
     parser.add_argument("--device", type=str, default="cuda")
-    parser.add_argument(
-        "--no-language",
-        action="store_true",
-        help="Match the checkpoint's training-time use_language setting.",
-    )
     args = parser.parse_args()
 
-    use_language = not args.no_language
     device = torch.device(args.device)
 
     # Load model — object ckpt path (required for BN / SP architectures).
@@ -277,12 +270,12 @@ def main() -> int:
     if args.checkpoint.endswith("_object.ckpt"):
         model = torch.load(args.checkpoint, map_location=device, weights_only=False)
     else:
-        model = build_model(device, use_language=use_language)
+        model = build_model(device)
         load_checkpoint(model, args.checkpoint, device)
     model.eval()
 
     processor = load_fast_processor(args.tokenizer)
-    t5_tokenizer = T5Tokenizer.from_pretrained("t5-small") if use_language else None
+    t5_tokenizer = T5Tokenizer.from_pretrained("t5-small")
 
     if args.stage == "A":
         result = run_stage_a(

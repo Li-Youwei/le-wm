@@ -60,7 +60,7 @@ predictor:
 # distribution toward isotropic Gaussian). train.py errors out if this
 # constraint is violated.
 projector:
-  norm_type: layer  # 'layer' (baseline) | 'batch' (required when sigreg_weight > 0)
+  norm_type: layer # 'layer' (baseline) | 'batch' (required when sigreg_weight > 0)
 
 # State-prediction + SIGReg loss weights.
 # Default 0 = pure-action baseline (frozen @ 7008f15, fully reproducible).
@@ -68,17 +68,8 @@ projector:
 #   pred_weight = 1.0  (no separate weight in paper; implicitly 1.0)
 #   sigreg_weight = 0.1  (paper Section 3, λ = 0.1)
 loss:
-  pred_weight: 0.0       # > 0 enables Q_ag/Q_hd/Q_pr STATE_QUERY tokens + 3 MSE losses
-  sigreg_weight: 0.0     # > 0 enables SIGReg on encoder outputs (Algorithm 1 strict)
-  # Gripper-aware auxiliary head + MSE loss. When > 0 the predictor grows a
-  # small MLP that reads the BOS hidden state and regresses the (H,)
-  # gripper-command sequence directly, bypassing FAST tokenization for dim 6.
-  # Motivation: diagnostic on libero_object 0% showed FAST joint BPE diluting
-  # the gripper signal — predicted gripper command oscillated ±1 while GT
-  # stayed constant at -1 for early chunks. The bypass head restores a clean
-  # direct signal. At inference eval_libero.py auto-detects the head and
-  # overrides actions_phys[..., 6] with its prediction.
-  gripper_aux_weight: 0.0
+  pred_weight: 0.0 # > 0 enables Q_ag/Q_hd/Q_pr STATE_QUERY tokens + 3 MSE losses
+  sigreg_weight: 0.0 # > 0 enables SIGReg on encoder outputs (Algorithm 1 strict)
   sigreg:
     kwargs:
       knots: 17

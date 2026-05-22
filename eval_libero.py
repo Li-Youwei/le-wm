@@ -54,14 +54,11 @@ from preprocess_libero import normalize_proprio
 # ---------------------------------------------------------------------------
 
 
-def build_model(device: torch.device, use_language: bool = True) -> torch.nn.Module:
+def build_model(device: torch.device) -> torch.nn.Module:
     """Build the JEPA model with the same architecture as train.py.
 
     Args:
         device: target device.
-        use_language: must match the training-time setting. When False, the
-            T5 encoder and language projection are omitted, and the predictor
-            runs on a vision+proprio-only prefix.
     """
     import stable_pretraining as spt
 
@@ -102,17 +99,12 @@ def build_model(device: torch.device, use_language: bool = True) -> torch.nn.Mod
         norm_fn=torch.nn.LayerNorm,
     )
 
-    if use_language:
-        # T5-small (frozen)
-        lang_encoder = T5EncoderModel.from_pretrained("t5-small")
-        lang_encoder.eval()
-        for p in lang_encoder.parameters():
-            p.requires_grad_(False)
-        lang_proj = torch.nn.Linear(lang_encoder.config.d_model, embed_dim)
-    else:
-        print("[Ablation] use_language=False — evaluating with vision+proprio only.")
-        lang_encoder = None
-        lang_proj = None
+    # T5-small (frozen)
+    lang_encoder = T5EncoderModel.from_pretrained("t5-small")
+    lang_encoder.eval()
+    for p in lang_encoder.parameters():
+        p.requires_grad_(False)
+    lang_proj = torch.nn.Linear(lang_encoder.config.d_model, embed_dim)
 
     model = JEPA(
         encoder=encoder,
@@ -138,25 +130,22 @@ def load_checkpoint(
 
     # Reject any non-baseline-architecture checkpoint loaded via the
     # _weights.ckpt path — build_model() constructs the baseline architecture
-    # (no state_pred_head_*, no state_query_embeddings, LayerNorm projector,
-    # no gripper_aux_head), so loading a checkpoint with extra keys would
-    # either fail with a confusing torch shape-mismatch error or (worse)
-    # silently pass with strict=False and skip critical parameters.
+    # (no state_pred_head_*, no state_query_embeddings, LayerNorm projector),
+    # so loading a checkpoint with extra keys would either fail with a
+    # confusing torch shape-mismatch error or (worse) silently pass with
+    # strict=False and skip critical parameters.
     #
-    # Three known deviations all require _object.ckpt:
+    # Two known deviations both require _object.ckpt:
     #   1. SP-trained: state_pred_head_* / state_query_embeddings keys.
     #   2. BatchNorm-projector: projector.net.1.running_mean buffer (BN1d
     #      tracks running stats; LayerNorm has no such buffer). This catches
     #      the legitimate "SIGReg-only, no SP" ablation as well, where
     #      projector.norm_type='batch' but no SP heads exist.
-    #   3. Gripper-aux-trained: gripper_aux_head.* keys. Bypass-FAST head
-    #      for the gripper dim; build_model() never constructs it.
     sp_keys = [
         k for k in state_dict if "state_pred_head" in k or "state_query_embeddings" in k
     ]
     bn_keys = [k for k in state_dict if "projector.net.1.running_mean" in k]
-    grip_keys = [k for k in state_dict if "gripper_aux_head" in k]
-    if (sp_keys or bn_keys or grip_keys) and not ckpt_path.endswith("_object.ckpt"):
+    if (sp_keys or bn_keys) and not ckpt_path.endswith("_object.ckpt"):
         reasons = []
         if sp_keys:
             reasons.append(
@@ -164,20 +153,14 @@ def load_checkpoint(
             )
         if bn_keys:
             reasons.append(f"BatchNorm projector running stats ({bn_keys[:1]})")
-        if grip_keys:
-            reasons.append(
-                f"gripper-aux head keys ({grip_keys[:2]}{'...' if len(grip_keys) > 2 else ''})"
-            )
         raise ValueError(
             f"Checkpoint '{ckpt_path}' has {' and '.join(reasons)} but is not "
-            "an _object.ckpt. Non-baseline architectures (SP-trained, "
-            "BatchNorm-projector / SIGReg-trained, or gripper-aux-trained) "
+            "an _object.ckpt. Non-baseline architectures (SP-trained or "
+            "BatchNorm-projector / SIGReg-trained) "
             "must be evaluated via the per-epoch object checkpoint produced "
             "by ModelObjectCallBack — pass "
             "--checkpoint .../lewm_*_object.ckpt instead."
         )
-
-    has_lang_module = getattr(model, "lang_encoder", None) is not None
 
     # Strip "model." prefix from spt.Module wrapper
     model_sd = {}
@@ -186,9 +169,6 @@ def load_checkpoint(
             new_key = k.removeprefix("model.")
             # Skip T5 encoder keys (loaded from pretrained)
             if new_key.startswith("lang_encoder."):
-                continue
-            # In no-language mode the model has no lang_proj — skip any residual keys
-            if not has_lang_module and new_key.startswith("lang_proj."):
                 continue
             model_sd[new_key] = v
 
@@ -457,7 +437,6 @@ def evaluate_task(
     video_dir: str | None = None,
     task_name: str = "",
     max_video_episodes: int = 999,
-    use_language: bool = True,
 ) -> tuple[int, int]:
     """Run episodes and count successes."""
     successes = 0
@@ -466,17 +445,14 @@ def evaluate_task(
     # Read OSC scales once per task from the running controller (not hardcoded).
     pos_scale, rot_scale = _read_osc_scales(env)
 
-    # Pre-tokenize language instruction (same for all episodes); skipped in no-language mode.
-    if use_language:
-        assert t5_tokenizer is not None, "t5_tokenizer required when use_language=True"
-        lang_ids, lang_mask = tokenize_language(
-            language_instruction,
-            t5_tokenizer,
-            max_lang_tokens,
-            device,
-        )
-    else:
-        lang_ids, lang_mask = None, None
+    # Pre-tokenize language instruction (same for all episodes).
+    assert t5_tokenizer is not None, "t5_tokenizer required"
+    lang_ids, lang_mask = tokenize_language(
+        language_instruction,
+        t5_tokenizer,
+        max_lang_tokens,
+        device,
+    )
 
     for ep in range(num_episodes):
         # Reset with deterministic initial state
@@ -527,21 +503,6 @@ def evaluate_task(
             #   [0:3] = anchor-relative pos delta (m)
             #   [3:6] = anchor-relative rot delta (rad, axis-angle)
             #   [6]   = gripper cmd (unchanged)
-
-            # Gripper aux override: when the model was trained with the
-            # auxiliary gripper-command head, bypass FAST for dim 6 and
-            # take the direct regression head's output instead. This
-            # addresses the libero_object 0% failure where FAST joint BPE
-            # diluted the gripper signal — see CLAUDE.md diagnostic notes.
-            if getattr(model.predictor, "use_gripper_aux", False):
-                pred_grip = model.predict_gripper_aux(
-                    z_agent,
-                    z_hand,
-                    proprio,
-                    lang_embeds,
-                    lang_lengths,
-                )  # (B=1, H)
-                actions_phys[0, :, 6] = pred_grip[0].detach().cpu().numpy()
 
             obs, reward, done, _ = _execute_chunk_closed_loop(
                 env,
@@ -668,20 +629,12 @@ def main():
         default=999,
         help="Max episodes per task to record (default: all)",
     )
-    parser.add_argument(
-        "--no-language",
-        action="store_true",
-        help="Ablation: evaluate a model trained without the language instruction. "
-        "Must match the checkpoint's training-time use_language setting.",
-    )
     args = parser.parse_args()
 
     if args.save_videos and iio is None:
         raise ImportError(
             "imageio required for --save-videos: pip install imageio imageio-ffmpeg"
         )
-
-    use_language = not args.no_language
 
     device = torch.device(args.device)
     np.random.seed(args.seed)
@@ -696,7 +649,7 @@ def main():
         model = torch.load(args.checkpoint, map_location=device, weights_only=False)
     else:
         # Lightning checkpoint: build architecture then load state_dict.
-        model = build_model(device, use_language=use_language)
+        model = build_model(device)
         load_checkpoint(model, args.checkpoint, device)
     model.eval()
 
@@ -704,8 +657,8 @@ def main():
     print(f"Loading FAST tokenizer from {args.tokenizer}")
     processor = load_fast_processor(args.tokenizer)
 
-    # Load T5 tokenizer for language (skipped in no-language mode)
-    t5_tokenizer = T5Tokenizer.from_pretrained("t5-small") if use_language else None
+    # Load T5 tokenizer for language
+    t5_tokenizer = T5Tokenizer.from_pretrained("t5-small")
 
     # Get task suite
     task_suite = benchmark.get_benchmark_dict()[args.suite]()
@@ -772,7 +725,6 @@ def main():
                 video_dir=args.video_dir,
                 task_name=task_name,
                 max_video_episodes=args.max_video_episodes,
-                use_language=use_language,
             )
         finally:
             env.close()

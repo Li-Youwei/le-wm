@@ -25,10 +25,6 @@ class JEPA(nn.Module):
         # tokens per view; 0 keeps the legacy CLS-only output.
         self.visual_pool_grid = int(visual_pool_grid)
 
-    @property
-    def use_language(self) -> bool:
-        return self.lang_encoder is not None
-
     def train(self, mode=True):
         """Override to keep T5 encoder frozen in eval mode.
 
@@ -37,8 +33,7 @@ class JEPA(nn.Module):
         re-enabling T5's dropout. This override prevents that.
         """
         super().train(mode)
-        if self.lang_encoder is not None:
-            self.lang_encoder.eval()
+        self.lang_encoder.eval()
         return self
 
     def encode(
@@ -60,17 +55,16 @@ class JEPA(nn.Module):
         Args:
             pixels_agent: (B, C, H, W) agentview image.
             pixels_hand: (B, C, H, W) eye-in-hand image.
-            lang_input_ids: (B, max_lang_tokens) T5 token IDs, or None for no-language mode.
-            lang_attention_mask: (B, max_lang_tokens) attention mask (1=real, 0=pad), or None.
+            lang_input_ids: (B, max_lang_tokens) T5 token IDs.
+            lang_attention_mask: (B, max_lang_tokens) attention mask (1=real, 0=pad).
 
         Returns:
             z_agent: (B, N, D) agentview tokens, projected. N=1 (CLS only) by
                 default; when visual_pool_grid>0, N = 1 + grid*grid (CLS first,
                 then grid*grid spatially-pooled patches).
             z_hand: (B, N, D) hand tokens, projected. Same layout as z_agent.
-            lang_embeds: (B, max_lang_tokens, D) projected language embeddings,
-                or None when language is disabled.
-            lang_lengths: (B,) real language token count per sample, or None.
+            lang_embeds: (B, max_lang_tokens, D) projected language embeddings.
+            lang_lengths: (B,) real language token count per sample.
         """
         # Visual: cat both views, single ViT pass, then split.
         visual_cat = torch.cat([pixels_agent, pixels_hand], dim=0)  # (2B, C, H, W)
@@ -87,18 +81,14 @@ class JEPA(nn.Module):
         visual_z = visual_z_flat.reshape(B_total, N_per, -1)  # (2B, N, D)
         z_agent, z_hand = visual_z.chunk(2, dim=0)  # (B, N, D), (B, N, D)
 
-        # Language: only when encoder is present AND tokens are provided
-        if self.lang_encoder is not None and lang_input_ids is not None:
-            with torch.no_grad():
-                lang_out = self.lang_encoder(
-                    input_ids=lang_input_ids,
-                    attention_mask=lang_attention_mask,
-                )
-            lang_embeds = self.lang_proj(lang_out.last_hidden_state)  # (B, seq_len, D)
-            lang_lengths = lang_attention_mask.sum(dim=1)  # (B,)
-        else:
-            lang_embeds = None
-            lang_lengths = None
+        # Language (always present): frozen T5 → projection.
+        with torch.no_grad():
+            lang_out = self.lang_encoder(
+                input_ids=lang_input_ids,
+                attention_mask=lang_attention_mask,
+            )
+        lang_embeds = self.lang_proj(lang_out.last_hidden_state)  # (B, seq_len, D)
+        lang_lengths = lang_attention_mask.sum(dim=1)  # (B,)
 
         return z_agent, z_hand, lang_embeds, lang_lengths
 
@@ -246,25 +236,4 @@ class JEPA(nn.Module):
             lang_lengths,
             max_len=max_len,
             temperature=temperature,
-        )
-
-    def predict_gripper_aux(
-        self,
-        z_agent,
-        z_hand,
-        proprio,
-        lang_embeds,
-        lang_lengths,
-    ):
-        """Inference: read out (B, gripper_chunk_size) from the aux head.
-
-        Wrapper for ``ARPredictor.predict_gripper_aux``. Raises if the
-        underlying predictor does not have ``use_gripper_aux=True``.
-        """
-        return self.predictor.predict_gripper_aux(
-            z_agent,
-            z_hand,
-            proprio,
-            lang_embeds,
-            lang_lengths,
         )
