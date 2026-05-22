@@ -55,14 +55,15 @@ class MoTFeedForward(nn.Module):
     """Per-modality FFN routing — each token's FFN parameters depend on its
     modality, following the Meta "Mixture of Transformers" recipe.
 
-    Attention (Q/K/V/output projections) stays shared across modalities; only
-    the FFN is split. Modality is assigned by absolute position in the
+    The companion MoTAttention splits the attention projections per modality
+    too; the only globally-shared op in a MoT block is the scaled-dot-product
+    attention itself. Modality is assigned by absolute position in the
     sequence layout (prefix=0, action=1, query=2), so routing has no learned
     gating — it's a hard partition.
 
     The forward runs each expert on the full sequence and masks-merges the
-    outputs. For our scale (B=128, T~110, M=3) this is ~2x slowdown of the
-    FFN layer in exchange for code simplicity; scatter-gather would be
+    outputs. For our scale (B=128, T~110, M=3) this is ~M x the FFN-layer
+    FLOPs in exchange for code simplicity; scatter-gather would be
     faster but messier.
     """
 
@@ -142,13 +143,89 @@ class Attention(nn.Module):
         return self.to_out(out)
 
 
+class MoTAttention(nn.Module):
+    """Per-modality attention projections — the full "Mixture-of-Transformers"
+    recipe (Liang et al. 2024). Each modality gets its own pre-norm, QKV
+    projection, and output projection; only the scaled-dot-product attention
+    (the token-mixing op) is global, so tokens of every modality still attend
+    to one another under the shared mask.
+
+    Like MoTFeedForward, every modality's projections run on the full sequence
+    and are merged by a per-position modality mask (~M x the projection FLOPs;
+    the attention op itself stays 1x) — chosen for code simplicity over
+    gather/scatter.
+    """
+
+    def __init__(self, dim, heads, dim_head, n_modalities, dropout=0.0):
+        super().__init__()
+        if n_modalities < 1:
+            raise ValueError(
+                f"MoTAttention requires n_modalities >= 1, got {n_modalities}"
+            )
+        inner_dim = dim_head * heads
+        project_out = not (heads == 1 and dim_head == dim)
+        self.heads = heads
+        self.inner_dim = inner_dim
+        self.dropout = dropout
+        self.n_modalities = n_modalities
+        self.norms = nn.ModuleList([nn.LayerNorm(dim) for _ in range(n_modalities)])
+        self.to_qkvs = nn.ModuleList(
+            [nn.Linear(dim, inner_dim * 3, bias=False) for _ in range(n_modalities)]
+        )
+        self.to_outs = nn.ModuleList(
+            [
+                nn.Sequential(nn.Linear(inner_dim, dim), nn.Dropout(dropout))
+                if project_out
+                else nn.Identity()
+                for _ in range(n_modalities)
+            ]
+        )
+
+    def _merge(self, fn_list, inp, out_dim, modality_ids):
+        """Run every modality's module on the full input, merge by mask."""
+        acc = inp.new_zeros(inp.size(0), inp.size(1), out_dim)
+        for m in range(self.n_modalities):
+            mask = (modality_ids == m).unsqueeze(-1)  # (B, T, 1) bool
+            if not mask.any():
+                continue
+            acc = acc + mask.to(inp.dtype) * fn_list[m](inp)
+        return acc
+
+    def forward(self, x, modality_ids, attn_mask=None):
+        """
+        x : (B, T, D)
+        modality_ids : (B, T) long in [0, n_modalities)
+        attn_mask : optional (B, 1, T, T) bool mask (True = attend).
+        """
+        drop = self.dropout if self.training else 0.0
+        # Per-modality pre-norm + QKV; global attention; per-modality out-proj.
+        x_normed = self._merge(self.norms, x, x.size(-1), modality_ids)
+        qkv = self._merge(self.to_qkvs, x_normed, self.inner_dim * 3, modality_ids)
+        q, k, v = qkv.chunk(3, dim=-1)
+        q, k, v = (
+            rearrange(t, "b t (h d) -> b h t d", h=self.heads) for t in (q, k, v)
+        )
+        if attn_mask is not None:
+            out = F.scaled_dot_product_attention(
+                q, k, v, attn_mask=attn_mask, dropout_p=drop
+            )
+        else:
+            out = F.scaled_dot_product_attention(
+                q, k, v, dropout_p=drop, is_causal=True
+            )
+        out = rearrange(out, "b h t d -> b t (h d)")
+        return self._merge(self.to_outs, out, x.size(-1), modality_ids)
+
+
 class Block(nn.Module):
     """Standard Transformer block.
 
-    ``n_modalities=0`` (default) keeps the legacy single shared FFN and the
-    block is bit-identical to the frozen baseline. Setting ``n_modalities>0``
-    switches the FFN to a per-modality MoT routing — attention stays shared,
-    only the FFN params split. The ``forward`` then requires ``modality_ids``.
+    ``n_modalities=0`` (default) keeps the legacy single shared attention + FFN
+    and the block is bit-identical to the frozen baseline. Setting
+    ``n_modalities>0`` routes BOTH the attention projections (per-modality
+    pre-norm + QKV + output projection, via MoTAttention) and the FFN (via
+    MoTFeedForward) per modality; only the scaled-dot-product attention itself
+    stays global. The ``forward`` then requires ``modality_ids``.
     """
 
     def __init__(
@@ -162,13 +239,16 @@ class Block(nn.Module):
     ):
         super().__init__()
 
-        self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
         self.use_mot = n_modalities > 0
         if self.use_mot:
+            self.attn = MoTAttention(
+                dim, heads, dim_head, n_modalities, dropout=dropout
+            )
             self.mlp = MoTFeedForward(
                 dim, mlp_dim, n_modalities=n_modalities, dropout=dropout
             )
         else:
+            self.attn = Attention(dim, heads=heads, dim_head=dim_head, dropout=dropout)
             self.mlp = FeedForward(dim, mlp_dim, dropout=dropout)
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=1e-6)
@@ -179,16 +259,16 @@ class Block(nn.Module):
         attn_mask: torch.Tensor | None = None,
         modality_ids: torch.Tensor | None = None,
     ) -> torch.Tensor:
-        x = x + self.attn(self.norm1(x), attn_mask=attn_mask)
-        x_norm = self.norm2(x)
         if self.use_mot:
             if modality_ids is None:
                 raise ValueError(
                     "Block.forward requires modality_ids when n_modalities>0."
                 )
-            x = x + self.mlp(x_norm, modality_ids)
+            x = x + self.attn(self.norm1(x), modality_ids, attn_mask=attn_mask)
+            x = x + self.mlp(self.norm2(x), modality_ids)
         else:
-            x = x + self.mlp(x_norm)
+            x = x + self.attn(self.norm1(x), attn_mask=attn_mask)
+            x = x + self.mlp(self.norm2(x))
         return x
 
 
@@ -335,10 +415,12 @@ class ARPredictor(nn.Module):
         self.n_state_query = 3 if use_state_prediction else 0
 
         # Mixture-of-Transformers (Meta MoT) — when True the FFN in each
-        # transformer block has a separate expert per modality (attention
-        # remains shared). Hypothesis under test: shared FFN causes action
-        # prediction and image/state prediction to interfere, especially
-        # with multi-token visual prefix.
+        # transformer block routes BOTH its attention projections (QKV/O +
+        # pre-norm, via MoTAttention) and its FFN (via MoTFeedForward) per
+        # modality; only the attention token-mixing op stays global (full Meta
+        # "Mixture-of-Transformers" recipe). Hypothesis under test: a single
+        # shared block causes action prediction and image/state prediction to
+        # interfere, especially with multi-token visual prefix.
         # Modality partitioning by position:
         #   0 = prefix (lang + visual + proprio),
         #   1 = action zone (BOS + action tokens + PAD),
