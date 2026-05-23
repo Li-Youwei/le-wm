@@ -44,6 +44,16 @@ VAL_INTERVAL="${VAL_INTERVAL:-4000}"
 WARMUP_STEPS="${WARMUP_STEPS:-2000}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 
+# Architecture toggles. Defaults reproduce plain sp_sigreg (CLS-only visual,
+# shared predictor, random-init trainable ViT-Tiny) — no behavior change unless
+# overridden.
+POOL_GRID="${POOL_GRID:-0}"                 # >0 enables V17 multi-token visual (G*G pooled patches)
+USE_MOT="${USE_MOT:-false}"                 # true enables full Mixture-of-Transformers
+VISION_SOURCE="${VISION_SOURCE:-spt_vit}"   # spt_vit | hf (frozen DINOv2 etc. via AutoModel)
+VISION_MODEL="${VISION_MODEL:-}"            # required when VISION_SOURCE=hf (e.g. facebook/dinov2-small)
+VISION_FREEZE="${VISION_FREEZE:-false}"     # hf path: eval() + requires_grad_(False)
+VISION_LOCAL_ONLY="${VISION_LOCAL_ONLY:-true}"  # set false to allow first download
+
 FLAT_DIR="${FLAT_DIR:-/Data/lyw/libero_processed_v5/all4_flat}"
 TOKENIZER="${TOKENIZER:-/Data/lyw/fast_tokenizer_all4}"
 PROCESSED_ROOT="${PROCESSED_ROOT:-/Data/lyw/libero_processed_v5}"
@@ -94,9 +104,22 @@ PROBE_ENABLED="${PROBE_ENABLED:-true}"
 # projector.norm_type, loader.batch_size, seed, trainer.{devices,max_epochs})
 # get plain overrides. New keys (trainer.max_steps, trainer.val_check_interval,
 # probe.*) get `+`.
+VISION_OVERRIDES=(
+    vision_encoder.source="$VISION_SOURCE"
+    vision_encoder.freeze="$VISION_FREEZE"
+    vision_encoder.local_files_only="$VISION_LOCAL_ONLY"
+)
+if [[ "$VISION_SOURCE" == "hf" ]]; then
+    [[ -n "$VISION_MODEL" ]] || { echo "ERROR: VISION_SOURCE=hf requires VISION_MODEL" >&2; exit 1; }
+    VISION_OVERRIDES+=(vision_encoder.model_name_or_path="$VISION_MODEL")
+fi
+
 python train.py \
     data=libero \
     data.dataset.hdf5_dir="$FLAT_DIR" \
+    predictor.use_mot="$USE_MOT" \
+    +visual_tokens.pool_grid="$POOL_GRID" \
+    "${VISION_OVERRIDES[@]}" \
     loss.pred_weight="$PRED" \
     loss.sigreg_weight="$SIGREG" \
     projector.norm_type="$NORM" \
