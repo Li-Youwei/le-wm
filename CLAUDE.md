@@ -217,7 +217,7 @@ L_total = L_CE + pred_weight·L_pred + sigreg_weight·L_sigreg
 
 ### 4-suite joint training
 
-Primary mode: joint over all 4 LIBERO suites (spatial+object+goal+10 = 40 tasks). Pure config: point `hdf5_dir` at a flat dir of 40 symlinked `.h5` (e.g. `/Data/lyw/libero_processed_v5/all4_flat/`); `LiberoDataset.__init__` globs non-recursively (`*.h5`), so the flat dir is required.
+Primary mode: joint over all 4 LIBERO suites (spatial+object+goal+10 = 40 tasks). Pure config: point `hdf5_dir` at a flat dir of 40 symlinked `.h5`; `LiberoDataset.__init__` globs non-recursively (`*.h5`), so the flat dir is required.
 
 - Emits `task_id` (stable, sorted-file order) + standard fields (+ `lang_*` if language, + `*_future` if SP).
 - **3-level balanced sampler:** `w_i = 1/(n_tasks · n_demos[task] · n_chunks[(task,demo)])` → `WeightedRandomSampler(replacement=True)`; uniform across task / demo / time.
@@ -238,7 +238,7 @@ Primary mode: joint over all 4 LIBERO suites (spatial+object+goal+10 = 40 tasks)
 | `utils.py`                                 | `ModelObjectCallBack` (top-K + latest-symlink), `TaskBalancedCEMetric`, `EarlyProbeCallback` (online probe via `quick_probe_eval.py`), `PeriodicPrintCallback`.                                                        |
 | `pick_best_ckpt.py`                        | Top-K `_object.ckpt` by `ce_loss_taskbal` (fallback `ce_loss_epoch`) from TB events.                                                                                                                                   |
 | `quick_probe_eval.py`                      | In-training probe: 10 tasks × `num_episodes` × 4 suites = 40 rollouts; reuses eval loader/rollout.                                                                                                                     |
-| `fit_tokenizer_all4.py`                    | One FAST tokenizer over all 40 tasks → `/Data/lyw/fast_tokenizer_all4/`.                                                                                                                                               |
+| `fit_tokenizer_all4.py`                    | One FAST tokenizer over all 40 tasks.                                                                                                                                                                                  |
 | `smoke_test.py`                            | Full-pipeline forward/backward/generate + VRAM at batch 128/64/32/16.                                                                                                                                                  |
 | `test_attn_mask.py`                        | Unit check on `_build_attn_mask` (not V17/MoT).                                                                                                                                                                        |
 | `check_fast_roundtrip.py`                  | FAST encode→decode on stored GT chunks; per-dim normalized + physical L1.                                                                                                                                              |
@@ -277,9 +277,8 @@ Upstream LeWM `eval.py` (CEM/Adam planning) + `config/eval/` removed (`d3b172a`)
 ## Commands
 
 ```bash
-conda activate vla                         # miniforge, py3.10; GPU server: ssh zju
+conda activate vla                         # miniforge, py3.10; GPU server: ssh zju2
 pip install -r requirements.txt
-export STABLEWM_HOME=/path/to/storage
 
 # Train (frozen baseline)
 python train.py data=libero
@@ -303,6 +302,8 @@ python eval_libero.py --checkpoint /path/lewm_step_{N}_object.ckpt \
 
 **Validation scripts (no pytest/CI):** `smoke_test.py`, `test_attn_mask.py`, `check_fast_roundtrip.py`.
 
+**Local sanity without GPU/data:** runtime checks need the `vla` conda env — bare `python3`/`python` on PATH lacks torch. Fastest predictor check: build `ARPredictor(..., depth=2)` + dummy tensors, assert `forward`/`generate` return arity (baseline → tensor, SP → 4-tuple) and `sum(p.numel())` param counts on CPU (no ViT/T5/HDF5). `test_attn_mask.py` runs standalone too.
+
 `overfit_demo=N`: train==val on one demo; a healthy pipeline drives `ce_loss<0.1`, `token_accuracy>0.95` within a few hundred epochs (else the bug is in data→forward→loss→backward, not capacity).
 
 ## External libraries
@@ -314,9 +315,9 @@ python eval_libero.py --checkpoint /path/lewm_step_{N}_object.ckpt \
 
 ## Key details
 
-- **Data:** train HDF5 `${STABLEWM_HOME}/libero/`; preprocessed `${DATA_ROOT}/libero_processed/<suite>/` (the **dir** is what `LiberoDataset` consumes). Frozen baseline ckpt `/Data/lyw/checkpoints/multitask_ln_100ep/lewm_weights.ckpt`. 4-suite flat-symlink dir `${DATA_ROOT}/libero_processed_v5/all4_flat/`.
-- **Raw LIBERO source (read-only — never write here):** `/nas_data_new/caz/data_ssd/libero/libero_{spatial,object,goal,10}/*.hdf5` (`RAW_ROOT`/`--raw-root`). `preprocess_all4.sh` aborts if `OUT_ROOT` falls inside it; processed output goes to `${OUT_ROOT:-/Data/lyw/libero_processed_v5}`.
-- **FAST tokens:** vlen int32 per sample; each HDF5 stores `action_low`/`action_high` (inverse-norm), `chunk_size`, `chunk_stride`, `language_instruction` attrs. Unified 4-suite tokenizer `/Data/lyw/fast_tokenizer_all4/` (`--load-tokenizer`).
+- **Data:** preprocessed HDF5 is one dir per suite — the **dir** (not individual files) is what `LiberoDataset` consumes; 4-suite training points `hdf5_dir` at a flat dir of 40 symlinked task `.h5`.
+- **Raw LIBERO source (read-only — never write here):** `/nas_data_new/caz/data_ssd/libero/libero_{spatial,object,goal,10}/*.hdf5` (`RAW_ROOT`/`--raw-root`). `preprocess_all4.sh` writes processed output elsewhere and aborts if the output dir would fall inside this raw path.
+- **FAST tokens:** vlen int32 per sample; each HDF5 stores `action_low`/`action_high` (inverse-norm), `chunk_size`, `chunk_stride`, `language_instruction` attrs. Unified 4-suite tokenizer loaded via `--load-tokenizer`.
 - **Device:** no hardcoded `cuda`; inferred from inputs (caller moves `JEPA` to device).
 - **Checkpoints:** `lewm_weights.ckpt` (Lightning state*dict, strips `model.`, skips `lang_encoder.*`; rejected for SP/BN). `lewm\*{step,epoch}\_{N}\_object.ckpt` (`torch.save(model)`, load `weights_only=False`); step mode keeps the `lewm_latest_object.ckpt` symlink.
 - **Seed:** enforced 3 places — `seed_everything(cfg.seed, workers=True)`, `seed=cfg.seed` to `spt.Manager`, `Generator().manual_seed(cfg.seed)` for split + sampler. Without all three, `spt.Manager` falls back to seed 0 and init drifts.
