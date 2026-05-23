@@ -426,15 +426,14 @@ def run(cfg):
     ##       model / optim      ##
     ##############################
 
-    encoder = spt.backbone.utils.vit_hf(
-        cfg.encoder_scale,
-        patch_size=cfg.patch_size,
-        image_size=cfg.img_size,
-        pretrained=False,
-        use_mask_token=False,
-    )
+    # Visual encoder. Default (vision_encoder.source=spt_vit, pretrained=false,
+    # freeze=false) is bit-identical to the frozen baseline's random-init
+    # trainable ViT-Tiny. Set source=hf + model_name_or_path=facebook/dinov2-small
+    # + freeze=true to use a frozen DINOv2 backbone instead (hidden_dim then
+    # comes from the HF config; the projector adapts hidden_dim -> embed_dim).
+    from vision_backbone import build_visual_encoder
 
-    hidden_dim = encoder.config.hidden_size
+    encoder, hidden_dim, freeze_encoder = build_visual_encoder(cfg, spt)
     embed_dim = cfg.wm.get("embed_dim", hidden_dim)
 
     # ARPredictor with language + proprio support.
@@ -479,6 +478,7 @@ def run(cfg):
         lang_encoder=lang_encoder,
         lang_proj=lang_proj,
         visual_pool_grid=visual_pool_grid,
+        freeze_encoder=freeze_encoder,
     )
 
     # Cosine-annealing scheduler with explicit warmup_steps / max_steps.

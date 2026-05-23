@@ -13,6 +13,24 @@ patch_size: 14
 encoder_scale: tiny
 dump_object: True
 
+# Visual backbone selector (see vision_backbone.py).
+#   source=spt_vit (default): repo's vit_hf factory. With pretrained=false,
+#     freeze=false this is the frozen-baseline encoder (random-init trainable
+#     ViT-Tiny) — bit-identical to 7008f15.
+#   source=hf: AutoModel.from_pretrained(model_name_or_path) returning
+#     last_hidden_state, e.g. a frozen DINOv2. Example CLI override:
+#     vision_encoder.source=hf vision_encoder.model_name_or_path=facebook/dinov2-small \
+#     vision_encoder.freeze=true vision_encoder.local_files_only=true
+#   embed_dim stays cfg.wm.embed_dim (192); the projector maps the backbone's
+#   hidden_dim -> embed_dim, so DINOv2-small(384)/base(768) drop in unchanged.
+vision_encoder:
+  source: spt_vit # spt_vit | hf
+  pretrained: false # only used when source=spt_vit
+  model_name_or_path: null # required when source=hf (e.g. facebook/dinov2-small)
+  freeze: false # hf path: eval() + requires_grad_(False); also pins encoder in JEPA.train()
+  local_files_only: true # set false for the first download (then cache hit); honors HF_HUB_OFFLINE
+  trust_remote_code: false
+
 trainer:
   max_epochs: 100
   devices: auto

@@ -13,6 +13,7 @@ class JEPA(nn.Module):
         lang_encoder=None,
         lang_proj=None,
         visual_pool_grid: int = 0,
+        freeze_encoder: bool = False,
     ):
         super().__init__()
 
@@ -24,6 +25,17 @@ class JEPA(nn.Module):
         # visual_pool_grid > 0 enables CLS + G*G adaptive-avg-pooled patch
         # tokens per view; 0 keeps the legacy CLS-only output.
         self.visual_pool_grid = int(visual_pool_grid)
+        # When the encoder is a frozen pretrained backbone (e.g. DINOv2), keep
+        # it in eval mode permanently (no dropout / no BN-stat updates) and
+        # out of the optimizer. build_visual_encoder already set
+        # requires_grad_(False); we mirror lang_encoder's eval-pinning in
+        # train() below so Lightning's per-step model.train() can't re-enable
+        # stochastic layers inside the backbone.
+        self.freeze_encoder = bool(freeze_encoder)
+        if self.freeze_encoder:
+            self.encoder.eval()
+            for p in self.encoder.parameters():
+                p.requires_grad_(False)
 
     def train(self, mode=True):
         """Override to keep T5 encoder frozen in eval mode.
@@ -34,6 +46,8 @@ class JEPA(nn.Module):
         """
         super().train(mode)
         self.lang_encoder.eval()
+        if self.freeze_encoder:
+            self.encoder.eval()
         return self
 
     def encode(
