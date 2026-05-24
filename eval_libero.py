@@ -437,13 +437,23 @@ def evaluate_task(
     video_dir: str | None = None,
     task_name: str = "",
     max_video_episodes: int = 999,
+    num_warmup_steps: int = 10,
 ) -> tuple[int, int]:
-    """Run episodes and count successes."""
+    """Run episodes and count successes.
+
+    Each episode runs ``num_warmup_steps`` no-op env steps after reset to let
+    the scene physically settle, then up to ``max_steps`` policy-driven steps.
+    The warmup steps are NOT counted toward ``max_steps`` (the policy horizon).
+    """
     successes = 0
     max_chunks = max_steps // chunk_size
 
     # Read OSC scales once per task from the running controller (not hardcoded).
     pos_scale, rot_scale = _read_osc_scales(env)
+
+    # No-op OSC action to let the scene settle before the policy acts (LIBERO
+    # convention): zero pose deltas, gripper held open.
+    dummy_action = np.array([0.0, 0.0, 0.0, 0.0, 0.0, 0.0, -1.0], dtype=np.float32)
 
     # Pre-tokenize language instruction (same for all episodes).
     assert t5_tokenizer is not None, "t5_tokenizer required"
@@ -465,6 +475,13 @@ def evaluate_task(
         frames: list[np.ndarray] | None = [] if recording else None
         if recording:
             frames.append(obs["agentview_image"])
+
+        # Warmup: no-op steps so objects drop into place and the controller
+        # stabilizes BEFORE the policy starts. Not counted toward max_steps.
+        for _ in range(num_warmup_steps):
+            obs, _, _, _ = env.step(dummy_action)
+            if frames is not None:
+                frames.append(obs["agentview_image"])
 
         reward = 0.0
         done = False
@@ -597,7 +614,18 @@ def main():
         "--num-episodes", type=int, default=20, help="Episodes per task"
     )
     parser.add_argument(
-        "--max-steps", type=int, default=300, help="Max raw steps per episode"
+        "--max-steps",
+        type=int,
+        default=300,
+        help="Max policy-driven env steps per episode (excludes warmup). "
+        "LIBERO convention: spatial 220 / object 280 / goal 300 / 10 (long) 520.",
+    )
+    parser.add_argument(
+        "--num-warmup-steps",
+        type=int,
+        default=10,
+        help="No-op env steps to settle the scene before the policy acts "
+        "(not counted toward --max-steps).",
     )
     parser.add_argument(
         "--camera-size",
@@ -719,6 +747,7 @@ def main():
                 language_instruction,
                 num_episodes=args.num_episodes,
                 max_steps=args.max_steps,
+                num_warmup_steps=args.num_warmup_steps,
                 device=device,
                 temperature=args.temperature,
                 save_videos=args.save_videos,

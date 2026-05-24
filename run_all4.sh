@@ -157,21 +157,32 @@ fi
 echo "[run_all4] best ckpt: $BEST_CKPT"
 
 # ====================================================================
-# Phase 5c — Per-suite eval × 4 (~30 min/suite for 10 task × 20 ep)
+# Phase 5c — Per-suite eval × 4. Per-suite policy horizon (LIBERO convention:
+# spatial 220 / object 280 / goal 300 / 10-long 520) + a fixed no-op warmup to
+# let the scene settle (NOT counted toward the horizon). Eval seed = $SEED.
 # ====================================================================
+EVAL_WARMUP="${EVAL_WARMUP:-10}"
 for suite in libero_spatial libero_object libero_goal libero_10; do
+    case "$suite" in
+        libero_spatial) SUITE_MAX_STEPS=220 ;;
+        libero_object)  SUITE_MAX_STEPS=280 ;;
+        libero_goal)    SUITE_MAX_STEPS=300 ;;
+        libero_10)      SUITE_MAX_STEPS=520 ;;
+        *)              SUITE_MAX_STEPS=300 ;;
+    esac
     EVAL_LOG="${CKPT_DIR}/eval_${suite}.log"
     PROC_DIR="${PROCESSED_ROOT}/${suite}"
-    echo "[run_all4] eval $suite → $EVAL_LOG"
+    echo "[run_all4] eval $suite (max_steps=$SUITE_MAX_STEPS warmup=$EVAL_WARMUP seed=$SEED) → $EVAL_LOG"
     python eval_libero.py \
         --checkpoint "$BEST_CKPT" \
         --tokenizer "$TOKENIZER" \
         --processed-dir "$PROC_DIR" \
         --suite "$suite" \
         --num-episodes 20 \
-        --max-steps 300 \
+        --max-steps "$SUITE_MAX_STEPS" \
+        --num-warmup-steps "$EVAL_WARMUP" \
         --device cuda \
-        --seed 42 \
+        --seed "$SEED" \
         2>&1 | tee "$EVAL_LOG"
 done
 
