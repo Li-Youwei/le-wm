@@ -43,6 +43,7 @@ MAX_STEPS="${MAX_STEPS:-100000}"
 VAL_INTERVAL="${VAL_INTERVAL:-4000}"
 WARMUP_STEPS="${WARMUP_STEPS:-2000}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
+NUM_WORKERS="${NUM_WORKERS:-6}"            # dataloader workers; raise on many-core hosts to keep the GPU fed
 
 # Architecture toggles. Defaults reproduce plain sp_sigreg (CLS-only visual,
 # shared predictor, random-init trainable ViT-Tiny) — no behavior change unless
@@ -129,6 +130,7 @@ python train.py \
     +trainer.val_check_interval="$VAL_INTERVAL" \
     +trainer.check_val_every_n_epoch=null \
     loader.batch_size="$BATCH_SIZE" \
+    num_workers="$NUM_WORKERS" \
     seed="$SEED" \
     subdir="" \
     output_model_name=lewm \
