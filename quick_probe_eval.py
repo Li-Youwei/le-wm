@@ -25,7 +25,6 @@ import os
 import sys
 from pathlib import Path
 
-import numpy as np
 import torch
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
@@ -243,7 +242,7 @@ def main() -> int:
     parser.add_argument(
         "--processed-root",
         type=Path,
-        default=Path("/Data/lyw/libero_processed_v5"),
+        default=Path("/data/lyw/libero_processed_v5"),
         help="Parent dir containing libero_{spatial,object,goal,10}/ subdirs",
     )
     parser.add_argument(

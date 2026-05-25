@@ -25,8 +25,8 @@ end-to-end.
 
 Usage:
     python check_fast_roundtrip.py \\
-        --processed-dir /Data/lyw/libero_processed/libero_spatial/ \\
-        --tokenizer /Data/lyw/fast_tokenizer \\
+        --processed-dir /data/lyw/libero_processed/libero_spatial/ \\
+        --tokenizer /data/lyw/fast_tokenizer \\
         [--num-samples 10] [--print-samples 3] [--seed 0] \\
         [--libero-root /path/to/raw/libero_spatial]
 """
@@ -214,13 +214,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--processed-dir",
         type=Path,
-        default=Path("/Data/lyw/libero_processed/libero_spatial/"),
+        default=Path("/data/lyw/libero_processed/libero_spatial/"),
         help="Directory containing preprocessed HDF5 files (searched recursively).",
     )
     parser.add_argument(
         "--tokenizer",
         type=Path,
-        default=Path("/Data/lyw/fast_tokenizer"),
+        default=Path("/data/lyw/fast_tokenizer"),
         help="Directory containing the saved FAST tokenizer.",
     )
     parser.add_argument(

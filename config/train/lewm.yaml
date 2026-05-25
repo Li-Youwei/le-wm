@@ -14,20 +14,25 @@ encoder_scale: tiny
 dump_object: True
 
 # Visual backbone selector (see vision_backbone.py).
-#   source=spt_vit (default): repo's vit_hf factory. With pretrained=false,
-#     freeze=false this is the frozen-baseline encoder (random-init trainable
-#     ViT-Tiny) — bit-identical to 7008f15.
-#   source=hf: AutoModel.from_pretrained(model_name_or_path) returning
-#     last_hidden_state, e.g. a frozen DINOv2. Example CLI override:
-#     vision_encoder.source=hf vision_encoder.model_name_or_path=facebook/dinov2-small \
-#     vision_encoder.freeze=true vision_encoder.local_files_only=true
+#   source=hf (DEFAULT): AutoModel.from_pretrained(model_name_or_path) returning
+#     last_hidden_state — a FROZEN DINOv2-base (facebook/dinov2-base, hidden=768,
+#     patch14 → 256 patches at 224, CLS at index 0; V17-compatible). This is the
+#     current default backbone (switched from the random-init trainable ViT-Tiny).
+#   source=spt_vit (LEGACY): repo's vit_hf factory. With pretrained=false,
+#     freeze=false this is the OLD frozen baseline (random-init trainable
+#     ViT-Tiny) — bit-identical to 7008f15. Reach it via:
+#       vision_encoder.source=spt_vit vision_encoder.freeze=false
 #   embed_dim stays cfg.wm.embed_dim (192); the projector maps the backbone's
-#   hidden_dim -> embed_dim, so DINOv2-small(384)/base(768) drop in unchanged.
+#   hidden_dim -> embed_dim, so DINOv2-base(768) / DINOv2-small(384) / ViT-Tiny
+#   (192) all drop in unchanged.
+#   FIRST RUN must populate the HF cache: either pre-download
+#   (`huggingface-cli download facebook/dinov2-base`) or set local_files_only=false
+#   once (with HF_HUB_OFFLINE unset). Subsequent runs hit the cache offline.
 vision_encoder:
-  source: spt_vit # spt_vit | hf
+  source: hf # hf (frozen DINOv2, default) | spt_vit (legacy ViT-Tiny)
   pretrained: false # only used when source=spt_vit
-  model_name_or_path: null # required when source=hf (e.g. facebook/dinov2-small)
-  freeze: false # hf path: eval() + requires_grad_(False); also pins encoder in JEPA.train()
+  model_name_or_path: facebook/dinov2-base # used when source=hf
+  freeze: true # hf path: eval() + requires_grad_(False); also pins encoder in JEPA.train()
   local_files_only: true # set false for the first download (then cache hit); honors HF_HUB_OFFLINE
   trust_remote_code: false
 

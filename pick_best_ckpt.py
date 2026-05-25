@@ -6,15 +6,15 @@ minimized. Maps each step to the matching ``lewm_step_<N>_object.ckpt`` on
 disk.
 
 Usage:
-    python pick_best_ckpt.py --ckpt-dir /Data/lyw/stable-wm/all4_sp_sigreg_seed3072 --top-k 1
+    python pick_best_ckpt.py --ckpt-dir /data/lyw/stable-wm/all4_sp_sigreg_seed3072 --top-k 1
 
 Output (JSON to stdout):
     {
       "metric": "validate/ce_loss_taskbal",
-      "top_1": "/Data/lyw/stable-wm/.../lewm_step_56000_object.ckpt",
+      "top_1": "/data/lyw/stable-wm/.../lewm_step_56000_object.ckpt",
       "top_1_value": 0.4123,
       "all": [
-        {"rank": 1, "step": 56000, "value": 0.4123, "ckpt": "/Data/lyw/.../lewm_step_56000_object.ckpt"},
+        {"rank": 1, "step": 56000, "value": 0.4123, "ckpt": "/data/lyw/.../lewm_step_56000_object.ckpt"},
         ...
       ]
     }

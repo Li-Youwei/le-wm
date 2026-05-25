@@ -6,18 +6,18 @@ This file guides Claude Code (claude.ai/code) when working in this repository.
 
 VLA (Vision-Language-Action) on the LeWorldModel (LeWM) codebase. Input: dual-view images + 9d proprio + language instruction. Output: autoregressively predicted FAST action tokens.
 
-**Frozen baseline** (all toggles off) is the reproducibility target at commit `7008f15`: loss = `L_CE` only, joint-trained on the 10 LIBERO-Spatial tasks into one checkpoint disambiguated solely by the language instruction. 65% avg success across the 10 spatial tasks. Joint training is ~65K chunks total.
+**Frozen baseline** = all toggles below off: loss = `L_CE` only (FAST-token cross-entropy); no SP / SIGReg / MoT / V17. Commit `7008f15` is the bit-identical reference for this loss/architecture (the default visual backbone has since changed — see the caveat below).
 
-All toggles below collapse to the frozen baseline at their default, and any combination is supported in one run:
+All toggles below collapse to the frozen-baseline _loss/architecture_ at their default, and any combination is supported in one run. **Default-changed caveat:** the default visual backbone is now a **frozen DINOv2-base** (not `7008f15`'s random-init trainable ViT-Tiny). Reproducing `7008f15` exactly therefore also needs `vision_encoder.source=spt_vit vision_encoder.freeze=false` (see Input encoders + Hyperparameters).
 
-| Toggle                   | Config knob (`cfg.`)      | Default | Effect when on                                                                                                 |
-| ------------------------ | ------------------------- | ------- | -------------------------------------------------------------------------------------------------------------- |
-| State-prediction (SP)    | `loss.pred_weight`        | `0.0`   | +`Q_ag/Q_hd/Q_pr` STATE_QUERY tokens + 3 MSE losses vs future visual latents & future proprio                  |
-| SIGReg anti-collapse     | `loss.sigreg_weight`      | `0.0`   | Algorithm-1 SIGReg on encoder CLS (4 streams w/ SP, 2 without). Forces `projector.norm_type='batch'`           |
-| Multi-token visual (V17) | `visual_tokens.pool_grid` | `0`     | Per-view encoder out → `1 (CLS) + G*G` pooled-patch tokens + per-view view-embedding & 2D pos grid             |
-| Mixture-of-Transformers  | `predictor.use_mot`       | `false` | Per-modality attention proj (QKV/O+norm) + FFN per modality; only SDPA mixing global; predictor ~2–2.6× params |
-| Step-based training      | `trainer.max_steps`       | unset   | Scheduler `interval=step`, `warmup=min(2000, 0.02·max_steps)`; else `max_epochs × len(train_loader)`           |
-| 4-suite joint            | flat HDF5 dir             | n/a     | `hdf5_dir` → 40 symlinked task `.h5`; 3-level balanced sampler + per-task val CE + `ce_loss_taskbal` selection |
+| Toggle                   | Config knob (`cfg.`)      | Default | Effect when on                                                                                                                                                     |
+| ------------------------ | ------------------------- | ------- | ------------------------------------------------------------------------------------------------------------------------------------------------------------------ |
+| State-prediction (SP)    | `loss.pred_weight`        | `0.0`   | +`Q_ag/Q_hd/Q_pr` STATE_QUERY tokens + 3 MSE losses vs future visual latents & future proprio                                                                      |
+| SIGReg anti-collapse     | `loss.sigreg_weight`      | `0.0`   | Algorithm-1 SIGReg on encoder CLS (4 streams w/ SP, 2 without). Forces `projector.norm_type='batch'`                                                               |
+| Multi-token visual (V17) | `visual_tokens.pool_grid` | `0`     | Per-view encoder out → `1 (CLS) + G*G` pooled-patch tokens + per-view view-embedding & 2D pos grid                                                                 |
+| Mixture-of-Transformers  | `predictor.use_mot`       | `false` | Per-modality attn proj (QKV/O+norm) + FFN, partitioned by **true modality** (text/image/state/action[+query]); only SDPA mixing global; predictor ~3.9–4.2× params |
+| Step-based training      | `trainer.max_steps`       | unset   | Scheduler `interval=step`, `warmup=min(2000, 0.02·max_steps)`; else `max_epochs × len(train_loader)`                                                               |
+| 4-suite joint            | flat HDF5 dir             | n/a     | `hdf5_dir` → 40 symlinked task `.h5`; 3-level balanced sampler + per-task val CE + `ce_loss_taskbal` selection                                                     |
 
 **Inference is identical for all variants** — STATE_QUERY tokens and MoT routing are training-time only. `generate()` decodes FAST from `[lang, z_ag, z_hd, z_pr, BOS]` (+ multi-token visual when on).
 
@@ -27,14 +27,14 @@ All toggles below collapse to the frozen baseline at their default, and any comb
 
 ### Input encoders
 
-| Input           | Source                            | Encoder             | Output           | Frozen  |
-| --------------- | --------------------------------- | ------------------- | ---------------- | ------- |
-| Agentview img   | `agentview_rgb` 128×128           | ViT (patch_size=14) | `z_agent` (D,)   | No      |
-| Eye-in-hand img | `eye_in_hand_rgb` 128×128         | same ViT (shared)   | `z_hand` (D,)    | No      |
-| Proprio (9d)    | EE pos(3)+xyzw quat(4)+gripper(2) | MLP→D               | `z_proprio` (D,) | No      |
-| Language        | task string                       | T5-small            | `l_1..l_n` (n,D) | **Yes** |
+| Input           | Source                            | Encoder                       | Output           | Frozen  |
+| --------------- | --------------------------------- | ----------------------------- | ---------------- | ------- |
+| Agentview img   | `agentview_rgb` 128×128           | DINOv2-base (patch14, frozen) | `z_agent` (D,)   | **Yes** |
+| Eye-in-hand img | `eye_in_hand_rgb` 128×128         | same encoder (shared)         | `z_hand` (D,)    | **Yes** |
+| Proprio (9d)    | EE pos(3)+xyzw quat(4)+gripper(2) | MLP→D                         | `z_proprio` (D,) | No      |
+| Language        | task string                       | T5-small                      | `l_1..l_n` (n,D) | **Yes** |
 
-`D=192` (ViT-Tiny). Two views share ViT weights. T5-small (512d) projected to D via trainable `lang_proj`.
+`D=192` (predictor/embed dim). Default visual encoder = **frozen DINOv2-base** (HF `facebook/dinov2-base`, hidden 768); the trainable projector maps 768→`D`. Two views share the encoder. Legacy random-init **trainable ViT-Tiny** (hidden=`D`=192) via `vision_encoder.source=spt_vit freeze=false`. T5-small (512d) projected to `D` via trainable `lang_proj`.
 
 **Resolution:** raw 128×128 must be resized **128→224** (224/14 = 16 patches/side). Never feed 128 to the ViT — not divisible by 14.
 
@@ -173,17 +173,17 @@ for k in range(H):
 
 ### Multi-token visual prefix (V17)
 
-`pool_grid=G>0` → `JEPA._pool_visual_tokens` turns encoder `(B,1+P,D)` into `cat([CLS, adaptive_avg_pool2d(patches→(B,D,side,side),(G,G))→(B,G*G,D)])` = `(B,1+G*G,D)`. With 224/14, side=16, P=256 (raises `ValueError` if P not a perfect square → rules out DINOv2-with-registers). G=4 → `n_visual_per_view=17` ("V17"). Both views use the same pooler.
+`pool_grid=G>0` → `JEPA._pool_visual_tokens` turns encoder `(B,1+P,D)` into `cat([CLS, adaptive_avg_pool2d(patches→(B,D,side,side),(G,G))→(B,G*G,D)])` = `(B,1+G*G,D)`. With 224/14, side=16, P=256 (raises `ValueError` if P not a perfect square → rules out DINOv2-**with-registers**; the default plain `facebook/dinov2-base` has no register tokens → 256 patches, V17-compatible). G=4 → `n_visual_per_view=17` ("V17"). Both views use the same pooler.
 
 In `ARPredictor.forward` each visual token gets: type-emb[1]; view-emb[0/1] (only if `nv>1`); for patch (r,c) a per-view 2D pos `agent/hand_patch_2d_pos[r,c]` (never shared); plus a 1D pos. CLS gets view-emb + 1D pos only. `pos_embedding` size = `max_lang + 2·nv + 1 + 1 + max_action_tokens + n_state_query` (V17+SP = 144; V17 no-SP = 141). All `1+G*G` tokens are prefix (bidirectional); action zone sees the full real prefix, causal within itself.
 
-**Bug #1 fix** (`jepa.py`): `encode()` and `encode_future_visual()` both reshape `(B,N,D)→(B*N,D)→projector→(B,N,D)` so source & target feed the BN1d projector the same distribution. (Pre-fix the future path used CLS-only `(B,D)`, biasing BN running stats under V17.)
+**Projector reshape** (`jepa.py`): `encode()` and `encode_future_visual()` both reshape `(B,N,D)→(B*N,D)→projector→(B,N,D)` so source & target feed the BN1d projector the same distribution (matters under V17, where N>1).
 
 ### Mixture-of-Transformers (MoT)
 
-`use_mot=true` = full Meta MoT: each `Block` routes **both** attention (`Attention`→`MoTAttention`: per-modality pre-norm + QKV + output proj) **and** FFN (`FeedForward`→`MoTFeedForward`) per modality; only the scaled-dot-product attention (token mixing) stays global, so modalities still attend to each other. Hard partition by absolute position: M=0 prefix, M=1 action zone, M=2 state-query (SP only); `n_modalities` = 3 w/ SP, 2 without. Both `MoT*` modules run every expert on the full sequence + merge by modality mask (~M× the projection/FFN FLOPs, attention op stays 1×; chosen for code simplicity over gather/scatter). All forward paths build their own `_build_modality_ids (B,L)`. `use_mot=false` → original shared `Attention` + MLP, `modality_ids=None`, **bit-identical to `7008f15`**. Predictor params: 11.92M (MoT off, SP on) → 30.83M (full MoT+SP, +159%) / 19.37M (full MoT, no SP, +63%); V17+MoT+SP = 43.43M. **Pre-upgrade FFN-only-MoT `_object.ckpt` no longer load (attention params added) — retrain.**
+`use_mot=true` = full Meta MoT: each `Block` routes **both** attention (`Attention`→`MoTAttention`: per-modality pre-norm + QKV + output proj) **and** FFN (`FeedForward`→`MoTFeedForward`) per modality; only the scaled-dot-product attention (token mixing) stays global, so modalities still attend to each other. Partition is by **true modality** (Meta MoT "decouple by modality", _not_ by sequence-role), assigned by absolute position in `_build_modality_ids`: M=0 text (lang), M=1 image (both visual views), M=2 state (proprio), M=3 action (BOS + tokens + PAD), M=4 state-query (SP only); `n_modalities` = 5 w/ SP, 4 without. Mirrors RynnVLA-002's four input modalities (image/text/state/action). Both `MoT*` modules run every expert on the full sequence + merge by modality mask (~M× the projection/FFN FLOPs, attention op stays 1×; chosen for code simplicity over gather/scatter). All forward paths build their own `_build_modality_ids (B,L)`. `use_mot=false` → original shared `Attention` + MLP, `modality_ids=None`, **bit-identical to `7008f15`**. Predictor params @ depth=6: 9.91M (MoT off) / 11.92M (MoT off, SP on) → **38.28M** (MoT, no SP, 4 mod) / **49.74M** (MoT+SP, 5 mod) / **62.34M** (MoT+SP+V17).
 
-**Checkpoint loading:** `eval_libero.py::load_checkpoint` rejects a `_weights.ckpt` if it sees `state_pred_head_*`/`state_query_embeddings` or `projector.net.1.running_mean` (BN) keys — those must load from the `_object.ckpt` (pickled JEPA from `ModelObjectCallBack`).
+**Checkpoint loading:** `eval_libero.py::load_checkpoint` rejects a `_weights.ckpt` if it sees `state_pred_head_*`/`state_query_embeddings` or `projector.net.1.running_mean` (BN) keys — those must load from the `_object.ckpt` (pickled JEPA from `ModelObjectCallBack`). `build_model()` (the `_weights.ckpt` path) now reconstructs the **default frozen DINOv2-base** via `vision_backbone.build_visual_encoder`, so a `_weights.ckpt` trained with a _different_ backbone (e.g. legacy `spt_vit` ViT-Tiny) won't shape-match — eval it via `_object.ckpt` instead.
 
 ### State-prediction + SIGReg (SP)
 
@@ -204,7 +204,7 @@ L_total = L_CE + pred_weight·L_pred + sigreg_weight·L_sigreg
 
 - Targets from `JEPA.encode_future_visual` (shared ViT + projector, **no `.detach()`** per LeWM §3 — no stop-grad/EMA; SIGReg prevents collapse). `train.py` normalizes both sides to 3D so nv=1 == legacy `(B,D)` MSE.
 - **SIGReg** (LeWM Algorithm 1): on the **encoder CLS slice only** — stack `[z_ag, z_hd, z_ag_future, z_hd_future][:,0]` = `(T=4,B,D)` (degenerates to T=2 current-only when `pred_weight=0`). Predictor outputs intentionally excluded (anchored indirectly via `L_pred`). Patch tokens are constrained by per-token SP MSE, not SIGReg.
-- **Bug #2 fix:** SP heads output `D·nv` (was `D`) so the 16 patch tokens get direct SP gradient (else they drifted to noise). Both bug fixes are bit-identical at nv=1; pre-fix V17 SP ckpts can't be revived.
+- **Patch SP gradient:** SP heads output `D·nv` so every pooled patch token (not just CLS) gets direct SP gradient; collapses to CLS-only — bit-identical to the legacy arch — at nv=1.
 - **Defaults (paper):** `pred_weight=1.0`, `sigreg_weight=0.1`; baseline both 0. `sigreg.kwargs`: `knots=17, num_proj=1024` (barely sensitive, leave alone).
 
 **BatchNorm projector caveats** (forced when `sigreg_weight>0`, per LeWM §3 — LayerNorm blocks anti-collapse):
@@ -226,62 +226,68 @@ Primary mode: joint over all 4 LIBERO suites (spatial+object+goal+10 = 40 tasks)
 
 ## Files
 
-| File                                       | Role                                                                                                                                                                                                                   |
-| ------------------------------------------ | ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
-| `jepa.py`                                  | `JEPA`: `encode`, `predict`, `encode_future_visual`, `predict_actions`, `_pool_visual_tokens`. `train()` keeps `lang_encoder` in `.eval()` (no T5 dropout). Encoder via `spt.backbone.utils.vit_hf`.                   |
-| `module.py`                                | `ARPredictor`, `Block`, `Attention`, `MoTAttention`, `MLP`, `FeedForward`, `MoTFeedForward`, `SIGReg`; vocab consts (BOS 1024 / EOS 1025 / PAD 1026 / TOTAL 1027 / HEAD 1026). All toggles default off.                |
-| `train.py`                                 | Hydra+Lightning+TB. `lejepa_forward` = L_CE (+ optional L_pred / L_sigreg). Demo-level train/val split via `(fpath,demo_idx)` keys (no chunk leakage). `seed_everything(cfg.seed)` + `seed=cfg.seed` to `spt.Manager`. |
-| `libero_dataset.py`                        | Dual-view + 9d proprio + T5 + FAST. Lazy per-worker HDF5. Stable `task_id`, `get_sampler_weights()`.                                                                                                                   |
-| `preprocess_libero.py`                     | Anchor-relative chunks + stride=1 + FAST BPE. `normalize_proprio` single source (reused by eval). Always stores `image_*_future`+`proprio_future` (no toggle).                                                         |
-| `eval_libero.py`                           | Closed-loop exec. Runtime OSC scales. Loads `_weights.ckpt` & `_object.ckpt`. Rejects non-baseline `_weights.ckpt`.                                                                                                    |
-| `fast_utils.py`                            | `fast_decode` with pad/truncate fallback (built-in decoder zeros on length mismatch → freezes the robot) + `denormalize_actions`.                                                                                      |
-| `utils.py`                                 | `ModelObjectCallBack` (top-K + latest-symlink), `TaskBalancedCEMetric`, `EarlyProbeCallback` (online probe via `quick_probe_eval.py`), `PeriodicPrintCallback`.                                                        |
-| `pick_best_ckpt.py`                        | Top-K `_object.ckpt` by `ce_loss_taskbal` (fallback `ce_loss_epoch`) from TB events.                                                                                                                                   |
-| `quick_probe_eval.py`                      | In-training probe: 10 tasks × `num_episodes` × 4 suites = 40 rollouts; reuses eval loader/rollout.                                                                                                                     |
-| `fit_tokenizer_all4.py`                    | One FAST tokenizer over all 40 tasks.                                                                                                                                                                                  |
-| `smoke_test.py`                            | Full-pipeline forward/backward/generate + VRAM at batch 128/64/32/16.                                                                                                                                                  |
-| `test_attn_mask.py`                        | Unit check on `_build_attn_mask` (not V17/MoT).                                                                                                                                                                        |
-| `check_fast_roundtrip.py`                  | FAST encode→decode on stored GT chunks; per-dim normalized + physical L1.                                                                                                                                              |
-| `config/train/lewm.yaml`                   | Primary config (SP / SIGReg / MoT toggles). V17 via CLI `+visual_tokens.pool_grid=4` (no default key).                                                                                                                 |
-| `config/train/overfit.yaml`                | 1-demo sanity (batch=8, lr=1e-3, no reg, max_epochs=2000).                                                                                                                                                             |
-| `config/train/data/libero.yaml`            | Dataset config + proprio layout.                                                                                                                                                                                       |
-| `run_all4.sh` / `_visual17.sh`             | 4-suite driver: train→pick best→per-suite eval; `_visual17.sh` adds V17. `launch_all4.sh` = tmux wrapper.                                                                                                              |
-| `run_object_baseline.sh`                   | Single-suite control (libero_object only).                                                                                                                                                                             |
-| `preprocess_all4.sh`                       | Preprocess all 40 raw `.hdf5` → `libero_processed_v5/libero_{spatial,object,goal,10}/`.                                                                                                                                |
-| `eval_videos.sh` / `launch_eval_videos.sh` | Eval re-run with `--save-videos`.                                                                                                                                                                                      |
-| `requirements.txt`                         | `transformers>=4.48,<5` critical (earlier misses `TimmWrapperModel`; v5 breaks FAST).                                                                                                                                  |
+| File                            | Role                                                                                                                                                                                                                                                                                                                                    |
+| ------------------------------- | --------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| `jepa.py`                       | `JEPA`: `encode`, `predict`, `encode_future_visual`, `predict_actions`, `_pool_visual_tokens`. `train()` pins `lang_encoder` (and a frozen encoder) in `.eval()`. Encoder built by `vision_backbone.build_visual_encoder`; `freeze_encoder` keeps a frozen backbone out of train mode + optimizer.                                      |
+| `vision_backbone.py`            | `build_visual_encoder(cfg, spt)` → `(encoder, hidden_dim, freeze_encoder)`. `vision_encoder.source=hf` (DEFAULT) = `AutoModel.from_pretrained` frozen DINOv2-base wrapped in `HFVisionBackbone`; `source=spt_vit` = legacy random-init ViT-Tiny via `vit_hf`. Projector adapts hidden_dim→`embed_dim`.                                  |
+| `module.py`                     | `ARPredictor`, `Block`, `Attention`, `MoTAttention`, `MLP`, `FeedForward`, `MoTFeedForward`, `SIGReg`; vocab consts (BOS 1024 / EOS 1025 / PAD 1026 / TOTAL 1027 / HEAD 1026). All toggles default off.                                                                                                                                 |
+| `train.py`                      | Hydra+Lightning+TB. `lejepa_forward` = L_CE (+ optional L_pred / L_sigreg). Demo-level train/val split via `(fpath,demo_idx)` keys (no chunk leakage). `seed_everything(cfg.seed)` + `seed=cfg.seed` to `spt.Manager`. Builds encoder via `build_visual_encoder`.                                                                       |
+| `libero_dataset.py`             | Dual-view + 9d proprio + T5 + FAST. ImageNet-normalized 224×224 (`_preprocess_image`). Lazy per-worker HDF5. Stable `task_id`, `get_sampler_weights()`.                                                                                                                                                                                 |
+| `preprocess_libero.py`          | Anchor-relative chunks + stride=1 + FAST BPE. `normalize_proprio` single source (reused by eval). Always stores `image_*_future`+`proprio_future` (no toggle).                                                                                                                                                                          |
+| `eval_libero.py`                | Closed-loop exec. Runtime OSC scales. Per-suite eval horizon `LIBERO_MAX_STEPS` (spatial 220 / object 280 / goal 300 / 10 520 / 90 400) auto-by-`--suite`; 50 rollouts/task; `--seed` default 3072. `build_model()` (the `_weights.ckpt` path) reconstructs frozen DINOv2-base; `_object.ckpt` for all toggles / non-default backbones. |
+| `fast_utils.py`                 | `fast_decode` with pad/truncate fallback (built-in decoder zeros on length mismatch → freezes the robot) + `denormalize_actions`.                                                                                                                                                                                                       |
+| `utils.py`                      | `ModelObjectCallBack` (top-K + latest-symlink), `TaskBalancedCEMetric`, `EarlyProbeCallback` (online probe via `quick_probe_eval.py`), `PeriodicPrintCallback`.                                                                                                                                                                         |
+| `pick_best_ckpt.py`             | Top-K `_object.ckpt` by `ce_loss_taskbal` (fallback `ce_loss_epoch`) from TB events.                                                                                                                                                                                                                                                    |
+| `quick_probe_eval.py`           | In-training probe: 10 tasks × `num_episodes` × 4 suites = 40 rollouts; reuses eval loader/rollout.                                                                                                                                                                                                                                      |
+| `fit_tokenizer_all4.py`         | One FAST tokenizer over all 40 tasks.                                                                                                                                                                                                                                                                                                   |
+| `smoke_test.py`                 | Full-pipeline forward/backward/generate + VRAM at batch 128/64/32/16.                                                                                                                                                                                                                                                                   |
+| `test_attn_mask.py`             | Unit check on `_build_attn_mask` (not V17/MoT).                                                                                                                                                                                                                                                                                         |
+| `check_fast_roundtrip.py`       | FAST encode→decode on stored GT chunks; per-dim normalized + physical L1.                                                                                                                                                                                                                                                               |
+| `config/train/lewm.yaml`        | Primary config (SP / SIGReg / MoT toggles + `vision_encoder` default = frozen DINOv2-base). V17 via CLI `+visual_tokens.pool_grid=4` (no default key).                                                                                                                                                                                  |
+| `config/train/overfit.yaml`     | 1-demo sanity (batch=8, lr=1e-3, no reg, max_epochs=2000); also pins the frozen DINOv2-base backbone.                                                                                                                                                                                                                                   |
+| `config/train/data/libero.yaml` | Dataset config + proprio layout.                                                                                                                                                                                                                                                                                                        |
+| `run_all4.sh`                   | 4-suite driver: train→pick best→per-suite eval (50 rollouts). Env knobs: `ARM`/`SEED`/`MAX_STEPS`/`VAL_INTERVAL`/`BATCH_SIZE`/`NUM_WORKERS`/`USE_MOT`/`POOL_GRID`/`VISION_{SOURCE,MODEL,FREEZE,LOCAL_ONLY}`. `launch_all4.sh` = tmux wrapper.                                                                                           |
+| `preprocess_all4.sh`            | Preprocess all 40 raw `.hdf5` → `libero_processed_v5/libero_{spatial,object,goal,10}/`.                                                                                                                                                                                                                                                 |
+| `requirements.txt`              | `transformers>=4.48,<5` critical (earlier misses `TimmWrapperModel`; v5 breaks FAST).                                                                                                                                                                                                                                                   |
 
 Upstream LeWM `eval.py` (CEM/Adam planning) + `config/eval/` removed (`d3b172a`) — VLA uses only `eval_libero.py`.
 
-## Hyperparameters (frozen baseline)
+## Hyperparameters (defaults)
 
-| Param                                            | Value                                                                                                                                   |
-| ------------------------------------------------ | --------------------------------------------------------------------------------------------------------------------------------------- |
-| Chunk `H` / stride                               | 20 raw steps (1s @ 20Hz) / 1                                                                                                            |
-| FAST vocab / `max_action_tokens`                 | 1024 / 80 (observed max 75)                                                                                                             |
-| `max_lang_tokens`                                | 25                                                                                                                                      |
-| `D` / predictor (depth / heads / dim_head / mlp) | 192 / 6 / 16 / 64 / 2048                                                                                                                |
-| dropout / emb_dropout                            | predictor 0.2 / 0.0                                                                                                                     |
-| proprio dim                                      | 9 (`ee_pos3 + xyzw_quat4 + gripper_raw2`)                                                                                               |
-| projector                                        | `MLP(hidden→2048→D)` LayerNorm (BatchNorm forced when SIGReg on)                                                                        |
-| T5                                               | `t5-small` frozen, 512d → `lang_proj`                                                                                                   |
-| optimizer                                        | AdamW lr=5e-5 wd=0.05; `LinearWarmupCosineAnnealingLR` interval=step                                                                    |
-| batch / precision / grad-clip                    | 128 / bf16 / 1.0                                                                                                                        |
-| label smoothing                                  | 0.1 (CE floor ≈ 1.02)                                                                                                                   |
-| train/val split                                  | 0.9 / 0.1 **demo-level** via `(fpath,demo_idx)` keys                                                                                    |
-| max epochs                                       | 100 (epoch mode). Step mode (4-suite): `max_steps=100000`, `max_epochs=999`, `val_check_interval=4000`, `+check_val_every_n_epoch=null` |
-| seed                                             | `cfg.seed=3072`                                                                                                                         |
+| Param                                            | Value                                                                                                                                                               |
+| ------------------------------------------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------- |
+| Chunk `H` / stride                               | 20 raw steps (1s @ 20Hz) / 1                                                                                                                                        |
+| FAST vocab / `max_action_tokens`                 | 1024 / 80 (observed max 75)                                                                                                                                         |
+| `max_lang_tokens`                                | 25                                                                                                                                                                  |
+| `D` / predictor (depth / heads / dim_head / mlp) | 192 / 6 / 16 / 64 / 2048                                                                                                                                            |
+| dropout / emb_dropout                            | predictor 0.2 / 0.0                                                                                                                                                 |
+| proprio dim                                      | 9 (`ee_pos3 + xyzw_quat4 + gripper_raw2`)                                                                                                                           |
+| vision backbone                                  | **frozen DINOv2-base** (`facebook/dinov2-base`, hidden 768) default → projector 768→`D`; legacy trainable ViT-Tiny via `vision_encoder.source=spt_vit freeze=false` |
+| projector                                        | `MLP(hidden→2048→D)` LayerNorm (BatchNorm forced when SIGReg on)                                                                                                    |
+| T5                                               | `t5-small` frozen, 512d → `lang_proj`                                                                                                                               |
+| optimizer                                        | AdamW lr=5e-5 wd=0.05; `LinearWarmupCosineAnnealingLR` interval=step                                                                                                |
+| batch / precision / grad-clip                    | 128 / bf16 / 1.0                                                                                                                                                    |
+| label smoothing                                  | 0.1 (CE floor ≈ 1.02)                                                                                                                                               |
+| train/val split                                  | 0.9 / 0.1 **demo-level** via `(fpath,demo_idx)` keys                                                                                                                |
+| max epochs                                       | 100 (epoch mode). Step mode (4-suite): `max_steps=100000`, `max_epochs=999`, `val_check_interval=4000`, `+check_val_every_n_epoch=null`                             |
+| seed                                             | `cfg.seed=3072` (train); `eval_libero.py --seed` default also 3072 (was 42)                                                                                         |
 
 **Ckpt selection:** lowest `validate/ce_loss_taskbal` (4-suite) / `validate/ce_loss_epoch` (single-suite). **Never the last step/epoch** — the baseline overfits before the budget.
 
 ## Commands
 
 ```bash
-conda activate vla                         # miniforge, py3.10; GPU server: ssh zju2
+conda activate vla                         # miniforge, py3.10 (GPU server; paths in run_all4.sh are server-specific)
 pip install -r requirements.txt
 
-# Train (frozen baseline)
+# Train (default backbone is now frozen DINOv2-base). FIRST RUN must populate
+# the HF cache for facebook/dinov2-base: either `huggingface-cli download
+# facebook/dinov2-base`, or pass vision_encoder.local_files_only=false once
+# (with HF_HUB_OFFLINE unset). Subsequent runs hit the cache offline.
 python train.py data=libero
+
+# Reproduce the exact 7008f15 frozen baseline (random-init trainable ViT-Tiny):
+python train.py data=libero vision_encoder.source=spt_vit vision_encoder.freeze=false
 
 # Toggles (any combination; SIGReg requires projector.norm_type=batch)
 python train.py data=libero loss.pred_weight=1.0 loss.sigreg_weight=0.1 projector.norm_type=batch
@@ -295,7 +301,8 @@ python train.py --config-name=overfit data.dataset.hdf5_dir=/path/single_task/ s
 # 4-suite joint (point hdf5_dir at the flat 40-task dir)
 bash run_all4.sh                           # ARM=baseline|sp_sigreg, SEED=...
 
-# Eval — _weights.ckpt only for frozen baseline; all toggles need _object.ckpt
+# Eval — _object.ckpt for DINOv2 / SP / SIGReg / MoT / V17 (the default path).
+# --max-steps auto-selected per --suite (220/280/300/520/400); 50 rollouts; seed 3072.
 python eval_libero.py --checkpoint /path/lewm_step_{N}_object.ckpt \
     --tokenizer /path/fast_tokenizer --processed-dir /path/libero_processed/<suite>/ --suite libero_spatial
 ```
@@ -304,7 +311,7 @@ python eval_libero.py --checkpoint /path/lewm_step_{N}_object.ckpt \
 
 **Local sanity without GPU/data:** runtime checks need the `vla` conda env — bare `python3`/`python` on PATH lacks torch. Fastest predictor check: build `ARPredictor(..., depth=2)` + dummy tensors, assert `forward`/`generate` return arity (baseline → tensor, SP → 4-tuple) and `sum(p.numel())` param counts on CPU (no ViT/T5/HDF5). `test_attn_mask.py` runs standalone too.
 
-`overfit_demo=N`: train==val on one demo; a healthy pipeline drives `ce_loss<0.1`, `token_accuracy>0.95` within a few hundred epochs (else the bug is in data→forward→loss→backward, not capacity).
+`overfit_demo=N`: train==val on one demo; a healthy pipeline drives `token_accuracy>0.95` within a few hundred epochs (else the bug is in data→forward→loss→backward, not capacity). `ce_loss` plateaus at the label-smoothing floor ≈1.02 (not 0) — read `token_accuracy`, not raw CE.
 
 ## External libraries
 
@@ -316,8 +323,9 @@ python eval_libero.py --checkpoint /path/lewm_step_{N}_object.ckpt \
 ## Key details
 
 - **Data:** preprocessed HDF5 is one dir per suite — the **dir** (not individual files) is what `LiberoDataset` consumes; 4-suite training points `hdf5_dir` at a flat dir of 40 symlinked task `.h5`.
-- **Raw LIBERO source (read-only — never write here):** `/nas_data_new/caz/data_ssd/libero/libero_{spatial,object,goal,10}/*.hdf5` (`RAW_ROOT`/`--raw-root`). `preprocess_all4.sh` writes processed output elsewhere and aborts if the output dir would fall inside this raw path.
+- **Raw LIBERO source (read-only — never write here):** `/data/lyw/libero_{spatial,object,goal,10}/*.hdf5` (`RAW_ROOT`/`--raw-root`, default `/data/lyw`). `preprocess_all4.sh` writes to a separate `OUT_ROOT` (default `/data/lyw/libero_processed_v5`) and aborts if `OUT_ROOT==RAW_ROOT` (would pollute the raw suite dirs). All run-time data/ckpt/tokenizer paths now live under `/data/lyw`; conda env `vla` at `/data/lyw/miniconda3`.
 - **FAST tokens:** vlen int32 per sample; each HDF5 stores `action_low`/`action_high` (inverse-norm), `chunk_size`, `chunk_stride`, `language_instruction` attrs. Unified 4-suite tokenizer loaded via `--load-tokenizer`.
 - **Device:** no hardcoded `cuda`; inferred from inputs (caller moves `JEPA` to device).
-- **Checkpoints:** `lewm_weights.ckpt` (Lightning state*dict, strips `model.`, skips `lang_encoder.*`; rejected for SP/BN). `lewm\*{step,epoch}\_{N}\_object.ckpt` (`torch.save(model)`, load `weights_only=False`); step mode keeps the `lewm_latest_object.ckpt` symlink.
-- **Seed:** enforced 3 places — `seed_everything(cfg.seed, workers=True)`, `seed=cfg.seed` to `spt.Manager`, `Generator().manual_seed(cfg.seed)` for split + sampler. Without all three, `spt.Manager` falls back to seed 0 and init drifts.
+- **Checkpoints:** `lewm_weights.ckpt` (Lightning state*dict, strips `model.`, skips `lang_encoder.*`; rejected for SP/BN; `build_model()`rebuilds the frozen DINOv2-base backbone).`lewm\*{step,epoch}\_{N}\_object.ckpt` (`torch.save(model)`, load `weights_only=False`); step mode keeps the `lewm_latest_object.ckpt` symlink.
+- **Seed:** enforced 3 places — `seed_everything(cfg.seed, workers=True)`, `seed=cfg.seed` to `spt.Manager`, `Generator().manual_seed(cfg.seed)` for split + sampler. `eval_libero.py --seed` defaults to 3072 too (was 42), matching train. Without all three, `spt.Manager` falls back to seed 0 and init drifts.
+- **Vision backbone / HF cache:** default `facebook/dinov2-base` is fetched via `AutoModel.from_pretrained` and must be in the HF cache before an offline run (`run_all4.sh` forces `HF_HUB_OFFLINE=1` only when `VISION_LOCAL_ONLY=true`). First time: `huggingface-cli download facebook/dinov2-base`, or `VISION_LOCAL_ONLY=false bash run_all4.sh`. Inputs are already ImageNet-normalized 224×224 (`_preprocess_image`), so DINOv2 needs no preprocessing change. Frozen-encoder caveat: SIGReg then regularizes the trainable projector output, not the (frozen) encoder features.

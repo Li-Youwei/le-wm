@@ -2,9 +2,10 @@
 # overfit.yaml — 1-demo pipeline sanity check.
 #
 # Goal: verify the train pipeline (data -> encoder -> predictor -> CE loss)
-# can memorize a tiny fixed set. If this can't drive loss < 0.1 and
-# token_accuracy > 0.95 after a few hundred epochs, there is a bug in the
-# pipeline — model capacity and optimization are NOT the problem.
+# can memorize a tiny fixed set. If this can't drive token_accuracy > 0.95
+# after a few hundred epochs, there is a bug in the pipeline — model capacity
+# and optimization are NOT the problem. (With label_smoothing=0.1, ce_loss
+# plateaus at the smoothing floor ≈1.02, NOT 0 — read token_accuracy, not CE.)
 #
 # What's different vs lewm.yaml:
 #   - overfit_demo=0 → train.py picks only samples whose demo_idx==0 and uses
@@ -16,7 +17,7 @@
 #
 # Usage:
 #   CUDA_VISIBLE_DEVICES=0 python train.py --config-name=overfit \
-#       data.dataset.hdf5_dir=/Data/lyw/libero_processed/libero_spatial/.train_pick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate \
+#       data.dataset.hdf5_dir=/data/lyw/libero_processed/libero_spatial/.train_pick_up_the_black_bowl_on_the_cookie_box_and_place_it_on_the_plate \
 #       subdir=overfit_sanity
 #
 # WARNING — overfit + state-prediction (SP) interaction:
@@ -41,7 +42,7 @@ output_model_name: lewm
 subdir: ${hydra:job.id}
 
 # --- Overfit switch (read by train.py) ---
-overfit_demo: 0          # take chunks from demo_idx=0 only; train == val
+overfit_demo: 0 # take chunks from demo_idx=0 only; train == val
 overfit_print_every: 100 # terminal print cadence (epochs)
 
 # --- Split (unused when overfit_demo is set, but kept for consistency) ---
@@ -53,6 +54,18 @@ img_size: 224
 patch_size: 14
 encoder_scale: tiny
 dump_object: True
+
+# Visual backbone — mirror lewm.yaml's frozen DINOv2-base default so the
+# pipeline sanity check exercises the real backbone. A frozen encoder doesn't
+# hurt overfit (the trainable projector + predictor have ample capacity to
+# memorize one demo). Legacy ViT-Tiny: source=spt_vit, freeze=false.
+vision_encoder:
+  source: hf # hf (frozen DINOv2-base) | spt_vit (legacy ViT-Tiny)
+  pretrained: false
+  model_name_or_path: facebook/dinov2-base
+  freeze: true
+  local_files_only: true
+  trust_remote_code: false
 
 trainer:
   max_epochs: 2000
@@ -71,7 +84,7 @@ loader:
 
 optimizer:
   type: AdamW
-  lr: 1.0e-3        # 20x baseline (5e-5) — tiny data, push through fast
+  lr: 1.0e-3 # 20x baseline (5e-5) — tiny data, push through fast
   weight_decay: 0.0 # disable to ease memorization
 
 wm:
@@ -83,18 +96,18 @@ predictor:
   heads: 16
   mlp_dim: 2048
   dim_head: 64
-  dropout: 0.0      # turn off to eliminate regularization noise
+  dropout: 0.0 # turn off to eliminate regularization noise
   emb_dropout: 0.0
 
 # Mirror the projector + loss schema from lewm.yaml so Hydra struct-mode
 # `loss.pred_weight=...` overrides on the CLI work without `+` prefix.
 # Default values still match the baseline overfit semantics (everything off).
 projector:
-  norm_type: layer  # 'layer' (baseline) | 'batch' (required when sigreg_weight > 0)
+  norm_type: layer # 'layer' (baseline) | 'batch' (required when sigreg_weight > 0)
 
 loss:
-  pred_weight: 0.0      # > 0 enables state prediction (SP) heads + 3 MSE losses
-  sigreg_weight: 0.0    # > 0 enables SIGReg on encoder outputs
+  pred_weight: 0.0 # > 0 enables state prediction (SP) heads + 3 MSE losses
+  sigreg_weight: 0.0 # > 0 enables SIGReg on encoder outputs
   sigreg:
     kwargs:
       knots: 17

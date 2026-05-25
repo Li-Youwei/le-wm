@@ -45,30 +45,49 @@ WARMUP_STEPS="${WARMUP_STEPS:-2000}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
 NUM_WORKERS="${NUM_WORKERS:-6}"            # dataloader workers; raise on many-core hosts to keep the GPU fed
 
-# Architecture toggles. Defaults reproduce plain sp_sigreg (CLS-only visual,
-# shared predictor, random-init trainable ViT-Tiny) — no behavior change unless
-# overridden.
+# Architecture toggles. Defaults: CLS-only visual, shared predictor, frozen
+# DINOv2-base backbone (the current default). No behavior change unless a knob
+# below is overridden.
 POOL_GRID="${POOL_GRID:-0}"                 # >0 enables V17 multi-token visual (G*G pooled patches)
 USE_MOT="${USE_MOT:-false}"                 # true enables full Mixture-of-Transformers
-VISION_SOURCE="${VISION_SOURCE:-spt_vit}"   # spt_vit | hf (frozen DINOv2 etc. via AutoModel)
-VISION_MODEL="${VISION_MODEL:-}"            # required when VISION_SOURCE=hf (e.g. facebook/dinov2-small)
-VISION_FREEZE="${VISION_FREEZE:-false}"     # hf path: eval() + requires_grad_(False)
-VISION_LOCAL_ONLY="${VISION_LOCAL_ONLY:-true}"  # set false to allow first download
+VISION_SOURCE="${VISION_SOURCE:-hf}"        # hf (frozen DINOv2, default) | spt_vit (legacy ViT-Tiny)
+VISION_MODEL="${VISION_MODEL:-facebook/dinov2-base}"  # used when VISION_SOURCE=hf
+# freeze default depends on source: hf (DINOv2) → frozen; spt_vit (ViT-Tiny) →
+# TRAINABLE. The 7008f15 baseline needs a trainable random-init ViT-Tiny — a
+# frozen random-init encoder would emit garbage features.
+if [[ "${VISION_SOURCE,,}" == "spt_vit" ]]; then
+    VISION_FREEZE="${VISION_FREEZE:-false}"
+else
+    VISION_FREEZE="${VISION_FREEZE:-true}"  # hf path: eval() + requires_grad_(False)
+fi
+VISION_LOCAL_ONLY="${VISION_LOCAL_ONLY:-true}"  # set false on the FIRST run to download DINOv2
+# Normalize bool-ish vars to lowercase so True/TRUE/False also work (the offline
+# gate below + Hydra bool overrides expect lowercase true/false).
+VISION_FREEZE="${VISION_FREEZE,,}"
+VISION_LOCAL_ONLY="${VISION_LOCAL_ONLY,,}"
 
-FLAT_DIR="${FLAT_DIR:-/Data/lyw/libero_processed_v5/all4_flat}"
-TOKENIZER="${TOKENIZER:-/Data/lyw/fast_tokenizer_all4}"
-PROCESSED_ROOT="${PROCESSED_ROOT:-/Data/lyw/libero_processed_v5}"
-CKPT_ROOT="${CKPT_ROOT:-/Data/lyw/stable-wm}"
+FLAT_DIR="${FLAT_DIR:-/data/lyw/libero_processed_v5/all4_flat}"
+TOKENIZER="${TOKENIZER:-/data/lyw/fast_tokenizer_all4}"
+PROCESSED_ROOT="${PROCESSED_ROOT:-/data/lyw/libero_processed_v5}"
+CKPT_ROOT="${CKPT_ROOT:-/data/lyw/stable-wm}"
 CKPT_DIR="${CKPT_ROOT}/all4_${ARM}_seed${SEED}"
 
 # Set GPU explicitly via CUDA_VISIBLE_DEVICES; default GPU 0.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
-export HF_HUB_OFFLINE=1
-export TRANSFORMERS_OFFLINE=1
+# HF offline: forced ON when VISION_LOCAL_ONLY=true (cache hit); OFF on the
+# first run (VISION_LOCAL_ONLY=false) so DINOv2-base — and, if not yet cached,
+# T5-small — can download. After the first run both are cached; keep it true.
+if [[ "$VISION_LOCAL_ONLY" == "true" ]]; then
+    export HF_HUB_OFFLINE=1
+    export TRANSFORMERS_OFFLINE=1
+else
+    export HF_HUB_OFFLINE=0
+    export TRANSFORMERS_OFFLINE=0
+fi
 export STABLEWM_HOME="$CKPT_DIR"
 
 # Conda init (bash -lc / non-interactive shells don't auto-init).
-source "$HOME/miniconda3/etc/profile.d/conda.sh"
+source /data/lyw/miniconda3/etc/profile.d/conda.sh
 conda activate vla
 
 echo "=========================================================="
@@ -96,7 +115,7 @@ mkdir -p "$CKPT_DIR"
 TRAIN_LOG="${CKPT_DIR}/train.log"
 echo "[run_all4] starting training; logs → $TRAIN_LOG"
 
-PROBE_SCRIPT="${PROBE_SCRIPT:-/Data/lyw/le-wm/quick_probe_eval.py}"
+PROBE_SCRIPT="${PROBE_SCRIPT:-/data/lyw/le-wm/quick_probe_eval.py}"
 PROBE_TRIGGER="${PROBE_TRIGGER:-20000}"
 PROBE_ENABLED="${PROBE_ENABLED:-true}"
 
@@ -178,7 +197,7 @@ for suite in libero_spatial libero_object libero_goal libero_10; do
         --tokenizer "$TOKENIZER" \
         --processed-dir "$PROC_DIR" \
         --suite "$suite" \
-        --num-episodes 20 \
+        --num-episodes 50 \
         --max-steps "$SUITE_MAX_STEPS" \
         --num-warmup-steps "$EVAL_WARMUP" \
         --device cuda \

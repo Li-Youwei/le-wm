@@ -229,7 +229,7 @@ class EarlyProbeCallback(Callback):
         super().__init__()
         self.trigger_steps = set(int(s) for s in trigger_steps)
         self.tokenizer_path = tokenizer_path
-        self.processed_root = processed_root  # /Data/lyw/libero_processed_v5
+        self.processed_root = processed_root  # /data/lyw/libero_processed_v5
         self.ckpt_dir = Path(ckpt_dir)
         self.script_path = script_path
         self._fired: set[int] = set()

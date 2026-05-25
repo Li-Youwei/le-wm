@@ -57,12 +57,13 @@ class MoTFeedForward(nn.Module):
 
     The companion MoTAttention splits the attention projections per modality
     too; the only globally-shared op in a MoT block is the scaled-dot-product
-    attention itself. Modality is assigned by absolute position in the
-    sequence layout (prefix=0, action=1, query=2), so routing has no learned
-    gating — it's a hard partition.
+    attention itself. Modality is assigned by absolute position to the REAL
+    modality of each token — text / image / state / action (+ state-query when
+    SP is on) — so routing has no learned gating; it's a hard partition. See
+    ARPredictor._build_modality_ids for the exact position→modality map.
 
     The forward runs each expert on the full sequence and masks-merges the
-    outputs. For our scale (B=128, T~110, M=3) this is ~M x the FFN-layer
+    outputs. For our scale (B=128, T~110, M=4-5) this is ~M x the FFN-layer
     FLOPs in exchange for code simplicity; scatter-gather would be
     faster but messier.
     """
@@ -272,56 +273,6 @@ class Block(nn.Module):
         return x
 
 
-class Transformer(nn.Module):
-    """Standard Transformer"""
-
-    def __init__(
-        self,
-        input_dim,
-        hidden_dim,
-        output_dim,
-        depth,
-        heads,
-        dim_head,
-        mlp_dim,
-        dropout=0.0,
-        block_class=Block,
-    ):
-        super().__init__()
-        self.norm = nn.LayerNorm(hidden_dim)
-        self.layers = nn.ModuleList([])
-
-        self.input_proj = (
-            nn.Linear(input_dim, hidden_dim)
-            if input_dim != hidden_dim
-            else nn.Identity()
-        )
-
-        self.output_proj = (
-            nn.Linear(hidden_dim, output_dim)
-            if hidden_dim != output_dim
-            else nn.Identity()
-        )
-
-        for _ in range(depth):
-            self.layers.append(
-                block_class(hidden_dim, heads, dim_head, mlp_dim, dropout)
-            )
-
-    def forward(self, x):
-
-        if hasattr(self, "input_proj"):
-            x = self.input_proj(x)
-
-        for block in self.layers:
-            x = block(x)
-        x = self.norm(x)
-
-        if hasattr(self, "output_proj"):
-            x = self.output_proj(x)
-        return x
-
-
 class MLP(nn.Module):
     """Simple MLP with optional normalization and activation"""
 
@@ -418,19 +369,27 @@ class ARPredictor(nn.Module):
         # transformer block routes BOTH its attention projections (QKV/O +
         # pre-norm, via MoTAttention) and its FFN (via MoTFeedForward) per
         # modality; only the attention token-mixing op stays global (full Meta
-        # "Mixture-of-Transformers" recipe). Hypothesis under test: a single
-        # shared block causes action prediction and image/state prediction to
-        # interfere, especially with multi-token visual prefix.
-        # Modality partitioning by position:
-        #   0 = prefix (lang + visual + proprio),
-        #   1 = action zone (BOS + action tokens + PAD),
-        #   2 = state-query (Q_ag/Q_hd/Q_pr, only when use_state_prediction).
+        # "Mixture-of-Transformers" recipe).
+        #
+        # Partitioning is by TRUE modality (Meta MoT "decouple by modality"),
+        # NOT by sequence-role. Each real modality gets its own expert:
+        #   0 = text   (language tokens)
+        #   1 = image  (agent + hand visual tokens — both views share it)
+        #   2 = state  (the single proprio token)
+        #   3 = action (BOS + action tokens + PAD)
+        #   4 = state-query (Q_ag/Q_hd/Q_pr) — only when use_state_prediction.
+        # This mirrors RynnVLA-002's four input modalities (image/text/state/
+        # action) and stops text, vision and proprio from sharing one FFN — the
+        # hypothesis being that a single shared expert makes action prediction
+        # and image/state processing interfere, especially with a multi-token
+        # visual prefix. See _build_modality_ids for the position→modality map.
         self.use_mot = bool(use_mot)
         if self.use_mot:
-            # n_modalities is fixed by the predictor's layout: 3 with SP
-            # enabled (which is the only configuration where modality 2
-            # is populated), 2 otherwise.
-            self.n_modalities = 3 if use_state_prediction else 2
+            # 5 modalities with SP (state-query populated), 4 without. NB: this
+            # mirrors the type_embedding count (`n_type`, below) — both encode
+            # the SAME partition (text/image/state/action[+query]). If you add
+            # or remove a modality, update BOTH (they're computed separately).
+            self.n_modalities = 5 if use_state_prediction else 4
         else:
             self.n_modalities = 0  # 0 = legacy single FFN (Block.use_mot=False)
 
@@ -669,32 +628,45 @@ class ARPredictor(nn.Module):
     ) -> torch.Tensor | None:
         """Build (B, L) modality_ids for MoT routing.
 
-        Modality assignment is by absolute position (deterministic, no learned
-        gating), matching the sequence layout used by forward() / generate():
-            0 = prefix  (lang + visual + proprio)
-            1 = action  (BOS + action tokens + PAD)
-            2 = state-query  (Q_ag, Q_hd, Q_pr) — only when has_query is True
+        True-modality partitioning (Meta MoT): assignment is by absolute
+        position (deterministic, no learned gating), one id per REAL modality —
+        not per sequence-role. Matches the layout built in forward()/generate()
+        ([lang, agent-visual, hand-visual, proprio, BOS, actions, (queries)]):
+            0 = text   (language tokens)
+            1 = image  (agent + hand visual tokens — both views, one modality)
+            2 = state  (the single proprio token)
+            3 = action (BOS + action tokens + PAD)
+            4 = state-query (Q_ag, Q_hd, Q_pr) — only when has_query is True
 
         Returns None when MoT is disabled (Block ignores it in that case).
+
+        NB: generate() grows the sequence one token at a time, so L may be
+        smaller than the full training layout (down to just prefix + BOS).
+        Every zone slice is clamped to [0, L) so partial sequences route
+        correctly.
         """
         if not self.use_mot:
             return None
         nv = self.n_visual_per_view
-        n_prefix = n_lang + 2 * nv + 1
-        action_end = n_prefix + 1 + self.max_action_tokens
-        # NB: forward() may pass L < action_end (e.g., generate() with only
-        # prefix+BOS+a-few-generated-tokens). Clamp the per-zone slices to L.
+        image_start = n_lang  # [0, image_start)         → text   (id 0)
+        state_start = n_lang + 2 * nv  # [image_start, state_start) → image (id 1)
+        n_prefix = state_start + 1  # [state_start, n_prefix)    → state (id 2), 1 tok
+        action_end = n_prefix + 1 + self.max_action_tokens  # +BOS +tokens +PAD
+
+        # id 0 (text) is the zero default; fill the rest, clamping each slice
+        # to L so a partial generate() sequence routes correctly.
         ids = torch.zeros(B, L, dtype=torch.long, device=device)
-        if action_end > n_prefix:
-            a_lo = min(n_prefix, L)
-            a_hi = min(action_end, L)
-            if a_hi > a_lo:
-                ids[:, a_lo:a_hi] = 1
+
+        def _fill(lo: int, hi: int, value: int) -> None:
+            lo_c, hi_c = min(lo, L), min(hi, L)
+            if hi_c > lo_c:
+                ids[:, lo_c:hi_c] = value
+
+        _fill(image_start, state_start, 1)  # image (both visual views)
+        _fill(state_start, n_prefix, 2)  # state (proprio, single token)
+        _fill(n_prefix, action_end, 3)  # action zone (BOS + tokens + PAD)
         if has_query and self.n_state_query > 0:
-            q_lo = min(action_end, L)
-            q_hi = min(action_end + self.n_state_query, L)
-            if q_hi > q_lo:
-                ids[:, q_lo:q_hi] = 2
+            _fill(action_end, action_end + self.n_state_query, 4)  # state-query
         return ids
 
     def _build_generate_mask(

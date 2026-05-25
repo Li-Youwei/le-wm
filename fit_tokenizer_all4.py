@@ -7,19 +7,19 @@ preprocessing (preprocess_libero.py --load-tokenizer ...) reuses this fitted tok
 while each per-task .h5 keeps its own (low, high) attrs.
 
 Output:
-- Fitted tokenizer at $TOKENIZER_DIR/ (default: /Data/lyw/fast_tokenizer_all4/)
-- Audit JSON at $AUDIT_OUT (default: /Data/lyw/libero_processed_v5/audit_token_length.json)
+- Fitted tokenizer at $TOKENIZER_DIR/ (default: /data/lyw/fast_tokenizer_all4/)
+- Audit JSON at $AUDIT_OUT (default: /data/lyw/libero_processed_v5/audit_token_length.json)
 - Stdout: per-task token-length stats + recommended max_action_tokens
 
-The raw LIBERO HDF5 directory ($RAW_LIBERO_DIR, default /nas_data_new/caz/data_ssd/libero)
+The raw LIBERO HDF5 directory ($RAW_LIBERO_DIR, default /data/lyw)
 is opened READ-ONLY. We never write into it.
 
 Usage (on the GPU server):
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \\
         python fit_tokenizer_all4.py \\
-            --raw-root /nas_data_new/caz/data_ssd/libero \\
-            --tokenizer-out /Data/lyw/fast_tokenizer_all4 \\
-            --audit-out /Data/lyw/libero_processed_v5/audit_token_length.json \\
+            --raw-root /data/lyw \\
+            --tokenizer-out /data/lyw/fast_tokenizer_all4 \\
+            --audit-out /data/lyw/libero_processed_v5/audit_token_length.json \\
             --chunk-size 20 --stride 1
 """
 
@@ -148,19 +148,19 @@ def main() -> None:
     parser.add_argument(
         "--raw-root",
         type=Path,
-        default=Path("/nas_data_new/caz/data_ssd/libero"),
+        default=Path("/data/lyw"),
         help="READ-ONLY raw LIBERO root containing libero_{spatial,object,goal,10}/",
     )
     parser.add_argument(
         "--tokenizer-out",
         type=Path,
-        default=Path("/Data/lyw/fast_tokenizer_all4"),
+        default=Path("/data/lyw/fast_tokenizer_all4"),
         help="Output dir for the fitted FAST tokenizer",
     )
     parser.add_argument(
         "--audit-out",
         type=Path,
-        default=Path("/Data/lyw/libero_processed_v5/audit_token_length.json"),
+        default=Path("/data/lyw/libero_processed_v5/audit_token_length.json"),
         help="Output JSON for per-task token length audit",
     )
     parser.add_argument("--chunk-size", type=int, default=20)

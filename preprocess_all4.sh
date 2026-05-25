@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
 # preprocess_all4.sh — Drive preprocess_libero.py × 40 with the shared FAST tokenizer.
 #
-# Reads from /nas_data_new/caz/data_ssd/libero/libero_{spatial,object,goal,10}/*.hdf5
+# Reads from /data/lyw/libero_{spatial,object,goal,10}/*.hdf5
 # (STRICTLY READ-ONLY) and writes per-task .h5 outputs to
-# /Data/lyw/libero_processed_v5/libero_<suite>/<task>.h5.
+# /data/lyw/libero_processed_v5/libero_<suite>/<task>.h5.
 #
 # Each invocation uses --load-tokenizer pointing at the unified
-# /Data/lyw/fast_tokenizer_all4/ so all 40 outputs share BPE vocab. Per-task
+# /data/lyw/fast_tokenizer_all4/ so all 40 outputs share BPE vocab. Per-task
 # action_low/high are computed independently (Option B). Skips tasks whose
 # output already exists, so the script is idempotent and resumable.
 #
@@ -16,9 +16,9 @@
 #   PARALLEL=4 bash preprocess_all4.sh            # 4 invocations at a time
 set -euo pipefail
 
-RAW_ROOT="${RAW_ROOT:-/nas_data_new/caz/data_ssd/libero}"
-OUT_ROOT="${OUT_ROOT:-/Data/lyw/libero_processed_v5}"
-TOKENIZER="${TOKENIZER:-/Data/lyw/fast_tokenizer_all4}"
+RAW_ROOT="${RAW_ROOT:-/data/lyw}"
+OUT_ROOT="${OUT_ROOT:-/data/lyw/libero_processed_v5}"
+TOKENIZER="${TOKENIZER:-/data/lyw/fast_tokenizer_all4}"
 CHUNK_SIZE="${CHUNK_SIZE:-20}"
 STRIDE="${STRIDE:-1}"
 MAX_TOKENS="${MAX_TOKENS:-80}"
@@ -38,13 +38,13 @@ if [[ ! -d "$RAW_ROOT" ]]; then
     exit 1
 fi
 
-# Refuse to write under the read-only raw data root.
-case "$OUT_ROOT" in
-    /nas_data_new/caz/data_ssd/libero*|/nas_data_new/caz/data_ssd/libero)
-        echo "ERROR: OUT_ROOT=$OUT_ROOT is inside the READ-ONLY raw LIBERO path. Aborting." >&2
-        exit 1
-        ;;
-esac
+# Raw suites live at $RAW_ROOT/libero_<suite>; OUT_ROOT must differ from
+# RAW_ROOT, else the per-task outputs would be written into (and pollute) the
+# read-only raw suite dirs. (Raw + processed now coexist under /data/lyw.)
+if [[ "$OUT_ROOT" == "$RAW_ROOT" ]]; then
+    echo "ERROR: OUT_ROOT must differ from RAW_ROOT ($RAW_ROOT) — output would land inside the raw suite dirs. Use e.g. OUT_ROOT=\$RAW_ROOT/libero_processed_v5." >&2
+    exit 1
+fi
 
 mkdir -p "$OUT_ROOT"
 

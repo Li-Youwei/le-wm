@@ -30,13 +30,13 @@ tmux kill-session -t "$SESSION" 2>/dev/null || true
 PROBE_ENABLED="${PROBE_ENABLED:-true}"
 tmux new-session -d -s "$SESSION" \
     "ARM=$ARM SEED=$SEED CUDA_VISIBLE_DEVICES=$GPU PROBE_ENABLED=$PROBE_ENABLED \
-     bash /Data/lyw/le-wm/run_all4.sh 2>&1 | \
-     tee /Data/lyw/le-wm/all4_${ARM}_seed${SEED}_gpu${GPU}.log; \
+     bash /data/lyw/le-wm/run_all4.sh 2>&1 | \
+     tee /data/lyw/le-wm/all4_${ARM}_seed${SEED}_gpu${GPU}.log; \
      echo \"=== EXIT \$? ===\"; bash"
 
 echo "[launch_all4] launched tmux session '$SESSION' (ARM=$ARM SEED=$SEED GPU=$GPU)"
 echo "Attach:   tmux attach -t $SESSION"
-echo "Tail log: tail -f /Data/lyw/le-wm/all4_${ARM}_seed${SEED}_gpu${GPU}.log"
+echo "Tail log: tail -f /data/lyw/le-wm/all4_${ARM}_seed${SEED}_gpu${GPU}.log"
 
 # ====================================================================
 # Phase B fanout (commented out — for multi-arm follow-up)
@@ -49,6 +49,6 @@ echo "Tail log: tail -f /Data/lyw/le-wm/all4_${ARM}_seed${SEED}_gpu${GPU}.log"
 #     gpu="${GPU_ARR[$((idx % ${#GPU_ARR[@]}))]}"
 #     win="arm_${a}_gpu${gpu}"
 #     tmux new-window -t "$SESSION" -n "$win" \
-#         "ARM=$a SEED=$SEED CUDA_VISIBLE_DEVICES=$gpu bash /Data/lyw/le-wm/run_all4.sh; bash"
+#         "ARM=$a SEED=$SEED CUDA_VISIBLE_DEVICES=$gpu bash /data/lyw/le-wm/run_all4.sh; bash"
 #     idx=$((idx + 1))
 # done

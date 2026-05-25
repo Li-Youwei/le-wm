@@ -33,15 +33,21 @@ Expected mask rules:
 import torch
 from module import ARPredictor, PAD_TOKEN_ID
 
+
 def main():
     # Create a minimal ARPredictor (only need mask logic, not weights).
     # proprio_dim matches the production default (9d = ee_pos(3)+quat(4)+grip(2)).
     pred = ARPredictor(
-        embed_dim=32, depth=1, heads=1, dim_head=32, mlp_dim=64,
-        max_action_tokens=6, max_lang_tokens=5, proprio_dim=9,
+        embed_dim=32,
+        depth=1,
+        heads=1,
+        dim_head=32,
+        mlp_dim=64,
+        max_action_tokens=6,
+        max_lang_tokens=5,
+        proprio_dim=9,
     )
 
-    B = 1
     n_lang = 5
     lang_lengths = torch.tensor([3])  # only first 3 are real
 
@@ -51,14 +57,28 @@ def main():
     L = pred.max_seq_len  # 5 + 3 + 1 + 6 = 15
     print(f"max_seq_len = {L}")
 
-    mask = pred._build_attn_mask(n_lang, lang_lengths, action_tokens, L, torch.device("cpu"))
+    mask = pred._build_attn_mask(
+        n_lang, lang_lengths, action_tokens, L, torch.device("cpu")
+    )
     mask_2d = mask[0, 0].int()  # (L, L), 1=attend, 0=blocked
 
     # Labels for readability
     labels = [
-        "lang0", "lang1", "lang2", "lPAD3", "lPAD4",
-        "z_ag", "z_hd", "z_pr",
-        "BOS", "T_1", "T_2", "T_3", "T_4", "aPAD5", "aPAD6",
+        "lang0",
+        "lang1",
+        "lang2",
+        "lPAD3",
+        "lPAD4",
+        "z_ag",
+        "z_hd",
+        "z_pr",
+        "BOS",
+        "T_1",
+        "T_2",
+        "T_3",
+        "T_4",
+        "aPAD5",
+        "aPAD6",
     ]
 
     # Print matrix
@@ -88,13 +108,17 @@ def main():
     for i in real_prefix:
         for j in real_prefix:
             if mask_2d[i, j] != 1:
-                errors.append(f"FAIL: prefix bidir — mask[{labels[i]},{labels[j]}] = 0, expected 1")
+                errors.append(
+                    f"FAIL: prefix bidir — mask[{labels[i]},{labels[j]}] = 0, expected 1"
+                )
 
     # Check 4: Prefix cannot see action zone (pos 8+)
     for i in real_prefix:
         for j in range(8, L):
             if mask_2d[i, j] != 0:
-                errors.append(f"FAIL: prefix→action — mask[{labels[i]},{labels[j]}] = 1, expected 0")
+                errors.append(
+                    f"FAIL: prefix→action — mask[{labels[i]},{labels[j]}] = 1, expected 0"
+                )
 
     # Check 5: BOS (pos 8) sees all real prefix + itself
     for j in real_prefix + [8]:

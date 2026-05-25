@@ -7,17 +7,17 @@ and language instruction as input.
 Usage:
     # Single task
     python eval_libero.py \
-        --checkpoint /Data/lyw/stable-wm/lewm_weights.ckpt \
-        --tokenizer /Data/lyw/fast_tokenizer \
-        --processed-dir /Data/lyw/libero_processed/libero_90 \
+        --checkpoint /data/lyw/stable-wm/lewm_weights.ckpt \
+        --tokenizer /data/lyw/fast_tokenizer \
+        --processed-dir /data/lyw/libero_processed/libero_90 \
         --suite libero_spatial --task-id 0 \
         --num-episodes 20
 
     # All tasks in a suite
     python eval_libero.py \
-        --checkpoint /Data/lyw/stable-wm/lewm_weights.ckpt \
-        --tokenizer /Data/lyw/fast_tokenizer \
-        --processed-dir /Data/lyw/libero_processed/libero_90 \
+        --checkpoint /data/lyw/stable-wm/lewm_weights.ckpt \
+        --tokenizer /data/lyw/fast_tokenizer \
+        --processed-dir /data/lyw/libero_processed/libero_90 \
         --suite libero_spatial \
         --num-episodes 20
 """
@@ -49,30 +49,65 @@ from libero_dataset import _preprocess_image
 from preprocess_libero import normalize_proprio
 
 
+# Per-suite policy horizon (max env steps per episode, EXCLUDING the no-op
+# warmup). These are the OpenVLA / RynnVLA-002 LIBERO eval values, verbatim
+# from RynnVLA-002's run_libero_eval.py (each comment = "longest training demo
+# has N steps"). Used as the default when --max-steps is not given explicitly,
+# so a standalone single-suite eval automatically uses the correct horizon.
+LIBERO_MAX_STEPS = {
+    "libero_spatial": 220,
+    "libero_object": 280,
+    "libero_goal": 300,
+    "libero_10": 520,
+    "libero_90": 400,
+}
+
+
 # ---------------------------------------------------------------------------
 # Model loading
 # ---------------------------------------------------------------------------
 
 
 def build_model(device: torch.device) -> torch.nn.Module:
-    """Build the JEPA model with the same architecture as train.py.
+    """Build the JEPA model matching train.py's DEFAULT architecture.
+
+    The default visual backbone is now a FROZEN DINOv2-base (see
+    config/train/lewm.yaml). This ``_weights.ckpt`` path therefore reconstructs
+    DINOv2-base via build_visual_encoder so the encoder.* keys line up. SP /
+    SIGReg / MoT / V17 and the legacy random-init ViT-Tiny baseline are
+    evaluated via the pickled ``_object.ckpt`` instead.
 
     Args:
         device: target device.
     """
     import stable_pretraining as spt
+    from omegaconf import OmegaConf
 
     from jepa import JEPA
     from module import ARPredictor, MLP
+    from vision_backbone import build_visual_encoder
 
-    encoder = spt.backbone.utils.vit_hf(
-        "tiny",
-        patch_size=14,
-        image_size=224,
-        pretrained=False,
-        use_mask_token=False,
+    # Mirror config/train/lewm.yaml's default backbone: a FROZEN DINOv2-base
+    # loaded via AutoModel. build_visual_encoder reproduces the exact training
+    # construction, so the encoder.* keys in a _weights.ckpt line up.
+    # `local_files_only` is intentionally omitted so build_visual_encoder falls
+    # back to _offline_default() (HF_HUB_OFFLINE / TRANSFORMERS_OFFLINE): a
+    # standalone eval on an un-cached machine can then still fetch DINOv2-base
+    # (export HF_HUB_OFFLINE=1 to force offline once it is cached).
+    enc_cfg = OmegaConf.create(
+        {
+            "encoder_scale": "tiny",
+            "patch_size": 14,
+            "img_size": 224,
+            "vision_encoder": {
+                "source": "hf",
+                "model_name_or_path": "facebook/dinov2-base",
+                "freeze": True,
+                "trust_remote_code": False,
+            },
+        }
     )
-    hidden_dim = encoder.config.hidden_size
+    encoder, hidden_dim, freeze_encoder = build_visual_encoder(enc_cfg, spt)
     embed_dim = 192
 
     predictor = ARPredictor(
@@ -112,6 +147,7 @@ def build_model(device: torch.device) -> torch.nn.Module:
         projector=projector,
         lang_encoder=lang_encoder,
         lang_proj=lang_proj,
+        freeze_encoder=freeze_encoder,
     )
     return model.to(device)
 
@@ -171,6 +207,22 @@ def load_checkpoint(
             if new_key.startswith("lang_encoder."):
                 continue
             model_sd[new_key] = v
+
+    # Backbone-mismatch guard: build_model() constructs the default DINOv2-base
+    # (projector input 768). A legacy ViT-Tiny _weights.ckpt has projector input
+    # 192, which would otherwise raise a cryptic torch size-mismatch inside
+    # load_state_dict. Surface an actionable message first.
+    proj_key = "projector.net.0.weight"
+    if proj_key in model_sd and hasattr(model.projector, "net"):
+        ckpt_in = model_sd[proj_key].shape[1]
+        model_in = model.projector.net[0].weight.shape[1]
+        if ckpt_in != model_in:
+            raise ValueError(
+                f"Projector input dim mismatch: checkpoint={ckpt_in}, model={model_in}. "
+                "This _weights.ckpt was trained with a different visual backbone "
+                "(legacy ViT-Tiny=192 vs default DINOv2-base=768). Evaluate it via the "
+                "matching _object.ckpt, or rebuild build_model() with that backbone."
+            )
 
     missing, unexpected = model.load_state_dict(model_sd, strict=False)
     # T5 encoder keys are expected to be missing (loaded from pretrained)
@@ -611,14 +663,19 @@ def main():
         help="Single task index (0-9). Omit to run all tasks in suite",
     )
     parser.add_argument(
-        "--num-episodes", type=int, default=20, help="Episodes per task"
+        "--num-episodes",
+        type=int,
+        default=50,
+        help="Rollouts per task (RynnVLA-002 protocol: num_trials_per_task=50).",
     )
     parser.add_argument(
         "--max-steps",
         type=int,
-        default=300,
+        default=None,
         help="Max policy-driven env steps per episode (excludes warmup). "
-        "LIBERO convention: spatial 220 / object 280 / goal 300 / 10 (long) 520.",
+        "When omitted, auto-selected per --suite from LIBERO_MAX_STEPS "
+        "(spatial 220 / object 280 / goal 300 / 10 (long) 520 / 90 400) — the "
+        "OpenVLA / RynnVLA-002 convention. Pass explicitly to override.",
     )
     parser.add_argument(
         "--num-warmup-steps",
@@ -639,7 +696,7 @@ def main():
     parser.add_argument(
         "--temperature", type=float, default=0.0, help="0=greedy, >0=sampling"
     )
-    parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--seed", type=int, default=3072)
     parser.add_argument(
         "--save-videos",
         action="store_true",
@@ -648,7 +705,7 @@ def main():
     parser.add_argument(
         "--video-dir",
         type=str,
-        default="/Data/lyw/eval_videos",
+        default="/data/lyw/eval_videos",
         help="Directory to save videos",
     )
     parser.add_argument(
@@ -666,6 +723,18 @@ def main():
 
     device = torch.device(args.device)
     np.random.seed(args.seed)
+
+    # Resolve per-suite policy horizon (OpenVLA / RynnVLA-002 convention) when
+    # --max-steps is not given explicitly. Explicit --max-steps still wins.
+    max_steps = (
+        args.max_steps
+        if args.max_steps is not None
+        else LIBERO_MAX_STEPS.get(args.suite, 300)
+    )
+    print(
+        f"Eval horizon: max_steps={max_steps} (warmup={args.num_warmup_steps}, "
+        f"episodes={args.num_episodes}) for suite={args.suite}"
+    )
 
     # Load model — two formats supported:
     #   _weights.ckpt  = Lightning state_dict (from spt.Manager)
@@ -746,7 +815,7 @@ def main():
                 action_dim,
                 language_instruction,
                 num_episodes=args.num_episodes,
-                max_steps=args.max_steps,
+                max_steps=max_steps,
                 num_warmup_steps=args.num_warmup_steps,
                 device=device,
                 temperature=args.temperature,
