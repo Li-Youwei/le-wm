@@ -119,9 +119,59 @@ class VisualTokenProjectionTest(unittest.TestCase):
         )
 
         self.assertEqual(tuple(logits.shape), (B, 7, ACTION_HEAD_SIZE))
-        self.assertEqual(tuple(pred_ag.shape), (B, N, D))
-        self.assertEqual(tuple(pred_hd.shape), (B, N, D))
-        self.assertEqual(tuple(pred_pr.shape), (B, 9))
+        self.assertEqual(tuple(pred_ag.shape), (B, 4, N, D))
+        self.assertEqual(tuple(pred_hd.shape), (B, 4, N, D))
+        self.assertEqual(tuple(pred_pr.shape), (B, 4, 9))
+
+    def test_multi_horizon_future_visual_encoding_preserves_horizon_axis(self) -> None:
+        cls_projector = RecordingProjector(offset=100.0)
+        patch_projector = RecordingProjector(offset=1000.0)
+        model = JEPA(
+            encoder=FakeEncoder(hidden_dim=4, n_patches=16),
+            predictor=nn.Identity(),
+            projector=cls_projector,
+            patch_projector=patch_projector,
+            visual_pool_grid=2,
+        )
+
+        pixels_agent = torch.zeros(2, 4, 3, 224, 224)
+        pixels_hand = torch.zeros(2, 4, 3, 224, 224)
+
+        future_agent, future_hand = model.encode_future_visual(
+            pixels_agent,
+            pixels_hand,
+        )
+        self.assertEqual(tuple(future_agent.shape), (2, 4, 4))
+        self.assertEqual(tuple(future_hand.shape), (2, 4, 4))
+
+        future_agent_tokens, future_hand_tokens = model.encode_future_visual(
+            pixels_agent,
+            pixels_hand,
+            return_all_tokens=True,
+        )
+        self.assertEqual(tuple(future_agent_tokens.shape), (2, 4, 5, 4))
+        self.assertEqual(tuple(future_hand_tokens.shape), (2, 4, 5, 4))
+
+    def test_visual257_positional_grids_and_state_queries_match_pool_grid(self) -> None:
+        predictor = ARPredictor(
+            embed_dim=192,
+            depth=1,
+            heads=2,
+            dim_head=8,
+            mlp_dim=256,
+            max_action_tokens=80,
+            max_lang_tokens=25,
+            proprio_dim=9,
+            visual_pool_grid=16,
+            use_state_prediction=True,
+        )
+
+        self.assertEqual(predictor.n_visual_per_view, 257)
+        self.assertEqual(tuple(predictor.agent_patch_2d_pos.shape), (16, 16, 192))
+        self.assertEqual(tuple(predictor.hand_patch_2d_pos.shape), (16, 16, 192))
+        self.assertEqual(tuple(predictor.state_query_embeddings.shape), (4, 3, 192))
+        self.assertEqual(predictor.n_state_query, 12)
+        self.assertEqual(predictor.max_seq_len, 633)
 
     def test_multi_visual_token_predictor_requires_grid_layout(self) -> None:
         with self.assertRaisesRegex(ValueError, "visual_pool_grid > 0"):

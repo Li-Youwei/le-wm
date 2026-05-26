@@ -12,7 +12,14 @@ from omegaconf import OmegaConf
 from transformers import T5EncoderModel
 
 from jepa import JEPA
-from module import ARPredictor, MLP, SIGReg, ACTION_HEAD_SIZE, EOS_TOKEN_ID
+from module import (
+    ACTION_HEAD_SIZE,
+    DEFAULT_STATE_PREDICTION_HORIZONS,
+    EOS_TOKEN_ID,
+    ARPredictor,
+    MLP,
+    SIGReg,
+)
 from utils import ModelObjectCallBack, PeriodicPrintCallback
 from vision_backbone import build_visual_encoder
 
@@ -36,8 +43,8 @@ def lejepa_forward(self, batch, stage, cfg):
     Always computes ``L_CE`` (action token cross-entropy).
 
     When ``cfg.loss.pred_weight > 0``: also computes ``L_pred`` — three MSE
-    losses against the future-frame encoder outputs (visual) and the raw
-    9-d future proprio. Per LeWM paper Section 3, the target encoder
+    losses against multi-horizon future-frame encoder outputs (visual) and
+    raw 9-d future proprio. Per LeWM paper Section 3, the target encoder
     branch does NOT use stop-gradient; SIGReg is what prevents collapse.
 
     When ``cfg.loss.sigreg_weight > 0``: also computes ``L_sigreg`` on the
@@ -155,7 +162,7 @@ def lejepa_forward(self, batch, stage, cfg):
     if use_state_pred:
         pixels_agent_future = batch["pixels_agent_future"]
         pixels_hand_future = batch["pixels_hand_future"]
-        proprio_future = batch["proprio_future"]  # (B, 9) raw target
+        proprio_future = batch["proprio_future"]  # (B, K, 9) raw target
 
         # Encode future visual through the SAME encoder + projector. Both
         # the source path (z_agent/z_hand of the current frame, computed
@@ -167,17 +174,27 @@ def lejepa_forward(self, batch, stage, cfg):
             pixels_hand_future,
             return_all_tokens=patch_sp,
         )
+        target_horizons = int(proprio_future.size(1))
+        pred_horizons = int(pred_pr.size(1))
+        if pred_horizons != target_horizons:
+            raise RuntimeError(
+                "State-prediction horizon count mismatch: predictor produced "
+                f"K={pred_horizons} for horizons "
+                f"{getattr(self.model.predictor, 'state_prediction_horizons', None)}, "
+                f"but dataset provided K={target_horizons}. Re-run preprocessing "
+                "with multi-horizon targets or align predictor.state_prediction_horizons."
+            )
 
         if patch_sp:
             if (
-                pred_ag.dim() != 3
-                or pred_hd.dim() != 3
-                or z_agent_future.dim() != 3
-                or z_hand_future.dim() != 3
+                pred_ag.dim() != 4
+                or pred_hd.dim() != 4
+                or z_agent_future.dim() != 4
+                or z_hand_future.dim() != 4
             ):
                 raise RuntimeError(
                     "visual_tokens.patch_sp=True requires pred_ag/pred_hd and "
-                    "future visual targets to be (B,N,D), got "
+                    "future visual targets to be (B,K,N,D), got "
                     f"pred_ag={tuple(pred_ag.shape)}, "
                     f"pred_hd={tuple(pred_hd.shape)}, "
                     f"z_agent_future={tuple(z_agent_future.shape)}, "
@@ -191,21 +208,21 @@ def lejepa_forward(self, batch, stage, cfg):
                     f"pred_hd={tuple(pred_hd.shape)} vs "
                     f"z_hand_future={tuple(z_hand_future.shape)}"
                 )
-            loss_pred_ag_cls = F.mse_loss(pred_ag[:, 0], z_agent_future[:, 0])
-            loss_pred_hd_cls = F.mse_loss(pred_hd[:, 0], z_hand_future[:, 0])
-            if pred_ag.size(1) > 1:
+            loss_pred_ag_cls = F.mse_loss(pred_ag[:, :, 0], z_agent_future[:, :, 0])
+            loss_pred_hd_cls = F.mse_loss(pred_hd[:, :, 0], z_hand_future[:, :, 0])
+            if pred_ag.size(2) > 1:
                 loss_pred_ag_patch = F.mse_loss(
-                    pred_ag[:, 1:],
-                    z_agent_future[:, 1:],
+                    pred_ag[:, :, 1:],
+                    z_agent_future[:, :, 1:],
                 )
                 loss_pred_hd_patch = F.mse_loss(
-                    pred_hd[:, 1:],
-                    z_hand_future[:, 1:],
+                    pred_hd[:, :, 1:],
+                    z_hand_future[:, :, 1:],
                 )
             else:
                 loss_pred_ag_patch = pred_ag.new_zeros(())
                 loss_pred_hd_patch = pred_hd.new_zeros(())
-            active_patch_weight = patch_sp_weight if pred_ag.size(1) > 1 else 0.0
+            active_patch_weight = patch_sp_weight if pred_ag.size(2) > 1 else 0.0
             denom = 1.0 + active_patch_weight
             loss_pred_ag = (
                 loss_pred_ag_cls + active_patch_weight * loss_pred_ag_patch
@@ -218,8 +235,36 @@ def lejepa_forward(self, batch, stage, cfg):
             output["pred_loss_ag_patch"] = loss_pred_ag_patch
             output["pred_loss_hd_patch"] = loss_pred_hd_patch
         else:
+            if (
+                pred_ag.dim() != 3
+                or pred_hd.dim() != 3
+                or z_agent_future.dim() != 3
+                or z_hand_future.dim() != 3
+            ):
+                raise RuntimeError(
+                    "State prediction requires pred_ag/pred_hd and future visual "
+                    "targets to be (B,K,D), got "
+                    f"pred_ag={tuple(pred_ag.shape)}, "
+                    f"pred_hd={tuple(pred_hd.shape)}, "
+                    f"z_agent_future={tuple(z_agent_future.shape)}, "
+                    f"z_hand_future={tuple(z_hand_future.shape)}"
+                )
+            if pred_ag.shape != z_agent_future.shape or pred_hd.shape != z_hand_future.shape:
+                raise RuntimeError(
+                    "State prediction/target shapes must match exactly, got "
+                    f"pred_ag={tuple(pred_ag.shape)} vs "
+                    f"z_agent_future={tuple(z_agent_future.shape)}, "
+                    f"pred_hd={tuple(pred_hd.shape)} vs "
+                    f"z_hand_future={tuple(z_hand_future.shape)}"
+                )
             loss_pred_ag = F.mse_loss(pred_ag, z_agent_future)
             loss_pred_hd = F.mse_loss(pred_hd, z_hand_future)
+        if pred_pr.shape != proprio_future.shape:
+            raise RuntimeError(
+                "Proprio state prediction/target shapes must match exactly, got "
+                f"pred_pr={tuple(pred_pr.shape)} vs "
+                f"proprio_future={tuple(proprio_future.shape)}"
+            )
         loss_pred_pr = F.mse_loss(pred_pr, proprio_future)
 
         output["pred_loss"] = loss_pred_ag + loss_pred_hd + loss_pred_pr
@@ -245,12 +290,15 @@ def lejepa_forward(self, batch, stage, cfg):
             # SIGReg degenerates to 2 streams (current views only).
             sigreg_input = torch.stack([z_ag_cls, z_hd_cls], dim=0)
         else:
-            z_ag_future_cls = (
-                z_agent_future[:, 0] if z_agent_future.dim() == 3 else z_agent_future
-            )
-            z_hd_future_cls = (
-                z_hand_future[:, 0] if z_hand_future.dim() == 3 else z_hand_future
-            )
+            if z_agent_future.dim() == 4:
+                z_ag_future_cls = z_agent_future[:, -1, 0]
+                z_hd_future_cls = z_hand_future[:, -1, 0]
+            elif z_agent_future.dim() == 3:
+                z_ag_future_cls = z_agent_future[:, -1]
+                z_hd_future_cls = z_hand_future[:, -1]
+            else:
+                z_ag_future_cls = z_agent_future
+                z_hd_future_cls = z_hand_future
             sigreg_input = torch.stack(
                 [z_ag_cls, z_hd_cls, z_ag_future_cls, z_hd_future_cls],
                 dim=0,
@@ -349,6 +397,7 @@ def run(cfg):
     max_lang_tokens = cfg.data.dataset.get("max_lang_tokens", 25)
     proprio_dim = cfg.data.dataset.get("proprio_dim", 9)
     use_language = cfg.data.dataset.get("use_language", True)
+    chunk_size = int(cfg.data.dataset.get("chunk_size", 20))
 
     # Loss-weight-driven feature toggles. State prediction needs the
     # extra HDF5 fields (image_*_future, proprio_future) and the 3
@@ -360,6 +409,21 @@ def run(cfg):
     gripper_aux_weight = float(loss_cfg_run.get("gripper_aux_weight", 0.0))
     use_state_prediction = pred_weight > 0
     use_gripper_aux = gripper_aux_weight > 0
+    predictor_cfg_run = cfg.get("predictor", {}) or {}
+    state_prediction_horizons = tuple(
+        int(h)
+        for h in predictor_cfg_run.get(
+            "state_prediction_horizons",
+            DEFAULT_STATE_PREDICTION_HORIZONS,
+        )
+    )
+    if use_state_prediction and max(state_prediction_horizons) > chunk_size:
+        raise ValueError(
+            "state_prediction_horizons must fit within the action chunk: "
+            f"horizons={state_prediction_horizons}, chunk_size={chunk_size}"
+        )
+    if use_state_prediction:
+        print(f"[state_prediction] horizons={state_prediction_horizons}")
 
     # Projector normalization: must be 'batch' when SIGReg is enabled
     # (LeWM paper Section 3 — LayerNorm prevents the anti-collapse
@@ -556,7 +620,7 @@ def run(cfg):
     # output dim matches batch["gripper_seq"].shape[1]. We treat it as
     # immutable (H=20 across the project); pull from data config to surface
     # mismatches loudly.
-    gripper_chunk_size = int(cfg.data.dataset.get("chunk_size", 20))
+    gripper_chunk_size = chunk_size
     predictor = ARPredictor(
         embed_dim=embed_dim,
         max_action_tokens=max_action_tokens,

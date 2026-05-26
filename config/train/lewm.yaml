@@ -66,6 +66,8 @@ predictor:
   # action tokens use separate non-embedding transformer parameters while
   # retaining global self-attention over the full sequence.
   state_prediction_arch: shared
+  # State-prediction query blocks, each containing Q_ag/Q_hd/Q_pr.
+  state_prediction_horizons: [5, 10, 15, 20]
 
 # Projector normalization layer — see AGENTS.md for SIGReg/BatchNorm notes.
 # Default 'layer' reproduces the frozen baseline.
@@ -82,7 +84,7 @@ projector:
 #   pred_weight = 1.0  (no separate weight in paper; implicitly 1.0)
 #   sigreg_weight = 0.1  (paper Section 3, λ = 0.1)
 loss:
-  pred_weight: 0.0       # > 0 enables Q_ag/Q_hd/Q_pr STATE_QUERY tokens + 3 MSE losses
+  pred_weight: 0.0       # > 0 enables horizon STATE_QUERY blocks + 3 stream MSE losses
   sigreg_weight: 0.0     # > 0 enables SIGReg on encoder outputs (Algorithm 1 strict)
   # Gripper-aware auxiliary head + MSE loss. When > 0 the predictor grows a
   # small MLP that reads the BOS hidden state and regresses the (H,)

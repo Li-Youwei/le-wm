@@ -172,34 +172,64 @@ class JEPA(nn.Module):
         ViT calls per training step in SP mode = 2 (down from 4).
 
         Args:
-            pixels_agent_future: (B, 3, H, W) agentview image at raw step t+H.
-            pixels_hand_future: (B, 3, H, W) hand-cam image at raw step t+H.
+            pixels_agent_future: (B, 3, H, W) agentview image at raw step t+H,
+                or (B, K, 3, H, W) for multi-horizon state prediction.
+            pixels_hand_future: (B, 3, H, W) hand-cam image at raw step t+H,
+                or (B, K, 3, H, W) for multi-horizon state prediction.
             return_all_tokens: when True, return the same CLS+pooled-patch
                 layout as ``encode()`` for patch-level state prediction.
 
         Returns:
             When ``return_all_tokens`` is False:
-                z_agent_future: (B, D) future agentview CLS latent.
-                z_hand_future: (B, D) future hand-cam CLS latent.
+                z_agent_future: (B, D) or (B, K, D) future agentview CLS latent.
+                z_hand_future: (B, D) or (B, K, D) future hand-cam CLS latent.
             When True:
-                z_agent_future: (B, N, D) future agentview tokens.
-                z_hand_future: (B, N, D) future hand-cam tokens.
+                z_agent_future: (B, N, D) or (B, K, N, D) future agentview tokens.
+                z_hand_future: (B, N, D) or (B, K, N, D) future hand-cam tokens.
         """
+        multi_horizon = pixels_agent_future.dim() == 5
+        if pixels_agent_future.dim() != pixels_hand_future.dim():
+            raise ValueError(
+                "pixels_agent_future and pixels_hand_future must have matching "
+                f"rank, got {pixels_agent_future.dim()} and {pixels_hand_future.dim()}"
+            )
+        if multi_horizon:
+            B, K = pixels_agent_future.shape[:2]
+            pixels_agent_in = pixels_agent_future.reshape(
+                B * K,
+                *pixels_agent_future.shape[2:],
+            )
+            pixels_hand_in = pixels_hand_future.reshape(
+                B * K,
+                *pixels_hand_future.shape[2:],
+            )
+        else:
+            B = pixels_agent_future.size(0)
+            K = None
+            pixels_agent_in = pixels_agent_future
+            pixels_hand_in = pixels_hand_future
+
         visual_cat = torch.cat(
-            [pixels_agent_future, pixels_hand_future],
+            [pixels_agent_in, pixels_hand_in],
             dim=0,
-        )  # (2B, C, H, W)
+        )  # (2B, C, H, W) or (2*B*K, C, H, W)
         visual_out = self._encode_visual_cat(visual_cat)
         if return_all_tokens:
             tokens_2b = self._pool_visual_tokens(visual_out.last_hidden_state)
             visual_z = self._project_visual_tokens(tokens_2b)  # (2B, N, D)
             z_agent_future, z_hand_future = visual_z.chunk(2, dim=0)
+            if multi_horizon:
+                z_agent_future = z_agent_future.reshape(B, K, *z_agent_future.shape[1:])
+                z_hand_future = z_hand_future.reshape(B, K, *z_hand_future.shape[1:])
             return z_agent_future, z_hand_future
 
         # CLS-only path for SP / SIGReg: take last_hidden_state[:, 0] before
         # the projector to skip the pooling-and-reshape codepath entirely.
         visual_z = self.projector(visual_out.last_hidden_state[:, 0])  # (2B, D)
         z_agent_future, z_hand_future = visual_z.chunk(2, dim=0)
+        if multi_horizon:
+            z_agent_future = z_agent_future.reshape(B, K, -1)
+            z_hand_future = z_hand_future.reshape(B, K, -1)
         return z_agent_future, z_hand_future
 
     def _encode_visual_cat(self, visual_cat: torch.Tensor):

@@ -346,6 +346,7 @@ EOS_TOKEN_ID = 1025
 PAD_TOKEN_ID = 1026
 TOTAL_VOCAB_SIZE = FAST_VOCAB_SIZE + 3  # 1027: 0..1023 FAST + BOS + EOS + PAD
 ACTION_HEAD_SIZE = FAST_VOCAB_SIZE + 2  # 1026: predict 0..1025, PAD excluded
+DEFAULT_STATE_PREDICTION_HORIZONS = (5, 10, 15, 20)
 
 MOT_LANG = 0
 MOT_VISUAL = 1
@@ -360,22 +361,24 @@ class ARPredictor(nn.Module):
     Baseline (use_state_prediction=False) processes the unified sequence:
         [l_1...l_n, z_agent, z_hand, z_proprio, BOS, T_1...T_k, PAD...]
 
-    With state prediction enabled (use_state_prediction=True), three query
-    tokens are appended at the end during training:
+    With state prediction enabled (use_state_prediction=True), four horizon
+    blocks of query tokens are appended at the end during training:
         [l_1...l_n, z_agent, z_hand, z_proprio, BOS, T_1...T_k, PAD...,
-         Q_ag, Q_hd, Q_pr]
+         (Q_ag,Q_hd,Q_pr)_t+5, ..., (Q_ag,Q_hd,Q_pr)_t+20]
 
-    The Q tokens read out predicted future latents (z_ag_{t+H}, z_hd_{t+H})
-    and predicted raw future proprio (s_pr_{t+H}, 9d).
+    The Q tokens read out predicted future latents (z_ag_{t+h}, z_hd_{t+h})
+    and predicted raw future proprio (s_pr_{t+h}, 9d) for each configured
+    horizon h.
 
-    Attention mask is prefix-bidirectional + action-causal + query-isolated:
-    - Perception prefix (lang + visual + proprio): bidirectional among real tokens
-    - Action tokens (BOS + T_1...T_k): see all real prefix, causal within action group
+    Attention mask is prefix-structured + action-causal + horizon-query causal:
+    - Language rows see real language + visual + proprio context only.
+    - Visual/proprio/BOS rows see real language + visual + proprio + BOS.
+    - Action tokens (T_1...T_k): see real context + BOS and are causal within
+      the action-token group.
     - PAD tokens: attend to nothing, no other token attends to them
-    - STATE_QUERY tokens (Q_ag, Q_hd, Q_pr): see all real prefix + real action zone
-      (BOS + real T) + themselves only. The three queries DO NOT attend to each
-      other — this preserves three-way independence of the predictions and
-      prevents one head from copying another's hidden state.
+    - STATE_QUERY tokens see real context + BOS + all non-PAD action tokens,
+      previous horizon query blocks, and themselves. Q_ag/Q_hd/Q_pr in the same
+      horizon block are isolated from each other.
 
     Inference (`generate()`) does NOT construct STATE_QUERY tokens regardless
     of the flag, so eval_libero.py flow `[lang, z_ag, z_hd, z_pr, BOS] →
@@ -385,8 +388,8 @@ class ARPredictor(nn.Module):
     language, visual, proprio, and action tokens use modality-specific
     layer norms, attention projection matrices, and FFNs, while attention is
     still computed globally over the full sequence. STATE_QUERY tokens are
-    routed by target modality: Q_ag/Q_hd use the visual expert, Q_pr uses the
-    proprio expert.
+    routed by target modality in each horizon block: Q_ag/Q_hd use the visual
+    expert, Q_pr uses the proprio expert.
     """
 
     def __init__(
@@ -407,6 +410,7 @@ class ARPredictor(nn.Module):
         n_visual_tokens_per_view: int = 1,
         visual_pool_grid: int = 0,
         state_pred_visual_tokens: bool = False,
+        state_prediction_horizons: tuple[int, ...] | list[int] | None = None,
         use_gripper_aux: bool = False,
         gripper_chunk_size: int = 20,
         state_prediction_arch: str = "shared",
@@ -418,7 +422,28 @@ class ARPredictor(nn.Module):
         self.proprio_dim = proprio_dim
         self.use_state_prediction = use_state_prediction
         self.state_pred_visual_tokens = bool(state_pred_visual_tokens)
-        self.n_state_query = 3 if use_state_prediction else 0
+        if state_prediction_horizons is None:
+            horizons = DEFAULT_STATE_PREDICTION_HORIZONS
+        else:
+            horizons = tuple(int(h) for h in state_prediction_horizons)
+        if not horizons:
+            raise ValueError("state_prediction_horizons must contain at least one horizon")
+        if any(h <= 0 for h in horizons):
+            raise ValueError(
+                f"state_prediction_horizons must be positive, got {horizons}"
+            )
+        if len(set(horizons)) != len(horizons):
+            raise ValueError(
+                f"state_prediction_horizons must be unique, got {horizons}"
+            )
+        self.state_prediction_horizons = tuple(horizons)
+        self.n_state_horizons = len(self.state_prediction_horizons)
+        self.n_state_streams = 3
+        self.n_state_query = (
+            self.n_state_horizons * self.n_state_streams
+            if use_state_prediction
+            else 0
+        )
         if state_prediction_arch not in ("shared", "mot"):
             raise ValueError(
                 "state_prediction_arch must be 'shared' or 'mot', got "
@@ -444,8 +469,8 @@ class ARPredictor(nn.Module):
                 "so view/2D patch positional embeddings have a defined grid."
             )
 
-        # max_seq_len = lang + 2*nv (visual prefix) + 1 (proprio) + 1 (BOS) + actions
-        # (+ Q_ag + Q_hd + Q_pr when use_state_prediction is True).
+        # max_seq_len = lang + 2*nv (visual prefix) + 1 (proprio) + 1 (BOS)
+        # + actions (+ K * [Q_ag, Q_hd, Q_pr] when state prediction is on).
         self.max_seq_len = (
             max_lang_tokens + 2 * nv + 1 + 1 + max_action_tokens + self.n_state_query
         )
@@ -529,8 +554,10 @@ class ARPredictor(nn.Module):
                     f"'{state_head_norm_type}'"
                 )
 
-            # 3 learnable query tokens: Q_ag, Q_hd, Q_pr (one per stream).
-            self.state_query_embeddings = nn.Parameter(torch.randn(3, embed_dim))
+            # K horizon blocks, each with Q_ag, Q_hd, Q_pr stream queries.
+            self.state_query_embeddings = nn.Parameter(
+                torch.randn(self.n_state_horizons, self.n_state_streams, embed_dim)
+            )
             # Per-stream projector: matches the encoder-side projector
             # signature (LeWM paper Sec. 3 + upstream pattern). With
             # state_pred_visual_tokens=True, Q_ag/Q_hd predict the full
@@ -609,13 +636,14 @@ class ARPredictor(nn.Module):
             (B, 1, L, L) bool mask. True = attend, False = mask out.
         """
         B = action_tokens.size(0)
-        # Prefix layout: lang(n_lang) + agent(nv) + hand(nv) + proprio(1) = n_lang + 2*nv + 1
-        # where nv = self.n_visual_per_view (1 by default, 17 for CLS+4x4 pool).
+        # Context layout: lang(n_lang) + agent(nv) + hand(nv) + proprio(1).
+        # BOS sits after context; FAST action tokens start after BOS.
         nv = self.n_visual_per_view
-        n_prefix = n_lang + 2 * nv + 1
-        action_start = (
-            n_prefix + 1
-        )  # BOS is at n_prefix, action tokens start at n_prefix+1
+        n_context = n_lang + 2 * nv + 1
+        bos_pos = n_context
+        action_start = bos_pos + 1
+        action_end = action_start + self.max_action_tokens
+        query_start = action_end
 
         pos = torch.arange(L, device=device)
 
@@ -629,64 +657,83 @@ class ARPredictor(nn.Module):
             is_real[:, :n_lang] = lang_pos < lang_lengths.unsqueeze(1)
 
         # z_agent, z_hand, z_proprio: always real
-        is_real[:, n_lang:n_prefix] = True
+        is_real[:, n_lang:n_context] = True
 
-        # BOS: always real
-        is_real[:, n_prefix] = True
+        # BOS: always real when present
+        if bos_pos < L:
+            is_real[:, bos_pos] = True
 
         # Action tokens: real if not PAD
-        action_end = action_start + self.max_action_tokens
-        if action_end <= L:
-            is_real[:, action_start:action_end] = action_tokens != PAD_TOKEN_ID
+        if action_start < L:
+            action_slice_end = min(action_end, L)
+            is_real[:, action_start:action_slice_end] = action_tokens[
+                :, : action_slice_end - action_start
+            ] != PAD_TOKEN_ID
 
-        # STATE_QUERY tokens (Q_ag, Q_hd, Q_pr) are always real when present.
-        query_start = action_end
-        query_end = query_start + self.n_state_query
-        if self.n_state_query > 0:
+        # STATE_QUERY tokens are always real when present.
+        query_end = min(query_start + self.n_state_query, L)
+        if self.n_state_query > 0 and query_start < L:
             is_real[:, query_start:query_end] = True
 
         # --- Zone membership ---
-        in_prefix = pos < n_prefix  # (L,)
-        in_action = (pos >= n_prefix) & (pos < action_end)  # (L,) includes BOS
-        # in_query is empty when use_state_prediction is False (query_end == query_start).
+        in_lang = pos < n_lang
+        in_visual_proprio = (pos >= n_lang) & (pos < n_context)
+        in_context = pos < n_context
+        in_bos = pos == bos_pos
+        in_action_token = (pos >= action_start) & (pos < action_end)
 
         # --- Build mask ---
         mask = torch.zeros(B, L, L, dtype=torch.bool, device=device)
 
-        # Real tokens in each zone
-        prefix_real = is_real & in_prefix.unsqueeze(0)  # (B, L)
-        action_real = is_real & in_action.unsqueeze(0)  # (B, L)
+        lang_real = is_real & in_lang.unsqueeze(0)
+        visual_proprio_real = is_real & in_visual_proprio.unsqueeze(0)
+        context_real = is_real & in_context.unsqueeze(0)
+        bos_real = is_real & in_bos.unsqueeze(0)
+        action_real = is_real & in_action_token.unsqueeze(0)
+        context_bos_real = context_real | bos_real
 
-        # Rule 1: Prefix tokens attend bidirectionally to all real prefix tokens
-        mask |= prefix_real.unsqueeze(2) & prefix_real.unsqueeze(1)
+        # Rule 1: language rows see real language + visual + proprio context.
+        mask |= lang_real.unsqueeze(2) & context_real.unsqueeze(1)
 
-        # Rule 2: Action tokens attend to all real prefix tokens
-        mask |= action_real.unsqueeze(2) & prefix_real.unsqueeze(1)
+        # Rule 2: visual/proprio/BOS rows see context + BOS.
+        visual_bos_rows = visual_proprio_real | bos_real
+        mask |= visual_bos_rows.unsqueeze(2) & context_bos_real.unsqueeze(1)
 
-        # Rule 3: Action tokens attend causally to real action tokens (j <= i)
+        # Rule 3: action tokens see context + BOS.
+        mask |= action_real.unsqueeze(2) & context_bos_real.unsqueeze(1)
+
+        # Rule 4: action tokens attend causally within non-PAD action tokens.
         causal = pos.unsqueeze(0) <= pos.unsqueeze(1)  # (L, L) lower-triangular
         mask |= (
             action_real.unsqueeze(2) & action_real.unsqueeze(1) & causal.unsqueeze(0)
         )
 
-        # Rule 4: STATE_QUERY rows (Q_ag, Q_hd, Q_pr) — only when enabled.
-        # Each Q sees: real prefix + real action zone (BOS + non-PAD T) + itself.
-        # Each Q does NOT see: PAD, OTHER queries (preserves 3-way independence
-        # so pred_pr cannot peek at pred_ag's hidden state, etc.). No token
-        # outside the query group attends to a query (q columns stay all-False).
-        if self.n_state_query > 0:
-            in_query = (pos >= query_start) & (pos < query_end)  # (L,)
-            query_real = is_real & in_query.unsqueeze(0)  # (B, L)
-
-            # Q sees real prefix
-            mask |= query_real.unsqueeze(2) & prefix_real.unsqueeze(1)
-            # Q sees real action zone (BOS + non-PAD action tokens)
-            mask |= query_real.unsqueeze(2) & action_real.unsqueeze(1)
-            # Q sees only itself within the query block — diagonal, NOT bidir
+        # Rule 5: horizon query blocks see context + BOS + all real actions,
+        # previous horizon query blocks, and themselves. Streams inside the
+        # same horizon block remain isolated from each other.
+        if self.n_state_query > 0 and query_start < L:
+            query_base_cols = context_bos_real | action_real
             eye_L = torch.eye(L, dtype=torch.bool, device=device)
-            mask |= (
-                query_real.unsqueeze(2) & query_real.unsqueeze(1) & eye_L.unsqueeze(0)
-            )
+            for horizon_idx in range(self.n_state_horizons):
+                block_start = query_start + horizon_idx * self.n_state_streams
+                block_end = min(block_start + self.n_state_streams, L)
+                if block_start >= L:
+                    break
+                in_block = (pos >= block_start) & (pos < block_end)
+                block_real = is_real & in_block.unsqueeze(0)
+
+                mask |= block_real.unsqueeze(2) & query_base_cols.unsqueeze(1)
+
+                if block_start > query_start:
+                    in_previous_queries = (pos >= query_start) & (pos < block_start)
+                    previous_real = is_real & in_previous_queries.unsqueeze(0)
+                    mask |= block_real.unsqueeze(2) & previous_real.unsqueeze(1)
+
+                mask |= (
+                    block_real.unsqueeze(2)
+                    & block_real.unsqueeze(1)
+                    & eye_L.unsqueeze(0)
+                )
 
         return mask.unsqueeze(1)  # (B, 1, L, L)
 
@@ -709,34 +756,43 @@ class ARPredictor(nn.Module):
         Returns: (B, 1, L, L) bool mask.
         """
         nv = self.n_visual_per_view
-        n_prefix = n_lang + 2 * nv + 1
+        n_context = n_lang + 2 * nv + 1
+        bos_pos = n_context
         pos = torch.arange(L, device=device)
 
-        # Real positions: language real + visual/proprio always real + all action real
+        # Real positions: language real + visual/proprio/BOS/actions real.
         is_real = torch.ones(B, L, dtype=torch.bool, device=device)
-        # Mask out language padding (skipped when no language)
         if n_lang > 0:
             assert lang_lengths is not None, "lang_lengths required when n_lang > 0"
             lang_pos = pos[:n_lang].unsqueeze(0).expand(B, -1)
             is_real[:, :n_lang] = lang_pos < lang_lengths.unsqueeze(1)
 
-        in_prefix = pos < n_prefix  # (L,)
+        in_lang = pos < n_lang
+        in_visual_proprio = (pos >= n_lang) & (pos < n_context)
+        in_context = pos < n_context
+        in_bos = pos == bos_pos
+        in_action_token = pos > bos_pos
 
         mask = torch.zeros(B, L, L, dtype=torch.bool, device=device)
 
-        prefix_real = is_real & in_prefix.unsqueeze(0)
-        action_positions = ~in_prefix.unsqueeze(0) & is_real  # (B, L)
+        lang_real = is_real & in_lang.unsqueeze(0)
+        visual_proprio_real = is_real & in_visual_proprio.unsqueeze(0)
+        context_real = is_real & in_context.unsqueeze(0)
+        bos_real = is_real & in_bos.unsqueeze(0)
+        action_real = is_real & in_action_token.unsqueeze(0)
+        context_bos_real = context_real | bos_real
 
-        # Prefix: bidirectional among real
-        mask |= prefix_real.unsqueeze(2) & prefix_real.unsqueeze(1)
-        # Action sees prefix
-        mask |= action_positions.unsqueeze(2) & prefix_real.unsqueeze(1)
-        # Action: causal within action
+        # Language sees context only.
+        mask |= lang_real.unsqueeze(2) & context_real.unsqueeze(1)
+        # Visual/proprio/BOS see context + BOS.
+        visual_bos_rows = visual_proprio_real | bos_real
+        mask |= visual_bos_rows.unsqueeze(2) & context_bos_real.unsqueeze(1)
+        # Generated action tokens see context + BOS.
+        mask |= action_real.unsqueeze(2) & context_bos_real.unsqueeze(1)
+        # Generated action tokens are causal within generated action tokens.
         causal = pos.unsqueeze(0) <= pos.unsqueeze(1)
         mask |= (
-            action_positions.unsqueeze(2)
-            & action_positions.unsqueeze(1)
-            & causal.unsqueeze(0)
+            action_real.unsqueeze(2) & action_real.unsqueeze(1) & causal.unsqueeze(0)
         )
 
         return mask.unsqueeze(1)
@@ -770,7 +826,7 @@ class ARPredictor(nn.Module):
         )
         if include_queries:
             query_ids = torch.tensor(
-                [MOT_VISUAL, MOT_VISUAL, MOT_PROPRIO],
+                [MOT_VISUAL, MOT_VISUAL, MOT_PROPRIO] * self.n_state_horizons,
                 device=device,
                 dtype=torch.long,
             ).expand(B, -1)
@@ -862,11 +918,11 @@ class ARPredictor(nn.Module):
             When ``use_state_prediction is True``:
                 Tuple ``(action_logits, pred_ag, pred_hd, pred_pr)`` where
                   - action_logits: same shape as baseline,
-                  - pred_ag: (B, embed_dim), or (B, N, embed_dim) when
+                  - pred_ag: (B, K, embed_dim), or (B, K, N, embed_dim) when
                     state_pred_visual_tokens=True, predicted future agentview latent(s),
-                  - pred_hd: (B, embed_dim), or (B, N, embed_dim) when
+                  - pred_hd: (B, K, embed_dim), or (B, K, N, embed_dim) when
                     state_pred_visual_tokens=True, predicted future hand-cam latent(s),
-                  - pred_pr: (B, proprio_dim) predicted RAW future proprio.
+                  - pred_pr: (B, K, proprio_dim) predicted RAW future proprio.
         """
         B = z_agent.size(0)
         device = z_agent.device
@@ -950,9 +1006,13 @@ class ARPredictor(nn.Module):
         # query is a learnable embedding plus the type embedding (index 4).
         # Index 4 only exists when use_state_prediction is True (n_type=5).
         if self.use_state_prediction:
-            # state_query_embeddings: (3, D) → (1, 3, D) → (B, 3, D)
-            q_base = self.state_query_embeddings.unsqueeze(0).expand(B, -1, -1)
-            q_emb = q_base + self.type_embedding.weight[4]  # broadcast over (B, 3, D)
+            # state_query_embeddings: (K, 3, D) -> (1, K*3, D) -> (B, K*3, D)
+            q_base = self.state_query_embeddings.reshape(
+                self.n_state_query,
+                self.embed_dim,
+            )
+            q_base = q_base.unsqueeze(0).expand(B, -1, -1)
+            q_emb = q_base + self.type_embedding.weight[4]  # broadcast over queries
             x = torch.cat([x, q_emb], dim=1)
 
         L = x.size(1)
@@ -1003,21 +1063,29 @@ class ARPredictor(nn.Module):
                 return action_logits, pred_grip
             return action_logits
 
-        # 9. Read out the three STATE_QUERY positions and run them through
-        #    their respective heads. Q_ag/Q_hd predict latent (D,) by default
-        #    or the full visual token set (N,D) when patch-level SP is enabled.
-        #    Q_pr
-        #    predicts the raw 9d proprio vector at t+H (NOT an embedding —
-        #    the target is the un-encoded proprio so the loss is in physical
-        #    units).
+        # 9. Read out K horizon blocks of STATE_QUERY positions and run stream
+        #    queries through shared per-stream heads. Q_ag/Q_hd predict latent
+        #    (D,) by default or the full visual token set (N,D) when patch-level
+        #    SP is enabled. Q_pr predicts raw 9d proprio per horizon.
         query_start = n_prefix + 1 + self.max_action_tokens
-        q_out = x[:, query_start : query_start + 3]  # (B, 3, D)
-        pred_ag = self.state_pred_head_ag(q_out[:, 0])  # (B, D) or (B, N*D)
-        pred_hd = self.state_pred_head_hd(q_out[:, 1])  # (B, D) or (B, N*D)
+        q_out = x[:, query_start : query_start + self.n_state_query]
+        q_out = q_out.reshape(
+            B,
+            self.n_state_horizons,
+            self.n_state_streams,
+            self.embed_dim,
+        )  # (B, K, 3, D)
+        K = self.n_state_horizons
+        pred_ag = self.state_pred_head_ag(q_out[:, :, 0].reshape(B * K, -1))
+        pred_hd = self.state_pred_head_hd(q_out[:, :, 1].reshape(B * K, -1))
         if self.state_pred_visual_tokens:
-            pred_ag = pred_ag.reshape(B, self.n_visual_per_view, self.embed_dim)
-            pred_hd = pred_hd.reshape(B, self.n_visual_per_view, self.embed_dim)
-        pred_pr = self.state_pred_head_pr(q_out[:, 2])  # (B, proprio_dim)
+            pred_ag = pred_ag.reshape(B, K, self.n_visual_per_view, self.embed_dim)
+            pred_hd = pred_hd.reshape(B, K, self.n_visual_per_view, self.embed_dim)
+        else:
+            pred_ag = pred_ag.reshape(B, K, self.embed_dim)
+            pred_hd = pred_hd.reshape(B, K, self.embed_dim)
+        pred_pr = self.state_pred_head_pr(q_out[:, :, 2].reshape(B * K, -1))
+        pred_pr = pred_pr.reshape(B, K, self.proprio_dim)
 
         if self.use_gripper_aux:
             return action_logits, pred_ag, pred_hd, pred_pr, pred_grip

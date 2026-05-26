@@ -85,6 +85,7 @@ predictor:
   dim_head: 64
   dropout: 0.0      # turn off to eliminate regularization noise
   emb_dropout: 0.0
+  state_prediction_horizons: [5, 10, 15, 20]
 
 # Mirror the projector + loss schema from lewm.yaml so Hydra struct-mode
 # `loss.pred_weight=...` overrides on the CLI work without `+` prefix.
@@ -93,7 +94,7 @@ projector:
   norm_type: layer  # 'layer' (baseline) | 'batch' (required when sigreg_weight > 0)
 
 loss:
-  pred_weight: 0.0      # > 0 enables state prediction (SP) heads + 3 MSE losses
+  pred_weight: 0.0      # > 0 enables horizon state prediction (SP) query blocks
   sigreg_weight: 0.0    # > 0 enables SIGReg on encoder outputs
   sigreg:
     kwargs:

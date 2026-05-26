@@ -65,6 +65,9 @@ import numpy as np
 from scipy.spatial.transform import Rotation as R
 
 
+STATE_PREDICTION_HORIZONS = (5, 10, 15, 20)
+
+
 # ---------------------------------------------------------------------------
 # Step 1: Load and inspect LIBERO HDF5
 # ---------------------------------------------------------------------------
@@ -249,6 +252,11 @@ def extract_chunks(
         the PHYSICAL-unit chunks; the caller must normalize them.
     """
     H = chunk_size
+    if max(STATE_PREDICTION_HORIZONS) > H:
+        raise ValueError(
+            f"state prediction horizons {STATE_PREDICTION_HORIZONS} require "
+            f"chunk_size >= {max(STATE_PREDICTION_HORIZONS)}, got {H}"
+        )
     if stride < 1:
         raise ValueError(f"stride must be >= 1, got {stride}")
     print(f"[Step 3] Extracting anchor-relative sliding-window chunks "
@@ -258,11 +266,12 @@ def extract_chunks(
         "image_agent": [],
         "image_hand": [],
         "proprio": [],
-        # State-prediction targets (frame at t+H — one step after the chunk
-        # completes). These are required by libero_dataset.py when
-        # ``use_state_prediction=True`` is set in the training config. They
-        # always populated here so downstream code can pick them up without
-        # needing to re-preprocess for every ablation toggle.
+        # State-prediction targets. Multi-horizon fields are the primary
+        # training targets; legacy single-future fields mirror the final
+        # horizon for backward-compatible readers.
+        "image_agent_future_horizons": [],
+        "image_hand_future_horizons": [],
+        "proprio_future_horizons": [],
         "image_agent_future": [],
         "image_hand_future": [],
         "proprio_future": [],
@@ -335,17 +344,27 @@ def extract_chunks(
         # Anchor state per chunk
         for ci in range(n_chunks):
             t = int(starts_arr[ci])
-            t_future = t + H  # frame at t+H — same index already loaded above
+            future_indices = [t + h for h in STATE_PREDICTION_HORIZONS]
 
             samples["image_agent"].append(agent_imgs[t])  # (H_img, W_img, 3) uint8
             samples["image_hand"].append(hand_imgs[t])
 
-            # State-prediction targets at t+H (LeWM-style next-embedding loss).
+            # State-prediction targets at configured horizons.
             # The chunk-validity range t <= T-H-1 already guarantees t+H <= T-1,
             # and we read up to last_obs_idx = (n_chunks-1)*stride + H above,
-            # so agent_imgs[t+H] / hand_imgs[t+H] are always in-bounds here.
-            samples["image_agent_future"].append(agent_imgs[t_future])
-            samples["image_hand_future"].append(hand_imgs[t_future])
+            # so all t+h targets are always in-bounds here.
+            agent_future_horizons = np.stack(
+                [agent_imgs[idx] for idx in future_indices],
+                axis=0,
+            )
+            hand_future_horizons = np.stack(
+                [hand_imgs[idx] for idx in future_indices],
+                axis=0,
+            )
+            samples["image_agent_future_horizons"].append(agent_future_horizons)
+            samples["image_hand_future_horizons"].append(hand_future_horizons)
+            samples["image_agent_future"].append(agent_future_horizons[-1])
+            samples["image_hand_future"].append(hand_future_horizons[-1])
 
             # 9D proprio: ee_pos(3) + xyzw-quat(4) + gripper_states raw(2)
             # NEVER mean/abs the gripper — fingers are symmetric, averaging destroys info.
@@ -356,14 +375,19 @@ def extract_chunks(
             ])
             samples["proprio"].append(normalize_proprio(proprio_raw))  # (9,) float64
 
-            # Same 9D layout at t+H — single source of truth for proprio
+            # Same 9D layout at each t+h — single source of truth for proprio
             # normalization is `normalize_proprio` (re-normalizes the quat).
-            proprio_future_raw = np.concatenate([
-                ee_pos[t_future],
-                robot_states[t_future, 5:9],
-                grip_states[t_future],
-            ])
-            samples["proprio_future"].append(normalize_proprio(proprio_future_raw))
+            proprio_future_horizons = []
+            for future_idx in future_indices:
+                proprio_future_raw = np.concatenate([
+                    ee_pos[future_idx],
+                    robot_states[future_idx, 5:9],
+                    grip_states[future_idx],
+                ])
+                proprio_future_horizons.append(normalize_proprio(proprio_future_raw))
+            proprio_future_horizons = np.stack(proprio_future_horizons, axis=0)
+            samples["proprio_future_horizons"].append(proprio_future_horizons)
+            samples["proprio_future"].append(proprio_future_horizons[-1])
 
             samples["continuous_actions"].append(chunks[ci])  # (H, 7) physical units
             samples["demo_idx"].append(demo_i)
@@ -682,11 +706,56 @@ def save_hdf5(
             compression="gzip",
             compression_opts=4,
         )
+        has_horizon_images = all(
+            key in samples
+            for key in (
+                "image_agent_future_horizons",
+                "image_hand_future_horizons",
+            )
+        )
+        if has_horizon_images:
+            first_agent_horizons = samples["image_agent_future_horizons"][0]
+            first_hand_horizons = samples["image_hand_future_horizons"][0]
+            if first_agent_horizons.shape != first_hand_horizons.shape:
+                raise ValueError(
+                    "Agent/hand future horizon image shapes must match, got "
+                    f"{first_agent_horizons.shape} and {first_hand_horizons.shape}"
+                )
+            n_horizons = first_agent_horizons.shape[0]
+            if n_horizons != len(STATE_PREDICTION_HORIZONS):
+                raise ValueError(
+                    f"Expected {len(STATE_PREDICTION_HORIZONS)} future horizons, "
+                    f"got {n_horizons}"
+                )
+            ds_agent_future_horizons = out.create_dataset(
+                "image_agent_future_horizons",
+                shape=(N, n_horizons, *img_shape),
+                dtype=np.uint8,
+                chunks=(1, 1, *img_shape),
+                compression="gzip",
+                compression_opts=4,
+            )
+            ds_hand_future_horizons = out.create_dataset(
+                "image_hand_future_horizons",
+                shape=(N, n_horizons, *img_shape),
+                dtype=np.uint8,
+                chunks=(1, 1, *img_shape),
+                compression="gzip",
+                compression_opts=4,
+            )
         for i in range(N):
             ds_agent[i] = samples["image_agent"][i]
             ds_hand[i] = samples["image_hand"][i]
-            ds_agent_future[i] = samples["image_agent_future"][i]
-            ds_hand_future[i] = samples["image_hand_future"][i]
+            if has_horizon_images:
+                agent_horizons = samples["image_agent_future_horizons"][i]
+                hand_horizons = samples["image_hand_future_horizons"][i]
+                ds_agent_future_horizons[i] = agent_horizons
+                ds_hand_future_horizons[i] = hand_horizons
+                ds_agent_future[i] = agent_horizons[-1]
+                ds_hand_future[i] = hand_horizons[-1]
+            else:
+                ds_agent_future[i] = samples["image_agent_future"][i]
+                ds_hand_future[i] = samples["image_hand_future"][i]
 
         # --- Proprioception (current and future) ---
         out.create_dataset(
@@ -694,11 +763,33 @@ def save_hdf5(
             data=np.stack(samples["proprio"], axis=0),  # (N, 9)
             dtype=np.float64,
         )
-        out.create_dataset(
-            "proprio_future",
-            data=np.stack(samples["proprio_future"], axis=0),  # (N, 9) at t+H
-            dtype=np.float64,
-        )
+        if "proprio_future_horizons" in samples:
+            proprio_future_horizons = np.stack(
+                samples["proprio_future_horizons"],
+                axis=0,
+            )
+            if proprio_future_horizons.shape[1] != len(STATE_PREDICTION_HORIZONS):
+                raise ValueError(
+                    "proprio_future_horizons horizon dimension must match "
+                    f"{STATE_PREDICTION_HORIZONS}, got "
+                    f"{proprio_future_horizons.shape[1]}"
+                )
+            out.create_dataset(
+                "proprio_future_horizons",
+                data=proprio_future_horizons,  # (N, K, 9)
+                dtype=np.float64,
+            )
+            out.create_dataset(
+                "proprio_future",
+                data=proprio_future_horizons[:, -1],  # legacy final horizon
+                dtype=np.float64,
+            )
+        else:
+            out.create_dataset(
+                "proprio_future",
+                data=np.stack(samples["proprio_future"], axis=0),  # (N, 9) at t+H
+                dtype=np.float64,
+            )
 
         # --- Continuous actions ---
         action_dim = samples["continuous_actions"][0].shape[1]
@@ -727,6 +818,11 @@ def save_hdf5(
         out.attrs["action_high"] = action_high.astype(np.float64)
         out.attrs["chunk_size"] = chunk_size
         out.attrs["chunk_stride"] = chunk_stride
+        if has_horizon_images or "proprio_future_horizons" in samples:
+            out.attrs["state_prediction_horizons"] = np.array(
+                STATE_PREDICTION_HORIZONS,
+                dtype=np.int32,
+            )
         out.attrs["image_key"] = image_key
         out.attrs["source_file"] = str(Path(source_file).resolve())
         out.attrs["num_demos"] = num_demos

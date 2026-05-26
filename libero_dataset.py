@@ -24,7 +24,7 @@ import torch.nn.functional as F
 from torch.utils.data import Dataset
 from transformers import T5Tokenizer
 
-from module import PAD_TOKEN_ID
+from module import DEFAULT_STATE_PREDICTION_HORIZONS, PAD_TOKEN_ID
 
 logger = logging.getLogger(__name__)
 
@@ -85,6 +85,7 @@ class LiberoDataset(Dataset):
         self.img_size = img_size
         self.use_language = use_language
         self.use_state_prediction = use_state_prediction
+        self.state_prediction_horizons: tuple[int, ...] | None = None
 
         # Discover all HDF5 files and build a global index
         hdf5_dir = Path(hdf5_dir)
@@ -127,26 +128,61 @@ class LiberoDataset(Dataset):
                     raise KeyError(f"No 'image_agent' in {fpath}")
                 n_samples = f["image_agent"].shape[0]
 
-                # When state prediction is enabled, all three future fields
-                # MUST exist in the HDF5 — fail fast with a clear message
-                # rather than silently broadcasting current frame as future.
-                # (Old preprocessed HDF5 from the frozen baseline does not
-                # have these; users must re-run preprocess_libero.py.)
+                # When state prediction is enabled, future fields MUST exist.
+                # Prefer the multi-horizon schema; allow the legacy single
+                # t+H fields only as an explicit backward-compatible fallback.
                 if use_state_prediction:
-                    missing = [
-                        key
-                        for key in (
-                            "image_agent_future",
-                            "image_hand_future",
-                            "proprio_future",
-                        )
-                        if key not in f
-                    ]
-                    if missing:
+                    multi_keys = (
+                        "image_agent_future_horizons",
+                        "image_hand_future_horizons",
+                        "proprio_future_horizons",
+                    )
+                    legacy_keys = (
+                        "image_agent_future",
+                        "image_hand_future",
+                        "proprio_future",
+                    )
+                    has_multi = all(key in f for key in multi_keys)
+                    has_legacy = all(key in f for key in legacy_keys)
+                    if not has_multi and not has_legacy:
+                        missing = [
+                            key for key in (*multi_keys, *legacy_keys) if key not in f
+                        ]
                         raise KeyError(
                             f"State-prediction enabled but {fpath.name} lacks "
                             f"future fields: {missing}. Re-run preprocess_libero.py "
-                            "to regenerate (it will add the t+H frames)."
+                            "to regenerate multi-horizon t+[5,10,15,20] targets."
+                        )
+                    if has_multi:
+                        k_img = int(f["image_agent_future_horizons"].shape[1])
+                        if f["image_hand_future_horizons"].shape[1] != k_img:
+                            raise ValueError(
+                                f"{fpath.name}: image future horizon counts differ."
+                            )
+                        if f["proprio_future_horizons"].shape[1] != k_img:
+                            raise ValueError(
+                                f"{fpath.name}: proprio future horizon count differs."
+                            )
+                        raw_horizons = f.attrs.get(
+                            "state_prediction_horizons",
+                            np.array(DEFAULT_STATE_PREDICTION_HORIZONS),
+                        )
+                        horizons = tuple(
+                            int(h) for h in np.asarray(raw_horizons).reshape(-1).tolist()
+                        )
+                    else:
+                        horizons = (int(f.attrs.get("chunk_size", 20)),)
+                    if len(horizons) != (k_img if has_multi else 1):
+                        raise ValueError(
+                            f"{fpath.name}: state_prediction_horizons={horizons} "
+                            "does not match future target horizon dimension."
+                        )
+                    if self.state_prediction_horizons is None:
+                        self.state_prediction_horizons = horizons
+                    elif self.state_prediction_horizons != horizons:
+                        raise ValueError(
+                            "All HDF5 files must use the same state_prediction_horizons; "
+                            f"got {self.state_prediction_horizons} and {horizons}."
                         )
 
                 # demo_idx is always written by preprocess_libero.py. Read it
@@ -282,17 +318,41 @@ class LiberoDataset(Dataset):
         # Future-frame state-prediction targets (only when enabled).
         # Existence was asserted in __init__; here we just read them.
         if self.use_state_prediction:
-            item["pixels_agent_future"] = _preprocess_image(
-                f["image_agent_future"][local_idx],
-                self.img_size,
-            )
-            item["pixels_hand_future"] = _preprocess_image(
-                f["image_hand_future"][local_idx],
-                self.img_size,
-            )
-            item["proprio_future"] = torch.from_numpy(
-                np.array(f["proprio_future"][local_idx], dtype=np.float32),
-            )
+            if "image_agent_future_horizons" in f:
+                agent_future = f["image_agent_future_horizons"][local_idx]
+                hand_future = f["image_hand_future_horizons"][local_idx]
+                item["pixels_agent_future"] = torch.stack(
+                    [
+                        _preprocess_image(img, self.img_size)
+                        for img in agent_future
+                    ],
+                    dim=0,
+                )
+                item["pixels_hand_future"] = torch.stack(
+                    [
+                        _preprocess_image(img, self.img_size)
+                        for img in hand_future
+                    ],
+                    dim=0,
+                )
+                item["proprio_future"] = torch.from_numpy(
+                    np.array(
+                        f["proprio_future_horizons"][local_idx],
+                        dtype=np.float32,
+                    ),
+                )
+            else:
+                item["pixels_agent_future"] = _preprocess_image(
+                    f["image_agent_future"][local_idx],
+                    self.img_size,
+                ).unsqueeze(0)
+                item["pixels_hand_future"] = _preprocess_image(
+                    f["image_hand_future"][local_idx],
+                    self.img_size,
+                ).unsqueeze(0)
+                item["proprio_future"] = torch.from_numpy(
+                    np.array(f["proprio_future"][local_idx], dtype=np.float32),
+                ).unsqueeze(0)
 
         return item
 

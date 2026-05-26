@@ -18,6 +18,10 @@ class RepositoryContractsTest(unittest.TestCase):
         config_text = (ROOT / "config/train/data/libero.yaml").read_text()
         self.assertIn("chunk_size:", config_text)
 
+    def test_train_config_declares_state_prediction_horizons(self) -> None:
+        config_text = (ROOT / "config/train/lewm.yaml").read_text()
+        self.assertIn("state_prediction_horizons: [5, 10, 15, 20]", config_text)
+
     def test_pretrained_vision_runner_forwards_warmup_steps_to_hydra(self) -> None:
         script_text = (ROOT / "run_all4_pretrained_vision.sh").read_text()
         self.assertIn("scheduler.warmup_steps", script_text)

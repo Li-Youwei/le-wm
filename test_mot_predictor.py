@@ -50,9 +50,11 @@ class MoTPredictorTest(unittest.TestCase):
         self.assertEqual(len(out), 4)
         logits, pred_ag, pred_hd, pred_pr = out
         self.assertEqual(logits.shape, (2, 6, ACTION_HEAD_SIZE))
-        self.assertEqual(pred_ag.shape, (2, 16))
-        self.assertEqual(pred_hd.shape, (2, 16))
-        self.assertEqual(pred_pr.shape, (2, 9))
+        self.assertEqual(pred_ag.shape, (2, 4, 16))
+        self.assertEqual(pred_hd.shape, (2, 4, 16))
+        self.assertEqual(pred_pr.shape, (2, 4, 9))
+        self.assertEqual(predictor.n_state_query, 12)
+        self.assertEqual(predictor.state_query_embeddings.shape, (4, 3, 16))
 
     def test_mot_uses_modality_specific_transformer_blocks(self) -> None:
         predictor = self._make_predictor()
@@ -61,6 +63,18 @@ class MoTPredictorTest(unittest.TestCase):
         self.assertEqual(len(predictor.blocks[0].attn.to_qkv), 4)
         self.assertEqual(len(predictor.blocks[0].mlp), 4)
         self.assertFalse(hasattr(predictor, "state_blocks"))
+        modality_ids = predictor._build_train_modality_ids(
+            B=2,
+            n_lang=4,
+            nv=1,
+            include_queries=True,
+            device=torch.device("cpu"),
+        )
+        self.assertEqual(modality_ids.shape, (2, predictor.max_seq_len))
+        self.assertEqual(
+            modality_ids[0, -12:].tolist(),
+            [1, 1, 2] * 4,
+        )
 
     def test_mot_keeps_global_cross_modality_attention_path(self) -> None:
         predictor = self._make_predictor()

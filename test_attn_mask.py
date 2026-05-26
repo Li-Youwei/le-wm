@@ -1,143 +1,133 @@
-"""Verify ARPredictor._build_attn_mask() correctness with a small example.
+"""Unit tests for ARPredictor attention-mask layout."""
 
-Setup:
-  B=1, max_lang_tokens=5, lang_lengths=3 (positions 3,4 are lang PAD)
-  max_action_tokens=6, action_lengths=4 (positions 4,5 in action zone are PAD)
+from __future__ import annotations
 
-Full sequence (L = 5 + 3 + 1 + 6 = 15):
-  pos  0: lang_0  (real)
-  pos  1: lang_1  (real)
-  pos  2: lang_2  (real)
-  pos  3: lang_PAD
-  pos  4: lang_PAD
-  pos  5: z_agent (real)
-  pos  6: z_hand  (real)
-  pos  7: z_proprio (real)
-  pos  8: BOS     (real)
-  pos  9: T_1     (real)
-  pos 10: T_2     (real)
-  pos 11: T_3     (real)
-  pos 12: T_4     (real)
-  pos 13: act_PAD
-  pos 14: act_PAD
-
-Expected mask rules:
-  - Lang PAD (pos 3,4): entire row = 0, entire column = 0
-  - Real prefix (pos 0-2, 5-7): bidirectional among each other
-  - Prefix cannot see action zone (pos 8+)
-  - BOS (pos 8): sees all real prefix + itself
-  - T_i (pos 9-12): sees all real prefix + BOS + T_1..T_i (causal)
-  - Action PAD (pos 13,14): entire row = 0, entire column = 0
-"""
+import unittest
 
 import torch
+
 from module import ARPredictor, PAD_TOKEN_ID
 
-def main():
-    # Create a minimal ARPredictor (only need mask logic, not weights).
-    # proprio_dim matches the production default (9d = ee_pos(3)+quat(4)+grip(2)).
-    pred = ARPredictor(
-        embed_dim=32, depth=1, heads=1, dim_head=32, mlp_dim=64,
-        max_action_tokens=6, max_lang_tokens=5, proprio_dim=9,
-    )
 
-    n_lang = 5
-    lang_lengths = torch.tensor([3])  # only first 3 are real
+class AttentionMaskLayoutTest(unittest.TestCase):
+    def _make_predictor(self) -> ARPredictor:
+        return ARPredictor(
+            embed_dim=32,
+            depth=1,
+            heads=1,
+            dim_head=32,
+            mlp_dim=64,
+            max_action_tokens=6,
+            max_lang_tokens=5,
+            proprio_dim=9,
+            use_state_prediction=True,
+        )
 
-    # Action tokens: 4 real tokens (ids 10,20,30,40) + 2 PAD
-    action_tokens = torch.tensor([[10, 20, 30, 40, PAD_TOKEN_ID, PAD_TOKEN_ID]])
+    def test_training_mask_matches_horizon_query_layout(self) -> None:
+        pred = self._make_predictor()
+        n_lang = 5
+        lang_lengths = torch.tensor([3])
+        action_tokens = torch.tensor(
+            [[10, 20, 30, 40, PAD_TOKEN_ID, PAD_TOKEN_ID]]
+        )
 
-    L = pred.max_seq_len  # 5 + 3 + 1 + 6 = 15
-    print(f"max_seq_len = {L}")
+        mask = pred._build_attn_mask(
+            n_lang,
+            lang_lengths,
+            action_tokens,
+            27,
+            torch.device("cpu"),
+        )[0, 0]
 
-    mask = pred._build_attn_mask(n_lang, lang_lengths, action_tokens, L, torch.device("cpu"))
-    mask_2d = mask[0, 0].int()  # (L, L), 1=attend, 0=blocked
+        real_lang = [0, 1, 2]
+        lang_pad = [3, 4]
+        visual_proprio = [5, 6, 7]
+        context = real_lang + visual_proprio
+        bos = 8
+        real_actions = [9, 10, 11, 12]
+        action_pad = [13, 14]
+        query_blocks = [
+            [15, 16, 17],
+            [18, 19, 20],
+            [21, 22, 23],
+            [24, 25, 26],
+        ]
+        query_positions = [p for block in query_blocks for p in block]
 
-    # Labels for readability
-    labels = [
-        "lang0", "lang1", "lang2", "lPAD3", "lPAD4",
-        "z_ag", "z_hd", "z_pr",
-        "BOS", "T_1", "T_2", "T_3", "T_4", "aPAD5", "aPAD6",
-    ]
+        for p in lang_pad + action_pad:
+            self.assertFalse(mask[p].any(), f"padding row {p} should be empty")
+            self.assertFalse(mask[:, p].any(), f"padding col {p} should be empty")
 
-    # Print matrix
-    header = "        " + " ".join(f"{label:>6s}" for label in labels)
-    print(header)
-    print("        " + "-" * (7 * len(labels)))
-    for i in range(L):
-        row = mask_2d[i].tolist()
-        row_str = " ".join(f"{v:>6d}" for v in row)
-        print(f"{labels[i]:>7s} | {row_str}")
+        for i in real_lang:
+            self.assertTrue(mask[i, context].all())
+            self.assertFalse(mask[i, bos])
+            self.assertFalse(mask[i, real_actions + query_positions].any())
 
-    # ---- Automated checks ----
-    errors = []
+        for i in visual_proprio + [bos]:
+            self.assertTrue(mask[i, context + [bos]].all())
+            self.assertFalse(mask[i, real_actions + query_positions].any())
 
-    # Check 1: Lang PAD rows (pos 3,4) should be all 0
-    for p in [3, 4]:
-        if mask_2d[p].any():
-            errors.append(f"FAIL: lang PAD row {p} ({labels[p]}) is not all-zero")
+        for i in real_actions:
+            self.assertTrue(mask[i, context + [bos]].all())
+            self.assertTrue(mask[i, list(range(9, i + 1))].all())
+            self.assertFalse(mask[i, list(range(i + 1, 15))].any())
+            self.assertFalse(mask[i, query_positions].any())
 
-    # Check 2: Lang PAD columns (pos 3,4) should be all 0
-    for p in [3, 4]:
-        if mask_2d[:, p].any():
-            errors.append(f"FAIL: lang PAD column {p} ({labels[p]}) is not all-zero")
+        for block_idx, block in enumerate(query_blocks):
+            previous_blocks = [
+                p for prior in query_blocks[:block_idx] for p in prior
+            ]
+            future_blocks = [
+                p for later in query_blocks[block_idx + 1 :] for p in later
+            ]
+            for i in block:
+                self.assertTrue(mask[i, context + [bos] + real_actions].all())
+                self.assertTrue(mask[i, previous_blocks].all())
+                same_block_others = [p for p in block if p != i]
+                self.assertTrue(mask[i, i])
+                self.assertFalse(mask[i, same_block_others].any())
+                self.assertFalse(mask[i, future_blocks].any())
+                self.assertFalse(mask[i, action_pad].any())
 
-    # Check 3: Real prefix (0,1,2,5,6,7) should be bidirectional among each other
-    real_prefix = [0, 1, 2, 5, 6, 7]
-    for i in real_prefix:
-        for j in real_prefix:
-            if mask_2d[i, j] != 1:
-                errors.append(f"FAIL: prefix bidir — mask[{labels[i]},{labels[j]}] = 0, expected 1")
+        for i in context + [bos] + real_actions:
+            self.assertFalse(mask[i, query_positions].any())
 
-    # Check 4: Prefix cannot see action zone (pos 8+)
-    for i in real_prefix:
-        for j in range(8, L):
-            if mask_2d[i, j] != 0:
-                errors.append(f"FAIL: prefix→action — mask[{labels[i]},{labels[j]}] = 1, expected 0")
+    def test_generate_mask_uses_lang_visual_bos_action_layout(self) -> None:
+        pred = ARPredictor(
+            embed_dim=32,
+            depth=1,
+            heads=1,
+            dim_head=32,
+            mlp_dim=64,
+            max_action_tokens=6,
+            max_lang_tokens=5,
+            proprio_dim=9,
+        )
+        n_lang = 5
+        lang_lengths = torch.tensor([3])
+        # lang(5) + visual/proprio(3) + BOS + two generated action tokens
+        L = 11
+        mask = pred._build_generate_mask(
+            n_lang,
+            lang_lengths,
+            B=1,
+            L=L,
+            device=torch.device("cpu"),
+        )[0, 0]
 
-    # Check 5: BOS (pos 8) sees all real prefix + itself
-    for j in real_prefix + [8]:
-        if mask_2d[8, j] != 1:
-            errors.append(f"FAIL: BOS cannot see {labels[j]}")
-    # BOS should NOT see future action tokens
-    for j in range(9, L):
-        if mask_2d[8, j] != 0:
-            errors.append(f"FAIL: BOS sees future {labels[j]}")
+        context = [0, 1, 2, 5, 6, 7]
+        bos = 8
+        actions = [9, 10]
 
-    # Check 6: Action tokens causal — T_i sees prefix + BOS + T_1..T_i
-    for i_pos in range(9, 13):  # T_1 to T_4
-        # Should see all real prefix
-        for j in real_prefix:
-            if mask_2d[i_pos, j] != 1:
-                errors.append(f"FAIL: {labels[i_pos]} cannot see prefix {labels[j]}")
-        # Should see BOS + all T up to itself
-        for j in range(8, i_pos + 1):
-            if mask_2d[i_pos, j] != 1:
-                errors.append(f"FAIL: {labels[i_pos]} cannot see {labels[j]}")
-        # Should NOT see future action tokens
-        for j in range(i_pos + 1, L):
-            if mask_2d[i_pos, j] != 0:
-                errors.append(f"FAIL: {labels[i_pos]} sees future {labels[j]}")
-
-    # Check 7: Action PAD rows (pos 13,14) should be all 0
-    for p in [13, 14]:
-        if mask_2d[p].any():
-            errors.append(f"FAIL: action PAD row {p} ({labels[p]}) is not all-zero")
-
-    # Check 8: Action PAD columns (pos 13,14) should be all 0
-    for p in [13, 14]:
-        if mask_2d[:, p].any():
-            errors.append(f"FAIL: action PAD column {p} ({labels[p]}) is not all-zero")
-
-    # Report
-    print()
-    if errors:
-        for e in errors:
-            print(f"  {e}")
-        print(f"\n{len(errors)} checks FAILED")
-    else:
-        print("All checks PASSED")
+        self.assertTrue(mask[0, context].all())
+        self.assertFalse(mask[0, bos])
+        self.assertFalse(mask[0, actions].any())
+        self.assertTrue(mask[5, context + [bos]].all())
+        self.assertFalse(mask[5, actions].any())
+        self.assertTrue(mask[bos, context + [bos]].all())
+        self.assertFalse(mask[bos, actions].any())
+        self.assertTrue(mask[10, context + [bos, 9, 10]].all())
 
 
 if __name__ == "__main__":
-    main()
+    unittest.main()
