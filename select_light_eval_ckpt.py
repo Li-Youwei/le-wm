@@ -2,8 +2,9 @@
 
 This is the second stage after ``pick_best_ckpt.py``: the CE-based top-k
 checkpoints are each evaluated with a small number of LIBERO episodes, then the
-checkpoint with the highest 4-suite rollout success rate is selected for the
-full evaluation.
+checkpoint with the highest rollout success rate is selected for the full
+evaluation. By default it expects all four LIBERO suites; ``--suites`` narrows
+selection for per-suite policy runs.
 """
 
 from __future__ import annotations
@@ -61,6 +62,13 @@ def main() -> int:
     parser.add_argument("--ckpt-dir", type=Path, required=True)
     parser.add_argument("--candidates-json", type=Path, required=True)
     parser.add_argument("--log-prefix", default="light_eval")
+    parser.add_argument(
+        "--suites",
+        nargs="+",
+        choices=SUITES,
+        default=list(SUITES),
+        help="Suites whose light-eval logs must be present for each candidate.",
+    )
     parser.add_argument("--out", type=Path, default=None)
     args = parser.parse_args()
 
@@ -77,7 +85,7 @@ def main() -> int:
         succ_total = 0
         episode_total = 0
         missing: list[str] = []
-        for suite in SUITES:
+        for suite in args.suites:
             parsed = parse_suite_log(args.ckpt_dir / f"{args.log_prefix}_{stem}_{suite}.log")
             if parsed is None:
                 missing.append(suite)
@@ -121,8 +129,13 @@ def main() -> int:
         return 3
 
     best = sorted(complete, key=lambda r: (-r["rate"], r["ce_value"], r["rank"]))[0]
+    metric_name = (
+        "light_eval_4suite_success_rate"
+        if tuple(args.suites) == SUITES
+        else "light_eval_success_rate"
+    )
     output = {
-        "selection_metric": "light_eval_4suite_success_rate",
+        "selection_metric": metric_name,
         "top_1": best["ckpt"],
         "top_1_rate": best["rate"],
         "top_1_successes": best["successes"],

@@ -22,6 +22,10 @@ class RepositoryContractsTest(unittest.TestCase):
         config_text = (ROOT / "config/train/lewm.yaml").read_text()
         self.assertIn("state_prediction_horizons: [5, 10, 15, 20]", config_text)
 
+    def test_train_config_uses_full_train_split_by_default(self) -> None:
+        config_text = (ROOT / "config/train/lewm.yaml").read_text()
+        self.assertIn("train_split: 1.0", config_text)
+
     def test_pretrained_vision_runner_forwards_warmup_steps_to_hydra(self) -> None:
         script_text = (ROOT / "run_all4_pretrained_vision.sh").read_text()
         self.assertIn("scheduler.warmup_steps", script_text)
@@ -32,6 +36,36 @@ class RepositoryContractsTest(unittest.TestCase):
         self.assertIn("POOL_GRID_DEFAULT=16", script_text)
         self.assertIn("PREDICTOR_DEPTH_DEFAULT=12", script_text)
         self.assertIn('predictor.depth="$PREDICTOR_DEPTH"', script_text)
+
+    def test_pretrained_vision_runner_uses_suitewise_training_protocol(self) -> None:
+        script_text = (ROOT / "run_all4_pretrained_vision.sh").read_text()
+        self.assertIn('MAX_STEPS="${MAX_STEPS:-60000}"', script_text)
+        self.assertIn('TRAIN_SPLIT="${TRAIN_SPLIT:-1.0}"', script_text)
+        self.assertIn('FINAL_EVAL_EPISODES="${FINAL_EVAL_EPISODES:-50}"', script_text)
+        self.assertIn(
+            'EVAL_MAX_STEPS_LIBERO_SPATIAL="${EVAL_MAX_STEPS_LIBERO_SPATIAL:-220}"',
+            script_text,
+        )
+        self.assertIn(
+            'EVAL_MAX_STEPS_LIBERO_OBJECT="${EVAL_MAX_STEPS_LIBERO_OBJECT:-280}"',
+            script_text,
+        )
+        self.assertIn(
+            'EVAL_MAX_STEPS_LIBERO_GOAL="${EVAL_MAX_STEPS_LIBERO_GOAL:-300}"',
+            script_text,
+        )
+        self.assertIn(
+            'EVAL_MAX_STEPS_LIBERO_10="${EVAL_MAX_STEPS_LIBERO_10:-520}"',
+            script_text,
+        )
+        self.assertIn(
+            'DEFAULT_SUITES=("libero_spatial" "libero_object" "libero_goal" "libero_10")',
+            script_text,
+        )
+        self.assertIn('TRAIN_HDF5_DIR="${PROCESSED_ROOT}/${suite}"', script_text)
+        self.assertIn('CKPT_DIR="${CKPT_ROOT}/${ARM}_${suite}_seed${SEED}"', script_text)
+        self.assertIn('--suites "$suite"', script_text)
+        self.assertNotIn("all4_flat", script_text)
 
     def test_saved_fast_tokenizer_patch_copies_processor_module_fallback(self) -> None:
         source = (ROOT / "preprocess_libero.py").read_text()
