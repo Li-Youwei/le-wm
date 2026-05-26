@@ -63,9 +63,13 @@ class AttentionMaskLayoutTest(unittest.TestCase):
             self.assertFalse(mask[i, bos])
             self.assertFalse(mask[i, real_actions + query_positions].any())
 
-        for i in visual_proprio + [bos]:
-            self.assertTrue(mask[i, context + [bos]].all())
+        for i in visual_proprio:
+            self.assertTrue(mask[i, context].all())
+            self.assertFalse(mask[i, bos])
             self.assertFalse(mask[i, real_actions + query_positions].any())
+
+        self.assertTrue(mask[bos, context + [bos]].all())
+        self.assertFalse(mask[bos, real_actions + query_positions].any())
 
         for i in real_actions:
             self.assertTrue(mask[i, context + [bos]].all())
@@ -85,7 +89,7 @@ class AttentionMaskLayoutTest(unittest.TestCase):
                 self.assertTrue(mask[i, previous_blocks].all())
                 same_block_others = [p for p in block if p != i]
                 self.assertTrue(mask[i, i])
-                self.assertFalse(mask[i, same_block_others].any())
+                self.assertTrue(mask[i, same_block_others].all())
                 self.assertFalse(mask[i, future_blocks].any())
                 self.assertFalse(mask[i, action_pad].any())
 
@@ -122,7 +126,8 @@ class AttentionMaskLayoutTest(unittest.TestCase):
         self.assertTrue(mask[0, context].all())
         self.assertFalse(mask[0, bos])
         self.assertFalse(mask[0, actions].any())
-        self.assertTrue(mask[5, context + [bos]].all())
+        self.assertTrue(mask[5, context].all())
+        self.assertFalse(mask[5, bos])
         self.assertFalse(mask[5, actions].any())
         self.assertTrue(mask[bos, context + [bos]].all())
         self.assertFalse(mask[bos, actions].any())

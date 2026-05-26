@@ -12,6 +12,11 @@ from omegaconf import OmegaConf
 from transformers import T5EncoderModel
 
 from jepa import JEPA
+from loss_utils import (
+    _equal_horizon_mse,
+    _sigreg_loss_over_future_horizons,
+    _weighted_stream_loss,
+)
 from module import (
     ACTION_HEAD_SIZE,
     DEFAULT_STATE_PREDICTION_HORIZONS,
@@ -48,10 +53,10 @@ def lejepa_forward(self, batch, stage, cfg):
     branch does NOT use stop-gradient; SIGReg is what prevents collapse.
 
     When ``cfg.loss.sigreg_weight > 0``: also computes ``L_sigreg`` on the
-    encoder outputs only — Algorithm 1 strict (4 streams in our setup:
-    z_ag_t, z_hd_t, z_ag_{t+H}, z_hd_{t+H}). Predictor outputs (ẑ) are
-    NOT included; that matches the paper's Algorithm 1 listing rather
-    than Figure 1's looser visual.
+    encoder outputs only. With multi-horizon SP enabled, SIGReg runs once per
+    future horizon on ``[z_ag_t, z_hd_t, z_ag_{t+K}, z_hd_{t+K}]`` and then
+    averages horizons equally. Predictor outputs (ẑ) are NOT included; that
+    matches the paper's Algorithm 1 listing rather than Figure 1's looser visual.
     """
     # `cfg.loss` may be absent in overfit.yaml (which doesn't define a
     # loss: section); guard with cfg.get(...) so both configs work.
@@ -59,6 +64,12 @@ def lejepa_forward(self, batch, stage, cfg):
     pred_weight = float(loss_cfg.get("pred_weight", 0.0))
     sigreg_weight = float(loss_cfg.get("sigreg_weight", 0.0))
     gripper_aux_weight = float(loss_cfg.get("gripper_aux_weight", 0.0))
+    pred_stream_weights_cfg = loss_cfg.get("pred_stream_weights", {}) or {}
+    pred_stream_weights = {
+        "ag": float(pred_stream_weights_cfg.get("ag", 1.0)),
+        "hd": float(pred_stream_weights_cfg.get("hd", 1.0)),
+        "pr": float(pred_stream_weights_cfg.get("pr", 1.0)),
+    }
     use_state_pred = pred_weight > 0
     use_gripper_aux = gripper_aux_weight > 0
     visual_cfg = cfg.get("visual_tokens", {}) or {}
@@ -208,14 +219,18 @@ def lejepa_forward(self, batch, stage, cfg):
                     f"pred_hd={tuple(pred_hd.shape)} vs "
                     f"z_hand_future={tuple(z_hand_future.shape)}"
                 )
-            loss_pred_ag_cls = F.mse_loss(pred_ag[:, :, 0], z_agent_future[:, :, 0])
-            loss_pred_hd_cls = F.mse_loss(pred_hd[:, :, 0], z_hand_future[:, :, 0])
+            loss_pred_ag_cls = _equal_horizon_mse(
+                pred_ag[:, :, 0], z_agent_future[:, :, 0]
+            )
+            loss_pred_hd_cls = _equal_horizon_mse(
+                pred_hd[:, :, 0], z_hand_future[:, :, 0]
+            )
             if pred_ag.size(2) > 1:
-                loss_pred_ag_patch = F.mse_loss(
+                loss_pred_ag_patch = _equal_horizon_mse(
                     pred_ag[:, :, 1:],
                     z_agent_future[:, :, 1:],
                 )
-                loss_pred_hd_patch = F.mse_loss(
+                loss_pred_hd_patch = _equal_horizon_mse(
                     pred_hd[:, :, 1:],
                     z_hand_future[:, :, 1:],
                 )
@@ -257,17 +272,24 @@ def lejepa_forward(self, batch, stage, cfg):
                     f"pred_hd={tuple(pred_hd.shape)} vs "
                     f"z_hand_future={tuple(z_hand_future.shape)}"
                 )
-            loss_pred_ag = F.mse_loss(pred_ag, z_agent_future)
-            loss_pred_hd = F.mse_loss(pred_hd, z_hand_future)
+            loss_pred_ag = _equal_horizon_mse(pred_ag, z_agent_future)
+            loss_pred_hd = _equal_horizon_mse(pred_hd, z_hand_future)
         if pred_pr.shape != proprio_future.shape:
             raise RuntimeError(
                 "Proprio state prediction/target shapes must match exactly, got "
                 f"pred_pr={tuple(pred_pr.shape)} vs "
                 f"proprio_future={tuple(proprio_future.shape)}"
             )
-        loss_pred_pr = F.mse_loss(pred_pr, proprio_future)
+        loss_pred_pr = _equal_horizon_mse(pred_pr, proprio_future)
 
-        output["pred_loss"] = loss_pred_ag + loss_pred_hd + loss_pred_pr
+        output["pred_loss"] = _weighted_stream_loss(
+            {
+                "ag": loss_pred_ag,
+                "hd": loss_pred_hd,
+                "pr": loss_pred_pr,
+            },
+            pred_stream_weights,
+        )
         output["pred_loss_ag"] = loss_pred_ag
         output["pred_loss_hd"] = loss_pred_hd
         output["pred_loss_pr"] = loss_pred_pr
@@ -275,13 +297,11 @@ def lejepa_forward(self, batch, stage, cfg):
         total_loss = total_loss + pred_weight * output["pred_loss"]
 
     # 7. SIGReg loss (Algorithm 1 strict — encoder outputs only).
-    # The 4-stream stack maps to LeWM's `emb` over 2 timesteps × 2 views.
-    # Predictor outputs (pred_ag/pred_hd) are intentionally NOT included
-    # — see paper Algorithm 1 + upstream `train.py::lejepa_forward`.
-    # `encode()` returns (B, N, D); for SIGReg we use the CLS slice only.
-    # SIGReg remains CLS-only even when patch-level SP is enabled; patch
-    # tokens get direct supervision through the SP MSE above, while SIGReg
-    # preserves the original LeWM 4-stream embedding regularizer.
+    # Predictor outputs (pred_ag/pred_hd) are intentionally NOT included.
+    # With multi-horizon SP, run SIGReg separately for each future horizon on
+    # [z_ag_t, z_hd_t, z_ag_t+h, z_hd_t+h], then average horizons equally.
+    # SIGReg remains CLS-only even when patch-level SP is enabled; patch tokens
+    # get direct supervision through the SP MSE above.
     if sigreg_weight > 0:
         z_ag_cls = z_agent[:, 0] if z_agent.dim() == 3 else z_agent
         z_hd_cls = z_hand[:, 0] if z_hand.dim() == 3 else z_hand
@@ -290,20 +310,15 @@ def lejepa_forward(self, batch, stage, cfg):
             # SIGReg degenerates to 2 streams (current views only).
             sigreg_input = torch.stack([z_ag_cls, z_hd_cls], dim=0)
         else:
-            if z_agent_future.dim() == 4:
-                z_ag_future_cls = z_agent_future[:, -1, 0]
-                z_hd_future_cls = z_hand_future[:, -1, 0]
-            elif z_agent_future.dim() == 3:
-                z_ag_future_cls = z_agent_future[:, -1]
-                z_hd_future_cls = z_hand_future[:, -1]
-            else:
-                z_ag_future_cls = z_agent_future
-                z_hd_future_cls = z_hand_future
-            sigreg_input = torch.stack(
-                [z_ag_cls, z_hd_cls, z_ag_future_cls, z_hd_future_cls],
-                dim=0,
+            output["sigreg_loss"] = _sigreg_loss_over_future_horizons(
+                self.sigreg,
+                z_ag_cls,
+                z_hd_cls,
+                z_agent_future,
+                z_hand_future,
             )
-        output["sigreg_loss"] = self.sigreg(sigreg_input)
+        if not use_state_pred:
+            output["sigreg_loss"] = self.sigreg(sigreg_input)
         total_loss = total_loss + sigreg_weight * output["sigreg_loss"]
 
     # 7b. Gripper auxiliary loss. Direct (H,) regression against the

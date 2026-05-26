@@ -85,6 +85,12 @@ projector:
 #   sigreg_weight = 0.1  (paper Section 3, λ = 0.1)
 loss:
   pred_weight: 0.0       # > 0 enables horizon STATE_QUERY blocks + 3 stream MSE losses
+  # Stream weights are normalized inside train.py, so [1,1,1] means equal
+  # ag/hd/proprio contribution regardless of natural loss scale.
+  pred_stream_weights:
+    ag: 1.0
+    hd: 1.0
+    pr: 1.0
   sigreg_weight: 0.0     # > 0 enables SIGReg on encoder outputs (Algorithm 1 strict)
   # Gripper-aware auxiliary head + MSE loss. When > 0 the predictor grows a
   # small MLP that reads the BOS hidden state and regresses the (H,)

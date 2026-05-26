@@ -22,6 +22,13 @@ class RepositoryContractsTest(unittest.TestCase):
         config_text = (ROOT / "config/train/lewm.yaml").read_text()
         self.assertIn("state_prediction_horizons: [5, 10, 15, 20]", config_text)
 
+    def test_train_config_declares_prediction_stream_weights(self) -> None:
+        config_text = (ROOT / "config/train/lewm.yaml").read_text()
+        self.assertIn("pred_stream_weights:", config_text)
+        self.assertIn("ag: 1.0", config_text)
+        self.assertIn("hd: 1.0", config_text)
+        self.assertIn("pr: 1.0", config_text)
+
     def test_train_config_uses_full_train_split_by_default(self) -> None:
         config_text = (ROOT / "config/train/lewm.yaml").read_text()
         self.assertIn("train_split: 1.0", config_text)

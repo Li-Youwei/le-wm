@@ -169,9 +169,65 @@ class VisualTokenProjectionTest(unittest.TestCase):
         self.assertEqual(predictor.n_visual_per_view, 257)
         self.assertEqual(tuple(predictor.agent_patch_2d_pos.shape), (16, 16, 192))
         self.assertEqual(tuple(predictor.hand_patch_2d_pos.shape), (16, 16, 192))
-        self.assertEqual(tuple(predictor.state_query_embeddings.shape), (4, 3, 192))
+        self.assertEqual(tuple(predictor.state_query_tokens.shape), (3, 192))
+        self.assertEqual(tuple(predictor.state_horizon_embeddings.shape), (4, 192))
+        self.assertEqual(tuple(predictor.state_modality_embeddings.shape), (3, 192))
+        self.assertEqual(
+            tuple(predictor._compose_state_query_embeddings().shape), (4, 3, 192)
+        )
         self.assertEqual(predictor.n_state_query, 12)
         self.assertEqual(predictor.max_seq_len, 633)
+
+    def test_state_queries_are_factorized_by_stream_horizon_and_modality(self) -> None:
+        predictor = ARPredictor(
+            embed_dim=4,
+            depth=1,
+            heads=1,
+            dim_head=4,
+            mlp_dim=16,
+            max_action_tokens=4,
+            max_lang_tokens=2,
+            proprio_dim=9,
+            use_state_prediction=True,
+        )
+        with torch.no_grad():
+            predictor.state_query_tokens.copy_(
+                torch.tensor(
+                    [
+                        [1.0, 0.0, 0.0, 0.0],
+                        [2.0, 0.0, 0.0, 0.0],
+                        [3.0, 0.0, 0.0, 0.0],
+                    ]
+                )
+            )
+            predictor.state_horizon_embeddings.copy_(
+                torch.tensor(
+                    [
+                        [0.0, 10.0, 0.0, 0.0],
+                        [0.0, 20.0, 0.0, 0.0],
+                        [0.0, 30.0, 0.0, 0.0],
+                        [0.0, 40.0, 0.0, 0.0],
+                    ]
+                )
+            )
+            predictor.state_modality_embeddings.copy_(
+                torch.tensor(
+                    [
+                        [0.0, 0.0, 100.0, 0.0],
+                        [0.0, 0.0, 200.0, 0.0],
+                        [0.0, 0.0, 300.0, 0.0],
+                    ]
+                )
+            )
+
+        queries = predictor._compose_state_query_embeddings()
+
+        self.assertTrue(
+            torch.equal(
+                queries[1, 2],
+                torch.tensor([3.0, 20.0, 300.0, 0.0]),
+            )
+        )
 
     def test_multi_visual_token_predictor_requires_grid_layout(self) -> None:
         with self.assertRaisesRegex(ValueError, "visual_pool_grid > 0"):

@@ -95,6 +95,10 @@ projector:
 
 loss:
   pred_weight: 0.0      # > 0 enables horizon state prediction (SP) query blocks
+  pred_stream_weights:
+    ag: 1.0
+    hd: 1.0
+    pr: 1.0
   sigreg_weight: 0.0    # > 0 enables SIGReg on encoder outputs
   sigreg:
     kwargs:

@@ -54,7 +54,10 @@ class MoTPredictorTest(unittest.TestCase):
         self.assertEqual(pred_hd.shape, (2, 4, 16))
         self.assertEqual(pred_pr.shape, (2, 4, 9))
         self.assertEqual(predictor.n_state_query, 12)
-        self.assertEqual(predictor.state_query_embeddings.shape, (4, 3, 16))
+        self.assertEqual(predictor.state_query_tokens.shape, (3, 16))
+        self.assertEqual(predictor.state_horizon_embeddings.shape, (4, 16))
+        self.assertEqual(predictor.state_modality_embeddings.shape, (3, 16))
+        self.assertEqual(predictor._compose_state_query_embeddings().shape, (4, 3, 16))
 
     def test_mot_uses_modality_specific_transformer_blocks(self) -> None:
         predictor = self._make_predictor()

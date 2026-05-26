@@ -371,14 +371,14 @@ class ARPredictor(nn.Module):
     horizon h.
 
     Attention mask is prefix-structured + action-causal + horizon-query causal:
-    - Language rows see real language + visual + proprio context only.
-    - Visual/proprio/BOS rows see real language + visual + proprio + BOS.
+    - Prefix rows (language + visual + proprio) see real language + visual +
+      proprio context only, never BOS/action/query.
+    - BOS rows see real language + visual + proprio + BOS.
     - Action tokens (T_1...T_k): see real context + BOS and are causal within
       the action-token group.
     - PAD tokens: attend to nothing, no other token attends to them
     - STATE_QUERY tokens see real context + BOS + all non-PAD action tokens,
-      previous horizon query blocks, and themselves. Q_ag/Q_hd/Q_pr in the same
-      horizon block are isolated from each other.
+      previous horizon query blocks, and the whole same-horizon query block.
 
     Inference (`generate()`) does NOT construct STATE_QUERY tokens regardless
     of the flag, so eval_libero.py flow `[lang, z_ag, z_hd, z_pr, BOS] →
@@ -554,9 +554,16 @@ class ARPredictor(nn.Module):
                     f"'{state_head_norm_type}'"
                 )
 
-            # K horizon blocks, each with Q_ag, Q_hd, Q_pr stream queries.
-            self.state_query_embeddings = nn.Parameter(
-                torch.randn(self.n_state_horizons, self.n_state_streams, embed_dim)
+            # Factorized STATE_QUERY identity:
+            # Q_{k,m} = query_token_m + horizon_emb_k + modality_emb_m.
+            self.state_query_tokens = nn.Parameter(
+                torch.randn(self.n_state_streams, embed_dim)
+            )
+            self.state_horizon_embeddings = nn.Parameter(
+                torch.randn(self.n_state_horizons, embed_dim)
+            )
+            self.state_modality_embeddings = nn.Parameter(
+                torch.randn(self.n_state_streams, embed_dim)
             )
             # Per-stream projector: matches the encoder-side projector
             # signature (LeWM paper Sec. 3 + upstream pattern). With
@@ -614,6 +621,24 @@ class ARPredictor(nn.Module):
             )
             self.norm = nn.LayerNorm(embed_dim)
         self.dropout = nn.Dropout(emb_dropout)
+
+    def _compose_state_query_embeddings(self) -> torch.Tensor:
+        """Return STATE_QUERY embeddings as (K, 3, D)."""
+        if all(
+            hasattr(self, name)
+            for name in (
+                "state_query_tokens",
+                "state_horizon_embeddings",
+                "state_modality_embeddings",
+            )
+        ):
+            return (
+                self.state_horizon_embeddings[:, None, :]
+                + self.state_query_tokens[None, :, :]
+                + self.state_modality_embeddings[None, :, :]
+            )
+        # Backward-compatible path for older object checkpoints.
+        return self.state_query_embeddings
 
     def _build_attn_mask(
         self,
@@ -692,12 +717,14 @@ class ARPredictor(nn.Module):
         action_real = is_real & in_action_token.unsqueeze(0)
         context_bos_real = context_real | bos_real
 
-        # Rule 1: language rows see real language + visual + proprio context.
+        # Rule 1: prefix rows see real language + visual + proprio context.
+        # Prefix tokens do not attend to BOS/action/query tokens.
         mask |= lang_real.unsqueeze(2) & context_real.unsqueeze(1)
 
-        # Rule 2: visual/proprio/BOS rows see context + BOS.
-        visual_bos_rows = visual_proprio_real | bos_real
-        mask |= visual_bos_rows.unsqueeze(2) & context_bos_real.unsqueeze(1)
+        mask |= visual_proprio_real.unsqueeze(2) & context_real.unsqueeze(1)
+
+        # Rule 2: BOS rows see context + BOS.
+        mask |= bos_real.unsqueeze(2) & context_bos_real.unsqueeze(1)
 
         # Rule 3: action tokens see context + BOS.
         mask |= action_real.unsqueeze(2) & context_bos_real.unsqueeze(1)
@@ -709,11 +736,9 @@ class ARPredictor(nn.Module):
         )
 
         # Rule 5: horizon query blocks see context + BOS + all real actions,
-        # previous horizon query blocks, and themselves. Streams inside the
-        # same horizon block remain isolated from each other.
+        # previous horizon query blocks, and their whole same-horizon block.
         if self.n_state_query > 0 and query_start < L:
             query_base_cols = context_bos_real | action_real
-            eye_L = torch.eye(L, dtype=torch.bool, device=device)
             for horizon_idx in range(self.n_state_horizons):
                 block_start = query_start + horizon_idx * self.n_state_streams
                 block_end = min(block_start + self.n_state_streams, L)
@@ -729,11 +754,7 @@ class ARPredictor(nn.Module):
                     previous_real = is_real & in_previous_queries.unsqueeze(0)
                     mask |= block_real.unsqueeze(2) & previous_real.unsqueeze(1)
 
-                mask |= (
-                    block_real.unsqueeze(2)
-                    & block_real.unsqueeze(1)
-                    & eye_L.unsqueeze(0)
-                )
+                mask |= block_real.unsqueeze(2) & block_real.unsqueeze(1)
 
         return mask.unsqueeze(1)  # (B, 1, L, L)
 
@@ -782,11 +803,11 @@ class ARPredictor(nn.Module):
         action_real = is_real & in_action_token.unsqueeze(0)
         context_bos_real = context_real | bos_real
 
-        # Language sees context only.
+        # Prefix rows see context only; BOS/action rows may read prefix.
         mask |= lang_real.unsqueeze(2) & context_real.unsqueeze(1)
-        # Visual/proprio/BOS see context + BOS.
-        visual_bos_rows = visual_proprio_real | bos_real
-        mask |= visual_bos_rows.unsqueeze(2) & context_bos_real.unsqueeze(1)
+        mask |= visual_proprio_real.unsqueeze(2) & context_real.unsqueeze(1)
+        # BOS sees context + BOS.
+        mask |= bos_real.unsqueeze(2) & context_bos_real.unsqueeze(1)
         # Generated action tokens see context + BOS.
         mask |= action_real.unsqueeze(2) & context_bos_real.unsqueeze(1)
         # Generated action tokens are causal within generated action tokens.
@@ -1006,8 +1027,8 @@ class ARPredictor(nn.Module):
         # query is a learnable embedding plus the type embedding (index 4).
         # Index 4 only exists when use_state_prediction is True (n_type=5).
         if self.use_state_prediction:
-            # state_query_embeddings: (K, 3, D) -> (1, K*3, D) -> (B, K*3, D)
-            q_base = self.state_query_embeddings.reshape(
+            # (K, 3, D) -> (1, K*3, D) -> (B, K*3, D)
+            q_base = self._compose_state_query_embeddings().reshape(
                 self.n_state_query,
                 self.embed_dim,
             )
