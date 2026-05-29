@@ -133,7 +133,19 @@ SEED="${SEED:-3072}"
 MAX_STEPS="${MAX_STEPS:-60000}"
 VAL_INTERVAL="${VAL_INTERVAL:-4000}"
 WARMUP_STEPS="${WARMUP_STEPS:-2000}"
-BATCH_SIZE="${BATCH_SIZE:-128}"
+DDP_DEVICES="${DDP_DEVICES:-4}"
+GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"
+if [[ -n "${PER_DEVICE_BATCH_SIZE:-}" ]]; then
+    :
+elif [[ -n "${BATCH_SIZE:-}" ]]; then
+    PER_DEVICE_BATCH_SIZE="$BATCH_SIZE"
+else
+    PER_DEVICE_BATCH_SIZE=16
+fi
+BATCH_SIZE="${BATCH_SIZE:-$PER_DEVICE_BATCH_SIZE}"
+ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-1}"
+TRAINER_STRATEGY="${TRAINER_STRATEGY:-ddp}"
+SYNC_BATCHNORM="${SYNC_BATCHNORM:-true}"
 STATE_ARCH="${STATE_ARCH:-$STATE_ARCH_DEFAULT}"
 POOL_GRID="${POOL_GRID:-$POOL_GRID_DEFAULT}"
 PREDICTOR_DEPTH="${PREDICTOR_DEPTH:-$PREDICTOR_DEPTH_DEFAULT}"
@@ -162,7 +174,7 @@ else
     RUN_SUITES=("${DEFAULT_SUITES[@]}")
 fi
 
-export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
+export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"
 export HF_HUB_OFFLINE="${HF_HUB_OFFLINE:-1}"
 export TRANSFORMERS_OFFLINE="${TRANSFORMERS_OFFLINE:-1}"
 
@@ -178,6 +190,9 @@ echo "[all4_pretrained_vision] PROCESSED_ROOT=$PROCESSED_ROOT"
 echo "[all4_pretrained_vision] VISION_ENCODER=$VISION_ENCODER"
 echo "[all4_pretrained_vision] SUITES=${RUN_SUITES[*]}"
 echo "[all4_pretrained_vision] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
+echo "[all4_pretrained_vision] DDP_DEVICES=$DDP_DEVICES TRAINER_STRATEGY=$TRAINER_STRATEGY SYNC_BATCHNORM=$SYNC_BATCHNORM"
+echo "[all4_pretrained_vision] GLOBAL_BATCH_SIZE=$GLOBAL_BATCH_SIZE PER_DEVICE_BATCH_SIZE=$PER_DEVICE_BATCH_SIZE ACCUMULATE_GRAD_BATCHES=$ACCUMULATE_GRAD_BATCHES"
+echo "[all4_pretrained_vision] BATCH_SIZE alias=$BATCH_SIZE (per-device)"
 echo "[all4_pretrained_vision] TRAIN_SPLIT=$TRAIN_SPLIT"
 echo "[all4_pretrained_vision] FULL_TRAIN_TARGET_STEP=$FULL_TRAIN_TARGET_STEP"
 echo "[all4_pretrained_vision] CKPT_SELECT_TOP_K=$CKPT_SELECT_TOP_K LIGHT_EVAL_EPISODES=$LIGHT_EVAL_EPISODES FINAL_EVAL_EPISODES=$FINAL_EVAL_EPISODES"
@@ -406,12 +421,17 @@ train_one_suite() {
         predictor.depth="$PREDICTOR_DEPTH" \
         projector.norm_type="$NORM" \
         scheduler.warmup_steps="$WARMUP_STEPS" \
-        trainer.devices=1 \
+        trainer.devices="$DDP_DEVICES" \
+        trainer.strategy="$TRAINER_STRATEGY" \
+        trainer.sync_batchnorm="$SYNC_BATCHNORM" \
+        trainer.accumulate_grad_batches="$ACCUMULATE_GRAD_BATCHES" \
+        trainer.use_distributed_sampler=false \
         +trainer.max_steps="$MAX_STEPS" \
         trainer.max_epochs=999 \
         +trainer.val_check_interval="$VAL_INTERVAL" \
         +trainer.check_val_every_n_epoch=null \
-        loader.batch_size="$BATCH_SIZE" \
+        loader.batch_size="$PER_DEVICE_BATCH_SIZE" \
+        loader.global_batch_size="$GLOBAL_BATCH_SIZE" \
         train_split="$TRAIN_SPLIT" \
         seed="$SEED" \
         subdir="" \

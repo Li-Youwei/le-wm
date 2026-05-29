@@ -11,6 +11,7 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from omegaconf import OmegaConf
 from transformers import T5EncoderModel
 
+from ddp_sampler import DistributedIndexSampler, DistributedWeightedSampler
 from jepa import JEPA
 from loss_utils import (
     _equal_horizon_mse,
@@ -40,6 +41,39 @@ def _cfg_bool(value, *, name: str) -> bool:
         if normalized in {"false", "0", "no", "n", "off"}:
             return False
     raise ValueError(f"{name} must be a boolean, got {value!r}")
+
+
+def _resolve_trainer_num_devices(devices_cfg, accelerator_cfg) -> int:
+    if OmegaConf.is_config(devices_cfg):
+        devices_cfg = OmegaConf.to_container(devices_cfg, resolve=True)
+
+    if isinstance(devices_cfg, int):
+        if devices_cfg == -1:
+            return _available_device_count(accelerator_cfg)
+        return max(1, devices_cfg)
+
+    if isinstance(devices_cfg, (list, tuple)):
+        return max(1, len(devices_cfg))
+
+    if isinstance(devices_cfg, str):
+        normalized = devices_cfg.strip().lower()
+        if normalized in {"auto", ""}:
+            return _available_device_count(accelerator_cfg)
+        if normalized == "-1":
+            return _available_device_count(accelerator_cfg)
+        if normalized.isdigit():
+            return max(1, int(normalized))
+        if "," in normalized:
+            return len([part for part in normalized.split(",") if part.strip()])
+
+    raise ValueError(f"Unsupported trainer.devices value: {devices_cfg!r}")
+
+
+def _available_device_count(accelerator_cfg) -> int:
+    accelerator = str(accelerator_cfg).strip().lower()
+    if accelerator in {"gpu", "cuda", "auto"} and torch.cuda.is_available():
+        return max(1, torch.cuda.device_count())
+    return 1
 
 
 def lejepa_forward(self, batch, stage, cfg):
@@ -490,28 +524,52 @@ def run(cfg):
         f"patch_sp={patch_sp}, patch_sp_weight={patch_sp_weight}"
     )
 
-    # Multi-GPU + plain BatchNorm = silent divergence. nn.BatchNorm1d computes
-    # statistics per-GPU, so without SyncBatchNorm each rank sees a different
-    # normalization → encoder representations drift apart with no error
-    # signal. Hard-fail rather than warn — debugging silent BN drift later
-    # costs more than this guard. Setting devices=1 (or [N]) is the safe
-    # path; SyncBatchNorm conversion is not yet auto-applied.
-    if projector_norm == "batch":
-        devices_cfg = cfg.trainer.get("devices", "auto")
-        is_explicit_single_gpu = devices_cfg == 1 or (
-            isinstance(devices_cfg, list) and len(devices_cfg) == 1
+    loader_kwargs = OmegaConf.to_container(cfg.loader, resolve=True)
+    target_global_batch = loader_kwargs.pop("global_batch_size", None)
+    target_global_batch = (
+        int(target_global_batch) if target_global_batch is not None else None
+    )
+    per_device_batch = int(loader_kwargs["batch_size"])
+    trainer_cfg_run = cfg.get("trainer", {}) or {}
+    trainer_num_devices = _resolve_trainer_num_devices(
+        trainer_cfg_run.get("devices", "auto"),
+        trainer_cfg_run.get("accelerator", "auto"),
+    )
+    accumulate_grad_batches = int(trainer_cfg_run.get("accumulate_grad_batches", 1))
+    effective_global_batch = (
+        per_device_batch * trainer_num_devices * accumulate_grad_batches
+    )
+    print(
+        "[batch] "
+        f"per_device_batch={per_device_batch}, "
+        f"devices={trainer_num_devices}, "
+        f"accumulate_grad_batches={accumulate_grad_batches}, "
+        f"effective_global_batch={effective_global_batch}, "
+        f"target_global_batch={target_global_batch}"
+    )
+    if target_global_batch is not None and effective_global_batch != target_global_batch:
+        raise ValueError(
+            "Effective global batch mismatch: "
+            f"loader.batch_size({per_device_batch}) * "
+            f"trainer.devices({trainer_num_devices}) * "
+            f"trainer.accumulate_grad_batches({accumulate_grad_batches}) = "
+            f"{effective_global_batch}, expected loader.global_batch_size="
+            f"{target_global_batch}."
         )
-        if not is_explicit_single_gpu:
-            raise ValueError(
-                f"projector.norm_type='batch' is unsafe with cfg.trainer.devices="
-                f"{devices_cfg!r}. BatchNorm without "
-                "torch.nn.SyncBatchNorm.convert_sync_batchnorm gives per-GPU "
-                "statistics → silent divergence across ranks. Either: "
-                "(a) set trainer.devices=1, or (b) wrap the model in "
-                "SyncBatchNorm before training (not yet auto-applied). "
-                "'auto' is also rejected because it can resolve to >1 GPUs "
-                "without warning."
-            )
+
+    uses_batch_norm = projector_norm == "batch" or patch_projector_norm_type == "batch"
+    sync_batchnorm = _cfg_bool(
+        trainer_cfg_run.get("sync_batchnorm", False),
+        name="trainer.sync_batchnorm",
+    )
+    if uses_batch_norm and trainer_num_devices > 1 and not sync_batchnorm:
+        raise ValueError(
+            "BatchNorm with multi-GPU DDP requires trainer.sync_batchnorm=True "
+            "so projector/state-head statistics are synchronized across ranks. "
+            f"Got trainer.devices={trainer_cfg_run.get('devices', 'auto')!r}, "
+            f"projector.norm_type={projector_norm!r}, "
+            f"visual_tokens.patch_projector_norm_type={patch_projector_norm_type!r}."
+        )
 
     from libero_dataset import LiberoDataset
 
@@ -586,36 +644,47 @@ def run(cfg):
     # 3-level balanced sampling (task → demo → time uniform) for the train loader.
     # Skipped in overfit mode (we want the same chunks every step).
     if overfit_demo is None:
-        from torch.utils.data import WeightedRandomSampler
-
         all_weights = dataset.get_sampler_weights()
         train_weights = all_weights[train_indices]
-        train_sampler = WeightedRandomSampler(
+        train_sampler = DistributedWeightedSampler(
             weights=train_weights,
             num_samples=len(train_weights),
             replacement=True,
-            generator=rnd_gen,
+            seed=seed,
         )
         # cfg.loader has no `shuffle` key (verified in lewm.yaml), so passing
-        # both **cfg.loader and sampler=... is safe. WeightedRandomSampler is
-        # incompatible with shuffle=True.
+        # both loader kwargs and sampler=... is safe. The sampler shards one
+        # shared weighted stream by DDP rank when WORLD_SIZE/RANK are present.
         train = torch.utils.data.DataLoader(
             train_set,
-            **cfg.loader,
+            **loader_kwargs,
             sampler=train_sampler,
             drop_last=train_drop_last,
         )
     else:
+        train_sampler = DistributedIndexSampler(
+            len(train_set),
+            shuffle=True,
+            seed=seed,
+            drop_last=train_drop_last,
+        )
         train = torch.utils.data.DataLoader(
             train_set,
-            **cfg.loader,
-            shuffle=True,
+            **loader_kwargs,
+            sampler=train_sampler,
             drop_last=train_drop_last,
-            generator=rnd_gen,
         )
     val = (
         torch.utils.data.DataLoader(
-            val_set, **cfg.loader, shuffle=False, drop_last=False
+            val_set,
+            **loader_kwargs,
+            sampler=DistributedIndexSampler(
+                len(val_set),
+                shuffle=False,
+                seed=seed,
+                drop_last=False,
+            ),
+            drop_last=False,
         )
         if has_validation
         else None

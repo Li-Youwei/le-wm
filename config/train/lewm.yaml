@@ -26,12 +26,18 @@ vision_encoder:
 trainer:
   max_epochs: 100
   devices: auto
+  strategy: auto
   accelerator: gpu
   precision: bf16
   gradient_clip_val: 1.0
+  sync_batchnorm: false
+  accumulate_grad_batches: 1
+  use_distributed_sampler: false
 
 loader:
-  batch_size: 128
+  # Per-device batch size. The suite runner uses 4 GPUs x 16 = global batch 64.
+  batch_size: 16
+  global_batch_size: 64
   num_workers: ${num_workers}
   persistent_workers: True
   prefetch_factor: 3

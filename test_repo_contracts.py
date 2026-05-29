@@ -74,6 +74,46 @@ class RepositoryContractsTest(unittest.TestCase):
         self.assertIn('--suites "$suite"', script_text)
         self.assertNotIn("all4_flat", script_text)
 
+    def test_pretrained_vision_runner_defaults_to_ddp_batch64(self) -> None:
+        script_text = (ROOT / "run_all4_pretrained_vision.sh").read_text()
+        self.assertIn('CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0,1,2,3}"', script_text)
+        self.assertIn('DDP_DEVICES="${DDP_DEVICES:-4}"', script_text)
+        self.assertIn('GLOBAL_BATCH_SIZE="${GLOBAL_BATCH_SIZE:-64}"', script_text)
+        self.assertIn('PER_DEVICE_BATCH_SIZE=16', script_text)
+        self.assertIn('PER_DEVICE_BATCH_SIZE="$BATCH_SIZE"', script_text)
+        self.assertIn(
+            'ACCUMULATE_GRAD_BATCHES="${ACCUMULATE_GRAD_BATCHES:-1}"',
+            script_text,
+        )
+        self.assertIn('TRAINER_STRATEGY="${TRAINER_STRATEGY:-ddp}"', script_text)
+        self.assertIn('SYNC_BATCHNORM="${SYNC_BATCHNORM:-true}"', script_text)
+        self.assertIn('trainer.devices="$DDP_DEVICES"', script_text)
+        self.assertIn('trainer.strategy="$TRAINER_STRATEGY"', script_text)
+        self.assertIn('trainer.sync_batchnorm="$SYNC_BATCHNORM"', script_text)
+        self.assertIn(
+            'trainer.accumulate_grad_batches="$ACCUMULATE_GRAD_BATCHES"',
+            script_text,
+        )
+        self.assertIn('loader.batch_size="$PER_DEVICE_BATCH_SIZE"', script_text)
+        self.assertIn('loader.global_batch_size="$GLOBAL_BATCH_SIZE"', script_text)
+        self.assertNotIn("trainer.devices=1", script_text)
+
+    def test_train_config_declares_ddp_batch_controls(self) -> None:
+        config_text = (ROOT / "config/train/lewm.yaml").read_text()
+        self.assertIn("strategy: auto", config_text)
+        self.assertIn("sync_batchnorm: false", config_text)
+        self.assertIn("accumulate_grad_batches: 1", config_text)
+        self.assertIn("use_distributed_sampler: false", config_text)
+        self.assertIn("batch_size: 16", config_text)
+        self.assertIn("global_batch_size: 64", config_text)
+
+    def test_train_uses_project_ddp_sampler_and_syncbn_guard(self) -> None:
+        source = (ROOT / "train.py").read_text()
+        self.assertIn("DistributedWeightedSampler", source)
+        self.assertIn("DistributedIndexSampler", source)
+        self.assertIn("trainer.sync_batchnorm=True", source)
+        self.assertIn("effective_global_batch", source)
+
     def test_saved_fast_tokenizer_patch_copies_processor_module_fallback(self) -> None:
         source = (ROOT / "preprocess_libero.py").read_text()
         self.assertIn("tokenizer: Any | None = None", source)
