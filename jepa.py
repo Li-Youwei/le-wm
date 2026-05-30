@@ -183,17 +183,32 @@ class JEPA(nn.Module):
                 N = 1 + grid*grid (CLS + spatially-pooled patches).
             z_hand_future: same layout as z_agent_future.
         """
-        visual_cat = torch.cat(
-            [pixels_agent_future, pixels_hand_future],
-            dim=0,
-        )  # (2B, C, H, W)
+        # Accept (B, C, H, W) [single horizon] or (B, K, C, H, W) [multi-horizon
+        # SP]. The horizon axis is flattened into the batch so all K horizons ×
+        # both views go through the encoder in ONE pass, then reshaped back.
+        squeeze_k = False
+        if pixels_agent_future.dim() == 4:
+            pixels_agent_future = pixels_agent_future.unsqueeze(1)  # (B, 1, C, H, W)
+            pixels_hand_future = pixels_hand_future.unsqueeze(1)
+            squeeze_k = True
+        B, K = pixels_agent_future.shape[:2]
+        C, Hh, Ww = pixels_agent_future.shape[2:]
+        af = pixels_agent_future.reshape(B * K, C, Hh, Ww)
+        hf = pixels_hand_future.reshape(B * K, C, Hh, Ww)
+        visual_cat = torch.cat([af, hf], dim=0)  # (2*B*K, C, H, W)
         visual_out = self.encoder(visual_cat, interpolate_pos_encoding=True)
         # Mirror encode(): pool → reshape adapter → projector → reshape back.
-        tokens_2b = self._pool_visual_tokens(visual_out.last_hidden_state)
-        B_total, N_per, D_in = tokens_2b.shape
-        visual_z_flat = self.projector(tokens_2b.reshape(B_total * N_per, D_in))
-        visual_z = visual_z_flat.reshape(B_total, N_per, -1)  # (2B, N, D)
-        z_agent_future, z_hand_future = visual_z.chunk(2, dim=0)
+        tokens = self._pool_visual_tokens(visual_out.last_hidden_state)
+        B_total, N_per, D_in = tokens.shape
+        visual_z = self.projector(tokens.reshape(B_total * N_per, D_in)).reshape(
+            B_total, N_per, -1
+        )  # (2*B*K, N, D)
+        z_agent_future, z_hand_future = visual_z.chunk(2, dim=0)  # (B*K, N, D)
+        z_agent_future = z_agent_future.reshape(B, K, N_per, -1)  # (B, K, N, D)
+        z_hand_future = z_hand_future.reshape(B, K, N_per, -1)
+        if squeeze_k:
+            z_agent_future = z_agent_future.squeeze(1)  # (B, N, D)
+            z_hand_future = z_hand_future.squeeze(1)
         return z_agent_future, z_hand_future
 
     def _pool_visual_tokens(self, hidden: torch.Tensor) -> torch.Tensor:

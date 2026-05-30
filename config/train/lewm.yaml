@@ -8,6 +8,10 @@ subdir: ${hydra:job.id}
 num_workers: 6
 train_split: 0.9
 seed: 3072
+# Train-only image augmentation (random-resized-crop scale>=0.85 + brightness/
+# contrast/saturation jitter), applied per-view consistently across the current
+# frame and its future SP targets. val stays un-augmented. Auto-off in overfit.
+augment: true
 img_size: 224
 patch_size: 14
 encoder_scale: tiny
@@ -32,7 +36,13 @@ vision_encoder:
   source: hf # hf (frozen DINOv2, default) | spt_vit (legacy ViT-Tiny)
   pretrained: false # only used when source=spt_vit
   model_name_or_path: facebook/dinov2-base # used when source=hf
-  freeze: true # hf path: eval() + requires_grad_(False); also pins encoder in JEPA.train()
+  # freeze=false => FINETUNE the visual encoder end-to-end (the #1 LIBERO lever:
+  # a frozen control-agnostic SSL encoder is the structural ceiling). Encoder
+  # params use optimizer.encoder_lr (low, discriminative); everything else uses
+  # optimizer.lr. SIGReg/SP become the genuine anti-collapse guard once the
+  # encoder is trainable (encode_future_visual has no stop-grad). Set freeze=true
+  # to keep DINOv2 frozen (old default).
+  freeze: false
   local_files_only: true # set false for the first download (then cache hit); honors HF_HUB_OFFLINE
   trust_remote_code: false
 
@@ -54,21 +64,39 @@ optimizer:
   type: AdamW
   lr: 5e-5
   weight_decay: 0.05
+  # Discriminative LR for the finetuned visual encoder (used only when
+  # vision_encoder.freeze=false). Low, so freshly-unfrozen pretrained DINOv2
+  # isn't whiplashed by the from-scratch heads. null => use the same lr for the
+  # encoder (no separate group).
+  encoder_lr: 1.0e-5
 
 # CE label smoothing — overridden to 0 in the no-regularization ablation.
 label_smoothing: 0.1
 
 wm:
   type: vla_baseline
-  embed_dim: 192
+  embed_dim: 384 # widened 192 -> 384: halves the DINOv2 768->D projector squeeze (4x -> 2x), clears the JL/rank floor for 514 visual tokens, and (with heads=16, dim_head=64) gives inner_dim=1024 = 2.67x over-projection instead of 5.33x
 
+# NOTE (capacity bump for LIBERO / RynnVLA-002 target): embed_dim 192->384,
+# depth 6->10->12 to match the multi-token visual prefix (pool_grid=16 = 1 CLS +
+# 16x16 patches => 514 of 624 seq positions are visual; the DINOv2 backbone is
+# now finetuned but the predictor still does the spatial integration). dropout
+# 0.2 -> 0.15. residual_scale_init=true is a PRECONDITION for depth>8.
+# Reproduce the 7008f15 frozen baseline by overriding back: wm.embed_dim=192
+# predictor.depth=6 predictor.dropout=0.2 predictor.residual_scale_init=false
+# vision_encoder.source=spt_vit vision_encoder.freeze=false.
 predictor:
-  depth: 6
+  depth: 12
   heads: 16
   mlp_dim: 2048
   dim_head: 64
-  dropout: 0.2
+  dropout: 0.15
   emb_dropout: 0.0
+  # GPT-2/Llama-style depth-aware residual init: scale each block's residual
+  # output projection by 1/sqrt(2*depth). No new params / no forward change;
+  # keeps residual-stream variance bounded as depth grows. false = baseline
+  # init (bit-identical to 7008f15 when use_mot=false).
+  residual_scale_init: true
   # Mixture-of-Transformers — when True the FFN in each transformer block has
   # a separate expert per modality (prefix / action / state-query); attention
   # stays shared. Hypothesis: shared FFN causes action prediction and
@@ -91,8 +119,19 @@ projector:
 #   pred_weight = 1.0  (no separate weight in paper; implicitly 1.0)
 #   sigreg_weight = 0.1  (paper Section 3, λ = 0.1)
 loss:
-  pred_weight: 0.0 # > 0 enables Q_ag/Q_hd/Q_pr STATE_QUERY tokens + 3 MSE losses
+  pred_weight: 0.0 # > 0 enables multi-horizon STATE_QUERY tokens + MSE losses
   sigreg_weight: 0.0 # > 0 enables SIGReg on encoder outputs (Algorithm 1 strict)
+  # Multi-horizon state prediction: one STATE_QUERY token per horizon (raw-step
+  # offsets from the anchor t), each read by the 3 SHARED heads (ag/hd/pr) to
+  # predict that horizon's future agent-image + hand-image + proprio. Offsets
+  # MUST be <= chunk H (=20) and must match what preprocess_libero.py stored
+  # (--sp-horizons); train.py asserts len == data K. Weights are near-heavy
+  # (near horizons are more deterministic -> higher-SNR shaping signal; far
+  # multimodal futures blur under MSE and risk patch collapse on the now-
+  # trainable encoder). Normalized to sum=1 in train.py, so pred_weight stays
+  # at its single-horizon scale. [5,10,15,20] = quarter points of H=20.
+  state_pred_horizons: [5, 10, 15, 20]
+  state_pred_horizon_weights: [0.4, 0.3, 0.2, 0.1]
   sigreg:
     kwargs:
       knots: 17

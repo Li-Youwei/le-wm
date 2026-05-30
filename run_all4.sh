@@ -41,25 +41,21 @@ esac
 SEED="${SEED:-3072}"
 MAX_STEPS="${MAX_STEPS:-100000}"
 VAL_INTERVAL="${VAL_INTERVAL:-4000}"
-WARMUP_STEPS="${WARMUP_STEPS:-2000}"
+WARMUP_STEPS="${WARMUP_STEPS:-4000}"       # informational only — effective warmup is computed in train.py as min(4000, 0.04*max_steps)
 BATCH_SIZE="${BATCH_SIZE:-128}"
 NUM_WORKERS="${NUM_WORKERS:-6}"            # dataloader workers; raise on many-core hosts to keep the GPU fed
 
-# Architecture toggles. Defaults: CLS-only visual, shared predictor, frozen
-# DINOv2-base backbone (the current default). No behavior change unless a knob
-# below is overridden.
-POOL_GRID="${POOL_GRID:-0}"                 # >0 enables V17 multi-token visual (G*G pooled patches)
+# Architecture toggles. Defaults: full 16x16 visual patch grid, shared
+# predictor (override USE_MOT=true for MoT), frozen DINOv2-base backbone.
+POOL_GRID="${POOL_GRID:-16}"                # multi-token visual: 1 CLS + G*G patches/view. 16 = full 16x16 DINOv2 grid (no pooling, current default); 4 = old V17 (4x4); 0 = CLS-only baseline
 USE_MOT="${USE_MOT:-false}"                 # true enables full Mixture-of-Transformers
 VISION_SOURCE="${VISION_SOURCE:-hf}"        # hf (frozen DINOv2, default) | spt_vit (legacy ViT-Tiny)
 VISION_MODEL="${VISION_MODEL:-facebook/dinov2-base}"  # used when VISION_SOURCE=hf
-# freeze default depends on source: hf (DINOv2) → frozen; spt_vit (ViT-Tiny) →
-# TRAINABLE. The 7008f15 baseline needs a trainable random-init ViT-Tiny — a
-# frozen random-init encoder would emit garbage features.
-if [[ "${VISION_SOURCE,,}" == "spt_vit" ]]; then
-    VISION_FREEZE="${VISION_FREEZE:-false}"
-else
-    VISION_FREEZE="${VISION_FREEZE:-true}"  # hf path: eval() + requires_grad_(False)
-fi
+# freeze default: BOTH sources default to TRAINABLE now. hf (DINOv2) is
+# finetuned end-to-end (the #1 LIBERO lever; encoder uses optimizer.encoder_lr).
+# spt_vit (random-init ViT-Tiny) must also be trainable (a frozen random-init
+# encoder emits garbage). Set VISION_FREEZE=true to keep DINOv2 frozen.
+VISION_FREEZE="${VISION_FREEZE:-false}"
 VISION_LOCAL_ONLY="${VISION_LOCAL_ONLY:-true}"  # set false on the FIRST run to download DINOv2
 # Normalize bool-ish vars to lowercase so True/TRUE/False also work (the offline
 # gate below + Hydra bool overrides expect lowercase true/false).
@@ -181,6 +177,11 @@ echo "[run_all4] best ckpt: $BEST_CKPT"
 # let the scene settle (NOT counted toward the horizon). Eval seed = $SEED.
 # ====================================================================
 EVAL_WARMUP="${EVAL_WARMUP:-10}"
+# Receding-horizon eval (optional): execute only the first N steps of each
+# predicted chunk, then re-observe + re-predict. Empty = legacy full-chunk exec.
+EVAL_EXEC_STEPS="${EVAL_EXEC_STEPS:-}"
+EXEC_ARG=()
+[[ -n "$EVAL_EXEC_STEPS" ]] && EXEC_ARG=(--exec-steps "$EVAL_EXEC_STEPS")
 for suite in libero_spatial libero_object libero_goal libero_10; do
     case "$suite" in
         libero_spatial) SUITE_MAX_STEPS=220 ;;
@@ -200,6 +201,7 @@ for suite in libero_spatial libero_object libero_goal libero_10; do
         --num-episodes 50 \
         --max-steps "$SUITE_MAX_STEPS" \
         --num-warmup-steps "$EVAL_WARMUP" \
+        "${EXEC_ARG[@]}" \
         --device cuda \
         --seed "$SEED" \
         2>&1 | tee "$EVAL_LOG"

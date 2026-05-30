@@ -67,6 +67,7 @@ from scipy.spatial.transform import Rotation as R
 # Step 1: Load and inspect LIBERO HDF5
 # ---------------------------------------------------------------------------
 
+
 def load_demo_keys(f: h5py.File) -> list[str]:
     """Enumerate demo_* groups under data/, sorted by numeric index."""
     data_group = f["data"]
@@ -77,7 +78,9 @@ def load_demo_keys(f: h5py.File) -> list[str]:
     return keys
 
 
-def inspect_hdf5(f: h5py.File, image_key: str, hand_image_key: str, demo_keys: list[str]) -> None:
+def inspect_hdf5(
+    f: h5py.File, image_key: str, hand_image_key: str, demo_keys: list[str]
+) -> None:
     """Print summary of the input HDF5 file and validate required keys."""
     print(f"[Step 1] Inspecting input HDF5 — {len(demo_keys)} demos found")
 
@@ -88,7 +91,13 @@ def inspect_hdf5(f: h5py.File, image_key: str, hand_image_key: str, demo_keys: l
         print(f"  Obs keys: {list(first_demo['obs'].keys())}")
 
     # Validate required keys exist
-    required_obs_keys = [image_key, hand_image_key, "ee_pos", "ee_ori", "gripper_states"]
+    required_obs_keys = [
+        image_key,
+        hand_image_key,
+        "ee_pos",
+        "ee_ori",
+        "gripper_states",
+    ]
     for dk in demo_keys:
         demo = f[f"data/{dk}"]
         if "actions" not in demo:
@@ -104,8 +113,10 @@ def inspect_hdf5(f: h5py.File, image_key: str, hand_image_key: str, demo_keys: l
 
     # Print trajectory lengths
     lengths = [f[f"data/{dk}/actions"].shape[0] for dk in demo_keys]
-    print(f"  Trajectory lengths: min={min(lengths)}, max={max(lengths)}, "
-          f"mean={np.mean(lengths):.1f}, total_steps={sum(lengths)}")
+    print(
+        f"  Trajectory lengths: min={min(lengths)}, max={max(lengths)}, "
+        f"mean={np.mean(lengths):.1f}, total_steps={sum(lengths)}"
+    )
     print(f"  Action dim: {f[f'data/{demo_keys[0]}/actions'].shape[1]}")
     img_shape = f[f"data/{demo_keys[0]}/obs/{image_key}"].shape[1:]
     print(f"  Agentview shape: {img_shape} (key='{image_key}')")
@@ -122,12 +133,18 @@ def inspect_hdf5(f: h5py.File, image_key: str, hand_image_key: str, demo_keys: l
 # Step 2: Proprio + chunk normalization helpers
 # ---------------------------------------------------------------------------
 
+
 def normalize_proprio(raw: np.ndarray) -> np.ndarray:
     """Normalize 9d proprio vector: ee_pos(3) + ee_quat(4) + gripper(2).
 
     - Position (dims 0:3): passed through unchanged.
-    - Quaternion (dims 3:7): re-normalize to unit length as a defensive safeguard
-      against numerical drift.
+    - Quaternion (dims 3:7, xyzw): re-normalize to unit length, then
+      hemisphere-canonicalize (flip sign so w >= 0). q and -q are the SAME
+      rotation but MSE(q,-q)=4, so without canonicalization the proprio SP
+      target is double-valued — harmless at 1 horizon, but multi-horizon SP
+      hits it at every horizon. Canonicalizing removes the ambiguity for both
+      the input proprio and the proprio_future target. Applied consistently
+      here AND in eval (single source of truth), so no train/eval drift.
     - Gripper (dims 7:9): two raw finger joint positions, passed through unchanged.
       Do NOT take mean/abs — the two fingers are symmetric around 0, so averaging
       either destroys half the information or zeros out entirely if `abs` is omitted.
@@ -136,15 +153,19 @@ def normalize_proprio(raw: np.ndarray) -> np.ndarray:
     preprocess_libero.py and eval_libero.py must call it on the same 9d layout.
 
     Args:
-        raw: (..., 9) array — [ee_pos(3), ee_quat(4), gripper(2)]
+        raw: (..., 9) array — [ee_pos(3), ee_quat(4 xyzw), gripper(2)]
 
     Returns:
-        (..., 9) array with quaternion re-normalized.
+        (..., 9) array with quaternion re-normalized + hemisphere-canonicalized.
     """
     out = raw.copy()
     quat = out[..., 3:7]
     quat_norm = np.linalg.norm(quat, axis=-1, keepdims=True)
-    out[..., 3:7] = quat / (quat_norm + 1e-8)
+    quat = quat / (quat_norm + 1e-8)
+    # Hemisphere-canonicalize: flip the whole quat where w (xyzw → index 3) < 0.
+    flip = quat[..., 3:4] < 0
+    quat = np.where(flip, -quat, quat)
+    out[..., 3:7] = quat
     return out
 
 
@@ -175,14 +196,18 @@ def compute_action_stats(
 
     zero_range_dims = np.where((action_high - action_low) < 1e-8)[0]
     if len(zero_range_dims) > 0:
-        print(f"  WARNING: Dimensions {zero_range_dims.tolist()} have near-zero range "
-              "and will be normalized to constant 0.0")
+        print(
+            f"  WARNING: Dimensions {zero_range_dims.tolist()} have near-zero range "
+            "and will be normalized to constant 0.0"
+        )
 
     dim_labels = ["dx", "dy", "dz", "drx", "dry", "drz", "grip"]
     for d in range(flat.shape[1]):
         lbl = dim_labels[d] if d < len(dim_labels) else f"d{d}"
-        print(f"  {lbl:>4}: raw range [{flat[:, d].min():.4f}, {flat[:, d].max():.4f}], "
-              f"p1={action_low[d]:.4f}, p99={action_high[d]:.4f}")
+        print(
+            f"  {lbl:>4}: raw range [{flat[:, d].min():.4f}, {flat[:, d].max():.4f}], "
+            f"p1={action_low[d]:.4f}, p99={action_high[d]:.4f}"
+        )
 
     return action_low, action_high
 
@@ -207,6 +232,7 @@ def normalize_actions(
 # Step 3: Extract anchor-relative sliding-window samples
 # ---------------------------------------------------------------------------
 
+
 def extract_chunks(
     f: h5py.File,
     demo_keys: list[str],
@@ -214,6 +240,7 @@ def extract_chunks(
     hand_image_key: str,
     chunk_size: int,
     stride: int,
+    sp_horizons: list[int],
 ) -> dict[str, list]:
     """Sliding-window extraction of anchor-relative action chunks.
 
@@ -249,8 +276,18 @@ def extract_chunks(
     H = chunk_size
     if stride < 1:
         raise ValueError(f"stride must be >= 1, got {stride}")
-    print(f"[Step 3] Extracting anchor-relative sliding-window chunks "
-          f"(H={H}, stride={stride}) ...")
+    # Multi-horizon state-prediction targets: store the future frame + proprio
+    # at each offset in sp_horizons. All must be <= H, since chunk validity
+    # (t <= T-H-1) only guarantees obs up to t+H are in-bounds.
+    if not sp_horizons or any(h < 1 or h > H for h in sp_horizons):
+        raise ValueError(
+            f"sp_horizons must be non-empty with every offset in [1, H={H}]; "
+            f"got {sp_horizons}"
+        )
+    print(
+        f"[Step 3] Extracting anchor-relative sliding-window chunks "
+        f"(H={H}, stride={stride}) ..."
+    )
 
     samples: dict[str, list] = {
         "image_agent": [],
@@ -273,7 +310,7 @@ def extract_chunks(
     skipped_demos = 0
 
     for demo_i, dk in enumerate(demo_keys):
-        actions_raw = f[f"data/{dk}/actions"][()]                  # (T, 7)
+        actions_raw = f[f"data/{dk}/actions"][()]  # (T, 7)
         T = actions_raw.shape[0]
 
         # We need obs at step t+H to compute the last anchor-relative delta.
@@ -295,22 +332,22 @@ def extract_chunks(
 
         agent_imgs = f[f"data/{dk}/obs/{image_key}"][: last_obs_idx + 1]
         hand_imgs = f[f"data/{dk}/obs/{hand_image_key}"][: last_obs_idx + 1]
-        ee_pos = f[f"data/{dk}/obs/ee_pos"][: last_obs_idx + 1]              # (<=T, 3)
-        ee_ori = f[f"data/{dk}/obs/ee_ori"][: last_obs_idx + 1]              # (<=T, 3) axis-angle
-        robot_states = f[f"data/{dk}/robot_states"][: last_obs_idx + 1]      # (<=T, 9)
+        ee_pos = f[f"data/{dk}/obs/ee_pos"][: last_obs_idx + 1]  # (<=T, 3)
+        ee_ori = f[f"data/{dk}/obs/ee_ori"][: last_obs_idx + 1]  # (<=T, 3) axis-angle
+        robot_states = f[f"data/{dk}/robot_states"][: last_obs_idx + 1]  # (<=T, 9)
         grip_states = f[f"data/{dk}/obs/gripper_states"][: last_obs_idx + 1]  # (<=T, 2)
-        gripper_cmd = actions_raw[: last_action_idx + 1, 6]                  # (<=T,)
+        gripper_cmd = actions_raw[: last_action_idx + 1, 6]  # (<=T,)
 
         # Pre-compute all rotations for this demo once (scipy batches).
         Rs = R.from_rotvec(ee_ori)  # "shape" (last_obs_idx+1,)
 
         # Vectorized index tables for fast anchor-relative deltas.
-        starts_arr = np.arange(n_chunks) * stride               # (n_chunks,)
-        k_p1 = np.arange(1, H + 1)                              # (H,) = [1..H]
+        starts_arr = np.arange(n_chunks) * stride  # (n_chunks,)
+        k_p1 = np.arange(1, H + 1)  # (H,) = [1..H]
         # target_idx[ci, k] = starts_arr[ci] + k + 1 (raw step index to read obs)
-        target_idx = starts_arr[:, None] + k_p1[None, :]        # (n_chunks, H)
-        target_flat = target_idx.reshape(-1)                    # (n_chunks*H,)
-        anchor_flat = np.repeat(starts_arr, H)                  # (n_chunks*H,)
+        target_idx = starts_arr[:, None] + k_p1[None, :]  # (n_chunks, H)
+        target_flat = target_idx.reshape(-1)  # (n_chunks*H,)
+        anchor_flat = np.repeat(starts_arr, H)  # (n_chunks*H,)
 
         # Position delta: pos[t+k+1] - pos[t]
         pos_deltas = ee_pos[target_flat] - ee_pos[anchor_flat]  # (n_chunks*H, 3)
@@ -323,55 +360,76 @@ def extract_chunks(
         rot_deltas = R_delta.as_rotvec().reshape(n_chunks, H, 3)  # (n_chunks, H, 3)
 
         # Gripper command at raw step t+k for k in 0..H-1  (= target_idx - 1)
-        gripper_idx = (starts_arr[:, None] + np.arange(H)[None, :])  # (n_chunks, H)
+        gripper_idx = starts_arr[:, None] + np.arange(H)[None, :]  # (n_chunks, H)
         gripper_values = gripper_cmd[gripper_idx.reshape(-1)].reshape(n_chunks, H, 1)
 
         # Assemble (n_chunks, H, 7) anchor-relative chunks
-        chunks = np.concatenate([pos_deltas, rot_deltas, gripper_values],
-                                axis=-1).astype(np.float32)
+        chunks = np.concatenate(
+            [pos_deltas, rot_deltas, gripper_values], axis=-1
+        ).astype(np.float32)
 
         # Anchor state per chunk
         for ci in range(n_chunks):
             t = int(starts_arr[ci])
-            t_future = t + H  # frame at t+H — same index already loaded above
 
             samples["image_agent"].append(agent_imgs[t])  # (H_img, W_img, 3) uint8
             samples["image_hand"].append(hand_imgs[t])
 
-            # State-prediction targets at t+H (LeWM-style next-embedding loss).
-            # The chunk-validity range t <= T-H-1 already guarantees t+H <= T-1,
-            # and we read up to last_obs_idx = (n_chunks-1)*stride + H above,
-            # so agent_imgs[t+H] / hand_imgs[t+H] are always in-bounds here.
-            samples["image_agent_future"].append(agent_imgs[t_future])
-            samples["image_hand_future"].append(hand_imgs[t_future])
+            # Multi-horizon state-prediction targets: stack the future frame at
+            # each offset h in sp_horizons → (K, H_img, W_img, 3). Chunk validity
+            # (t <= T-H-1) plus h <= H guarantees t+h <= T-1 (in-bounds; obs are
+            # loaded up to t+H above).
+            samples["image_agent_future"].append(
+                np.stack([agent_imgs[t + h] for h in sp_horizons], axis=0)
+            )  # (K, H_img, W_img, 3) uint8
+            samples["image_hand_future"].append(
+                np.stack([hand_imgs[t + h] for h in sp_horizons], axis=0)
+            )
 
-            # 9D proprio: ee_pos(3) + xyzw-quat(4) + gripper_states raw(2)
-            # NEVER mean/abs the gripper — fingers are symmetric, averaging destroys info.
-            proprio_raw = np.concatenate([
-                ee_pos[t],                # (3,)
-                robot_states[t, 5:9],     # (4,) xyzw quaternion (verified)
-                grip_states[t],           # (2,) raw two finger joint positions
-            ])
+            # 9D proprio: ee_pos(3) + xyzw-quat(4) + gripper_states raw(2).
+            # NEVER mean/abs the gripper — fingers are symmetric, averaging kills info.
+            proprio_raw = np.concatenate(
+                [
+                    ee_pos[t],  # (3,)
+                    robot_states[t, 5:9],  # (4,) xyzw quaternion (verified)
+                    grip_states[t],  # (2,) raw two finger joint positions
+                ]
+            )
             samples["proprio"].append(normalize_proprio(proprio_raw))  # (9,) float64
 
-            # Same 9D layout at t+H — single source of truth for proprio
-            # normalization is `normalize_proprio` (re-normalizes the quat).
-            proprio_future_raw = np.concatenate([
-                ee_pos[t_future],
-                robot_states[t_future, 5:9],
-                grip_states[t_future],
-            ])
-            samples["proprio_future"].append(normalize_proprio(proprio_future_raw))
+            # Same 9D layout at each horizon t+h → (K, 9). normalize_proprio is
+            # the single source of truth (re-normalizes + hemisphere-canon quat).
+            samples["proprio_future"].append(
+                np.stack(
+                    [
+                        normalize_proprio(
+                            np.concatenate(
+                                [
+                                    ee_pos[t + h],
+                                    robot_states[t + h, 5:9],
+                                    grip_states[t + h],
+                                ]
+                            )
+                        )
+                        for h in sp_horizons
+                    ],
+                    axis=0,
+                )
+            )  # (K, 9)
 
             samples["continuous_actions"].append(chunks[ci])  # (H, 7) physical units
             samples["demo_idx"].append(demo_i)
-            samples["chunk_idx"].append(t)  # record raw-step anchor, not an arbitrary counter
+            samples["chunk_idx"].append(
+                t
+            )  # record raw-step anchor, not an arbitrary counter
 
         total_chunks += n_chunks
 
     if skipped_demos > 0:
         print(f"  Skipped {skipped_demos} demos (too short for H+1={H + 1} frames)")
-    print(f"  Extracted {total_chunks} chunks from {len(demo_keys) - skipped_demos} demos")
+    print(
+        f"  Extracted {total_chunks} chunks from {len(demo_keys) - skipped_demos} demos"
+    )
 
     return samples
 
@@ -379,6 +437,7 @@ def extract_chunks(
 # ---------------------------------------------------------------------------
 # Step 4: FAST tokenization
 # ---------------------------------------------------------------------------
+
 
 def _patch_saved_tokenizer(save_dir: Path) -> None:
     """Ensure a saved FAST tokenizer can be reloaded via AutoProcessor.
@@ -399,7 +458,12 @@ def _patch_saved_tokenizer(save_dir: Path) -> None:
     layout in ``data/fast_tokenizer/`` (contains ``processor_config.json``).
     """
     # 1. Copy processing_action_tokenizer.py into the saved directory
-    processor_src = Path(__file__).parent / "data" / "fast_tokenizer" / "processing_action_tokenizer.py"
+    processor_src = (
+        Path(__file__).parent
+        / "data"
+        / "fast_tokenizer"
+        / "processing_action_tokenizer.py"
+    )
     if processor_src.exists():
         shutil.copy2(processor_src, save_dir / "processing_action_tokenizer.py")
     else:
@@ -455,7 +519,9 @@ def tokenize_actions(
     # Optionally fit a domain-specific BPE vocabulary
     if fit:
         if load_tokenizer_path is not None:
-            print("  WARNING: --fit-tokenizer ignored because --load-tokenizer was provided.")
+            print(
+                "  WARNING: --fit-tokenizer ignored because --load-tokenizer was provided."
+            )
         else:
             print(f"  Fitting tokenizer on {action_chunks.shape[0]} chunks ...")
             fitted = tokenizer.fit(action_chunks)
@@ -496,9 +562,11 @@ def tokenize_actions(
 
     # Print token length statistics
     lengths = [len(t) for t in tokens_list]
-    print(f"  Token lengths: min={min(lengths)}, max={max(lengths)}, "
-          f"mean={np.mean(lengths):.1f}, median={np.median(lengths):.0f}, "
-          f"std={np.std(lengths):.1f}")
+    print(
+        f"  Token lengths: min={min(lengths)}, max={max(lengths)}, "
+        f"mean={np.mean(lengths):.1f}, median={np.median(lengths):.0f}, "
+        f"std={np.std(lengths):.1f}"
+    )
 
     return tokens_list, tokenizer
 
@@ -506,6 +574,7 @@ def tokenize_actions(
 # ---------------------------------------------------------------------------
 # Step 5: Save to output HDF5
 # ---------------------------------------------------------------------------
+
 
 def extract_language_instruction(f: h5py.File) -> str:
     """Extract language instruction from LIBERO HDF5 data attributes.
@@ -535,6 +604,7 @@ def save_hdf5(
     image_key: str,
     source_file: str,
     num_demos: int,
+    sp_horizons: list[int],
     language_instruction: str = "",
     save_tokenizer_path: str | None = None,
     load_tokenizer_path: str | None = None,
@@ -548,7 +618,6 @@ def save_hdf5(
     print(f"[Step 5] Saving {N} samples to {output_path} ...")
 
     with h5py.File(output_path, "w") as out:
-
         # --- Agentview images (chunked + compressed) ---
         img_shape = samples["image_agent"][0].shape  # (H_img, W_img, 3)
         ds_agent = out.create_dataset(
@@ -568,20 +637,22 @@ def save_hdf5(
             compression="gzip",
             compression_opts=4,
         )
-        # --- Future-frame images at raw step t+H (state-prediction target) ---
+        # --- Future-frame images at K horizons (multi-horizon SP target) ---
+        # Per-sample shape is (K, H_img, W_img, 3): one frame per sp_horizon.
+        fut_shape = samples["image_agent_future"][0].shape  # (K, H_img, W_img, 3)
         ds_agent_future = out.create_dataset(
             "image_agent_future",
-            shape=(N, *img_shape),
+            shape=(N, *fut_shape),
             dtype=np.uint8,
-            chunks=(1, *img_shape),
+            chunks=(1, *fut_shape),
             compression="gzip",
             compression_opts=4,
         )
         ds_hand_future = out.create_dataset(
             "image_hand_future",
-            shape=(N, *img_shape),
+            shape=(N, *fut_shape),
             dtype=np.uint8,
-            chunks=(1, *img_shape),
+            chunks=(1, *fut_shape),
             compression="gzip",
             compression_opts=4,
         )
@@ -599,7 +670,7 @@ def save_hdf5(
         )
         out.create_dataset(
             "proprio_future",
-            data=np.stack(samples["proprio_future"], axis=0),  # (N, 9) at t+H
+            data=np.stack(samples["proprio_future"], axis=0),  # (N, K, 9)
             dtype=np.float64,
         )
 
@@ -622,14 +693,20 @@ def save_hdf5(
         out.create_dataset("fast_length", data=fast_lengths)
 
         # --- Demo / chunk indices ---
-        out.create_dataset("demo_idx", data=np.array(samples["demo_idx"], dtype=np.int32))
-        out.create_dataset("chunk_idx", data=np.array(samples["chunk_idx"], dtype=np.int32))
+        out.create_dataset(
+            "demo_idx", data=np.array(samples["demo_idx"], dtype=np.int32)
+        )
+        out.create_dataset(
+            "chunk_idx", data=np.array(samples["chunk_idx"], dtype=np.int32)
+        )
 
         # --- Attributes (metadata for downstream use) ---
         out.attrs["action_low"] = action_low.astype(np.float64)
         out.attrs["action_high"] = action_high.astype(np.float64)
         out.attrs["chunk_size"] = chunk_size
         out.attrs["chunk_stride"] = chunk_stride
+        # Multi-horizon SP offsets (raw steps from anchor) for *_future axis K.
+        out.attrs["sp_horizons"] = np.asarray(sp_horizons, dtype=np.int32)
         out.attrs["image_key"] = image_key
         out.attrs["source_file"] = str(Path(source_file).resolve())
         out.attrs["num_demos"] = num_demos
@@ -642,12 +719,15 @@ def save_hdf5(
         if load_tokenizer_path is not None:
             out.attrs["tokenizer_load_path"] = str(Path(load_tokenizer_path).resolve())
 
-    print(f"  Saved successfully. File size: {Path(output_path).stat().st_size / 1e6:.1f} MB")
+    print(
+        f"  Saved successfully. File size: {Path(output_path).stat().st_size / 1e6:.1f} MB"
+    )
 
 
 # ---------------------------------------------------------------------------
 # Step 6: Print statistics
 # ---------------------------------------------------------------------------
+
 
 def print_statistics(
     samples: dict[str, list],
@@ -667,22 +747,34 @@ def print_statistics(
     print(f"  Total samples: {N}")
     print(f"  Demos used: {len(unique_demos)}")
     chunks_per_demo = [np.sum(demo_indices == d) for d in unique_demos]
-    print(f"  Chunks per demo: min={min(chunks_per_demo)}, max={max(chunks_per_demo)}, "
-          f"mean={np.mean(chunks_per_demo):.1f}")
+    print(
+        f"  Chunks per demo: min={min(chunks_per_demo)}, max={max(chunks_per_demo)}, "
+        f"mean={np.mean(chunks_per_demo):.1f}"
+    )
 
     # --- Proprio stats ---
     if samples["proprio"]:
         proprio_all = np.stack(samples["proprio"], axis=0)  # (N, 9)
         print(f"\n  Proprioception stats ({proprio_all.shape[1]}d):")
         # xyzw quaternion order (verified — robosuite / scipy convention)
-        labels = ["ee_pos_x", "ee_pos_y", "ee_pos_z",
-                  "ee_quat_x", "ee_quat_y", "ee_quat_z", "ee_quat_w",
-                  "grip_left", "grip_right"]
+        labels = [
+            "ee_pos_x",
+            "ee_pos_y",
+            "ee_pos_z",
+            "ee_quat_x",
+            "ee_quat_y",
+            "ee_quat_z",
+            "ee_quat_w",
+            "grip_left",
+            "grip_right",
+        ]
         for d in range(proprio_all.shape[1]):
             col = proprio_all[:, d]
             lbl = labels[d] if d < len(labels) else f"dim{d}"
-            print(f"    {lbl}: min={col.min():.4f}, max={col.max():.4f}, "
-                  f"mean={col.mean():.4f}, std={col.std():.4f}")
+            print(
+                f"    {lbl}: min={col.min():.4f}, max={col.max():.4f}, "
+                f"mean={col.mean():.4f}, std={col.std():.4f}"
+            )
 
     # --- Action stats (after normalization) ---
     all_actions = np.stack(samples["continuous_actions"], axis=0)  # (N, H, 7)
@@ -690,15 +782,19 @@ def print_statistics(
     print(f"\n  Normalized action stats (should be in [-1, 1]):")
     for d in range(flat_actions.shape[1]):
         col = flat_actions[:, d]
-        print(f"    Dim {d}: min={col.min():.4f}, max={col.max():.4f}, "
-              f"mean={col.mean():.4f}, std={col.std():.4f}")
+        print(
+            f"    Dim {d}: min={col.min():.4f}, max={col.max():.4f}, "
+            f"mean={col.mean():.4f}, std={col.std():.4f}"
+        )
 
     # --- Token statistics ---
     lengths = np.array([len(t) for t in tokens_list])
     print(f"\n  FAST token lengths:")
-    print(f"    min={lengths.min()}, max={lengths.max()}, "
-          f"mean={lengths.mean():.1f}, median={np.median(lengths):.0f}, "
-          f"std={lengths.std():.1f}")
+    print(
+        f"    min={lengths.min()}, max={lengths.max()}, "
+        f"mean={lengths.mean():.1f}, median={np.median(lengths):.0f}, "
+        f"std={lengths.std():.1f}"
+    )
 
     # --- Vocab usage frequency (top-20) ---
     token_counter: Counter[int] = Counter()
@@ -707,8 +803,10 @@ def print_statistics(
 
     total_tokens = sum(token_counter.values())
     unique_tokens = len(token_counter)
-    print(f"\n  Vocab usage: {unique_tokens} unique token IDs out of "
-          f"{total_tokens} total tokens")
+    print(
+        f"\n  Vocab usage: {unique_tokens} unique token IDs out of "
+        f"{total_tokens} total tokens"
+    )
     print(f"  Top-20 most frequent token IDs:")
     for token_id, count in token_counter.most_common(20):
         pct = 100.0 * count / total_tokens
@@ -721,52 +819,74 @@ def print_statistics(
 # Main
 # ---------------------------------------------------------------------------
 
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description="Preprocess LIBERO HDF5 demos into chunk-level FAST-tokenized samples."
     )
     parser.add_argument(
-        "--input", required=True,
+        "--input",
+        required=True,
         help="Path to input LIBERO HDF5 file (one task).",
     )
     parser.add_argument(
-        "--output", required=True,
+        "--output",
+        required=True,
         help="Path for the output HDF5 file.",
     )
     parser.add_argument(
-        "--chunk-size", type=int, default=20,
+        "--chunk-size",
+        type=int,
+        default=20,
         help="Action chunk length H in raw env steps (default: 20 = 1s at 20Hz).",
     )
     parser.add_argument(
-        "--stride", type=int, default=1,
+        "--stride",
+        type=int,
+        default=1,
         help="Sliding window stride in raw steps (default: 1). stride=1 is the "
-             "standard VLA practice — consecutive chunks share H-1 actions but "
-             "each gets a fresh observation anchor, maximizing data coverage. "
-             "Using stride=H would reduce per-demo sample count by ~H and is "
-             "strongly discouraged.",
+        "standard VLA practice — consecutive chunks share H-1 actions but "
+        "each gets a fresh observation anchor, maximizing data coverage. "
+        "Using stride=H would reduce per-demo sample count by ~H and is "
+        "strongly discouraged.",
     )
     parser.add_argument(
-        "--image-key", default="agentview_rgb",
+        "--sp-horizons",
+        default="5,10,15,20",
+        help="Comma-separated raw-step offsets for multi-horizon state-prediction "
+        "targets (default: 5,10,15,20). Each must be in [1, chunk_size]. Stores a "
+        "future frame + proprio per offset; the *_future datasets gain a K axis. "
+        "Must match cfg.loss.state_pred_horizons at train time.",
+    )
+    parser.add_argument(
+        "--image-key",
+        default="agentview_rgb",
         help="Agentview image key in the HDF5 (default: agentview_rgb).",
     )
     parser.add_argument(
-        "--hand-image-key", default="eye_in_hand_rgb",
+        "--hand-image-key",
+        default="eye_in_hand_rgb",
         help="Eye-in-hand image key in the HDF5 (default: eye_in_hand_rgb).",
     )
     parser.add_argument(
-        "--max-action-tokens", type=int, default=None,
+        "--max-action-tokens",
+        type=int,
+        default=None,
         help="Assert that no token sequence exceeds this length. If None, skip assertion.",
     )
     parser.add_argument(
-        "--fit-tokenizer", action="store_true",
+        "--fit-tokenizer",
+        action="store_true",
         help="Train a LIBERO-specific FAST BPE tokenizer instead of using the universal one.",
     )
     parser.add_argument(
-        "--save-tokenizer", default=None,
+        "--save-tokenizer",
+        default=None,
         help="Directory to save the fitted FAST tokenizer.",
     )
     parser.add_argument(
-        "--load-tokenizer", default=None,
+        "--load-tokenizer",
+        default=None,
         help="Directory to load a previously fitted FAST tokenizer.",
     )
     return parser.parse_args()
@@ -774,6 +894,9 @@ def parse_args() -> argparse.Namespace:
 
 def main() -> None:
     args = parse_args()
+
+    sp_horizons = [int(x) for x in str(args.sp_horizons).split(",") if x.strip()]
+    print(f"  Multi-horizon SP offsets: {sp_horizons}")
 
     # Step 1: Load and inspect
     print(f"Opening {args.input} ...")
@@ -791,8 +914,13 @@ def main() -> None:
         # Stats are computed from the chunks themselves (not raw HDF5 actions) so
         # that the 1/99 percentile reflects the actual distribution the model sees.
         samples = extract_chunks(
-            f, demo_keys, args.image_key, args.hand_image_key,
-            args.chunk_size, stride=args.stride,
+            f,
+            demo_keys,
+            args.image_key,
+            args.hand_image_key,
+            args.chunk_size,
+            stride=args.stride,
+            sp_horizons=sp_horizons,
         )
 
     if not samples["continuous_actions"]:
@@ -830,12 +958,17 @@ def main() -> None:
     # Step 5: Save output HDF5
     Path(args.output).parent.mkdir(parents=True, exist_ok=True)
     save_hdf5(
-        args.output, samples, tokens_list, action_low, action_high,
+        args.output,
+        samples,
+        tokens_list,
+        action_low,
+        action_high,
         chunk_size=args.chunk_size,
         chunk_stride=args.stride,
         image_key=args.image_key,
         source_file=args.input,
         num_demos=len(demo_keys),
+        sp_horizons=sp_horizons,
         language_instruction=language_instruction,
         save_tokenizer_path=args.save_tokenizer,
         load_tokenizer_path=args.load_tokenizer,

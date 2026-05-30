@@ -124,64 +124,94 @@ def lejepa_forward(self, batch, stage, cfg):
 
     total_loss = output["ce_loss"]
 
-    # 6. State-prediction loss (LeWM-style, NO stop-gradient on target).
+    # 6. Multi-horizon state-prediction loss (LeWM-style, NO stop-gradient).
     if use_state_pred:
-        pixels_agent_future = batch["pixels_agent_future"]
-        pixels_hand_future = batch["pixels_hand_future"]
-        proprio_future = batch["proprio_future"]  # (B, 9) raw target
+        # Futures now carry a horizon axis K: (B, K, 3, H, W) / (B, K, 9).
+        pixels_agent_future = batch["pixels_agent_future"]  # (B, K, 3, H, W)
+        pixels_hand_future = batch["pixels_hand_future"]  # (B, K, 3, H, W)
+        proprio_future = batch["proprio_future"]  # (B, K, 9) raw target
 
-        # Encode future visual through the SAME encoder + projector. Both
-        # the source path (z_agent/z_hand of the current frame, computed
-        # in step 2) and the target path (here) get gradients — that's
-        # the LeWM "no heuristics" recipe; SIGReg is the only thing
-        # holding off collapse.
-        # Post Bug #1 + Bug #2: encode_future_visual returns (B, N, D)
-        # symmetric with encode(); SP heads also produce (B, N, D), so
-        # MSE matches token-by-token and every source visual patch
-        # receives direct SP gradient via Q_ag/Q_hd attention. SIGReg
-        # below still constrains the CLS slice only (per-view single
-        # embedding anti-collapse).
+        # Encode all K future horizons through the SAME (now finetuned) encoder
+        # + projector → (B, K, nv, D) per view. No stop-grad (LeWM recipe);
+        # SIGReg is the anti-collapse guard, which matters more now the encoder
+        # is trainable. SP heads emit matching (B, K, nv, D) so the MSE is
+        # token- and horizon-aligned, routing SP gradient to every source patch.
         z_agent_future, z_hand_future = self.model.encode_future_visual(
             pixels_agent_future,
             pixels_hand_future,
-        )
-        # Normalize shape: ensure (B, N, D) for both sides of the MSE.
-        if z_agent_future.dim() == 2:
-            z_agent_future = z_agent_future.unsqueeze(1)
-        if z_hand_future.dim() == 2:
-            z_hand_future = z_hand_future.unsqueeze(1)
-        z_ag_future_cls = z_agent_future[:, 0]  # for SIGReg below
-        z_hd_future_cls = z_hand_future[:, 0]
+        )  # each (B, K, nv, D)
 
-        loss_pred_ag = F.mse_loss(pred_ag, z_agent_future)
-        loss_pred_hd = F.mse_loss(pred_hd, z_hand_future)
-        loss_pred_pr = F.mse_loss(pred_pr, proprio_future)
+        # The model emits one prediction per STATE_QUERY horizon; the data
+        # carries one future per preprocess --sp-horizons offset. These K must
+        # match, else the per-horizon MSE would broadcast silently (e.g. model
+        # K=1 vs data K=4). Fail loudly instead.
+        if pred_ag.size(1) != z_agent_future.size(1):
+            raise ValueError(
+                f"Horizon mismatch: predictor emits K={pred_ag.size(1)} "
+                f"(len(cfg.loss.state_pred_horizons)) but the data has K="
+                f"{z_agent_future.size(1)} future frames (preprocess "
+                "--sp-horizons). Align cfg.loss.state_pred_horizons with the "
+                "preprocessed *_future axis."
+            )
+
+        # Per-horizon weights (near-heavy), normalized to sum=1 so total SP
+        # magnitude matches the single-horizon scale → pred_weight unchanged.
+        K = z_agent_future.size(1)
+        w = torch.tensor(
+            list(loss_cfg.get("state_pred_horizon_weights", [1.0] * K)),
+            device=z_agent_future.device,
+            dtype=z_agent_future.dtype,
+        )
+        if w.numel() != K:
+            raise ValueError(
+                f"state_pred_horizon_weights length {w.numel()} != number of "
+                f"horizons K={K} (from the data's *_future axis). Align "
+                "cfg.loss.state_pred_horizon_weights / state_pred_horizons with "
+                "preprocess_libero.py --sp-horizons."
+            )
+        w = w / w.sum().clamp(min=1e-8)  # (K,)
+
+        def _w_mse(pred, target):
+            # mean over all dims except (batch, horizon) → (B,K) → mean over
+            # batch → (K,); then horizon-weighted sum.
+            per_h = ((pred - target) ** 2).flatten(2).mean(dim=-1).mean(dim=0)
+            return (w * per_h).sum()
+
+        loss_pred_ag = _w_mse(pred_ag, z_agent_future)
+        loss_pred_hd = _w_mse(pred_hd, z_hand_future)
+        loss_pred_pr = _w_mse(pred_pr, proprio_future)
 
         output["pred_loss"] = loss_pred_ag + loss_pred_hd + loss_pred_pr
         output["pred_loss_ag"] = loss_pred_ag
         output["pred_loss_hd"] = loss_pred_hd
         output["pred_loss_pr"] = loss_pred_pr
+        # Per-horizon agent loss (unweighted) — watch for far-horizon
+        # free-riding / collapse; drives the 12tok / causal fallbacks.
+        with torch.no_grad():
+            per_h_ag = (
+                ((pred_ag - z_agent_future) ** 2).flatten(2).mean(dim=-1).mean(dim=0)
+            )
+            for k in range(K):
+                output[f"pred_loss_ag_h{k}"] = per_h_ag[k].detach()
 
         total_loss = total_loss + pred_weight * output["pred_loss"]
 
-    # 7. SIGReg loss (Algorithm 1 strict — encoder outputs only).
-    # The 4-stream stack maps to LeWM's `emb` over 2 timesteps × 2 views.
-    # Predictor outputs (pred_ag/pred_hd) are intentionally NOT included
-    # — see paper Algorithm 1 + upstream `train.py::lejepa_forward`.
-    # Both `encode()` and `encode_future_visual()` return (B, N, D) after
-    # the Bug #1 fix; SIGReg uses the CLS slice only (per-view single
-    # embedding constraint, patch tokens remain a predictor-side concern).
+    # 7. SIGReg loss (Algorithm 1 strict — encoder CLS outputs only).
+    # Stack the 2 current-view CLS + ALL K future-horizon CLS (both views) so
+    # anti-collapse covers every predicted horizon, not just one — important
+    # now the encoder is trainable (each future encode is a collapse channel).
+    # Predictor outputs (pred_ag/pred_hd) stay excluded (paper Algorithm 1).
     if sigreg_weight > 0:
         z_ag_cls = z_agent[:, 0] if z_agent.dim() == 3 else z_agent
         z_hd_cls = z_hand[:, 0] if z_hand.dim() == 3 else z_hand
-        if not use_state_pred:
-            # Without state prediction we don't have z_*_future encoded —
-            # SIGReg degenerates to 2 streams (current views only).
-            sigreg_input = torch.stack([z_ag_cls, z_hd_cls], dim=0)
-        else:
-            sigreg_input = torch.stack(
-                [z_ag_cls, z_hd_cls, z_ag_future_cls, z_hd_future_cls], dim=0
-            )
+        streams = [z_ag_cls, z_hd_cls]
+        if use_state_pred:
+            # z_*_future: (B, K, nv, D) → per-horizon CLS (B, D) for all K.
+            Kf = z_agent_future.size(1)
+            for k in range(Kf):
+                streams.append(z_agent_future[:, k, 0])
+                streams.append(z_hand_future[:, k, 0])
+        sigreg_input = torch.stack(streams, dim=0)  # (2 + 2K, B, D)
         output["sigreg_loss"] = self.sigreg(sigreg_input)
         total_loss = total_loss + sigreg_weight * output["sigreg_loss"]
 
@@ -206,6 +236,10 @@ def lejepa_forward(self, batch, stage, cfg):
         log_dict[f"{stage}/pred_loss_ag"] = output["pred_loss_ag"].detach()
         log_dict[f"{stage}/pred_loss_hd"] = output["pred_loss_hd"].detach()
         log_dict[f"{stage}/pred_loss_pr"] = output["pred_loss_pr"].detach()
+        # Per-horizon agent SP loss (h0=nearest .. hK-1=farthest).
+        for key in output:
+            if key.startswith("pred_loss_ag_h"):
+                log_dict[f"{stage}/{key}"] = output[key].detach()
     if "sigreg_loss" in output:
         log_dict[f"{stage}/sigreg_loss"] = output["sigreg_loss"].detach()
     # Log learning rate if available
@@ -268,6 +302,13 @@ def run(cfg):
     pred_weight = float(loss_cfg_run.get("pred_weight", 0.0))
     sigreg_weight = float(loss_cfg_run.get("sigreg_weight", 0.0))
     use_state_prediction = pred_weight > 0
+    # Multi-horizon state prediction: one STATE_QUERY token per horizon. The
+    # predictor only needs the COUNT (K); the actual offsets live in the data
+    # (preprocess --sp-horizons) and the loss weights. K=1 = single-horizon SP.
+    sp_horizons = list(loss_cfg_run.get("state_pred_horizons", [20]))
+    n_sp_horizons = len(sp_horizons) if use_state_prediction else 1
+    if use_state_prediction:
+        print(f"[state_pred] horizons={sp_horizons} (K={n_sp_horizons})")
 
     # Projector normalization: must be 'batch' when SIGReg is enabled
     # (LeWM paper Section 3 — LayerNorm prevents the anti-collapse
@@ -336,6 +377,20 @@ def run(cfg):
         use_state_prediction=use_state_prediction,
     )
 
+    # Multi-horizon SP: the data's stored offsets (preprocess --sp-horizons) must
+    # match cfg.loss.state_pred_horizons in BOTH count AND order/value — the
+    # per-horizon query token k is MSE'd against future frame k with weight k, so
+    # a reordering would silently bind each horizon to the wrong target. Counts
+    # alone are checked at loss time; assert the full list here, up front.
+    if use_state_prediction and dataset.sp_horizons is not None:
+        if list(dataset.sp_horizons) != list(sp_horizons):
+            raise ValueError(
+                f"SP horizon mismatch: data was preprocessed with "
+                f"--sp-horizons={dataset.sp_horizons} but cfg.loss."
+                f"state_pred_horizons={sp_horizons}. They must match exactly "
+                "(count + order + values); re-preprocess or fix the config."
+            )
+
     # Demo-level split: avoid leaking chunks from the same demo into both train and val.
     # Use (fpath, demo_idx) as the unique demo key — under joint 4-suite training,
     # demo_0 from different tasks must be split independently, not lumped together.
@@ -370,18 +425,56 @@ def run(cfg):
     else:
         unique_demo_keys = sorted(set(demo_keys))
         n_train_demos = int(len(unique_demo_keys) * cfg.train_split)
-        perm = torch.randperm(len(unique_demo_keys), generator=rnd_gen).tolist()
-        train_demo_set = {unique_demo_keys[perm[i]] for i in range(n_train_demos)}
+        if n_train_demos >= len(unique_demo_keys):
+            # 100% training (cfg.train_split >= 1.0): every demo trains, nothing
+            # is held out. There is no true val set; instead reuse a small random
+            # subset of TRAIN chunks as a "monitoring val". It only drives the
+            # periodic _object.ckpt dump cadence (on_validation_end every
+            # trainer.val_check_interval steps) and a train-CE signal — the
+            # checkpoint is selected by downstream eval rollouts, NOT this CE, so
+            # the train/val overlap is intentional and harmless.
+            train_indices = list(range(len(demo_keys)))
+            perm = torch.randperm(len(train_indices), generator=rnd_gen).tolist()
+            n_mon = min(2048, len(train_indices))
+            val_indices = [train_indices[i] for i in perm[:n_mon]]
+            print(
+                f"[Split] train_split={cfg.train_split} >= 1.0 → 100% TRAIN "
+                f"({len(train_indices)} chunks, all {len(unique_demo_keys)} demos). "
+                f"Monitoring val = {len(val_indices)} train chunks (overlaps train; "
+                f"ckpt selected by eval, not val CE)."
+            )
+        else:
+            perm = torch.randperm(len(unique_demo_keys), generator=rnd_gen).tolist()
+            train_demo_set = {unique_demo_keys[perm[i]] for i in range(n_train_demos)}
 
-        train_indices = [i for i, k in enumerate(demo_keys) if k in train_demo_set]
-        val_indices = [i for i, k in enumerate(demo_keys) if k not in train_demo_set]
-        print(
-            f"[Split] {len(unique_demo_keys)} unique (task, demo) pairs → "
-            f"{n_train_demos} train / {len(unique_demo_keys) - n_train_demos} val. "
-            f"Train chunks: {len(train_indices)}, val chunks: {len(val_indices)}."
+            train_indices = [i for i, k in enumerate(demo_keys) if k in train_demo_set]
+            val_indices = [
+                i for i, k in enumerate(demo_keys) if k not in train_demo_set
+            ]
+            print(
+                f"[Split] {len(unique_demo_keys)} unique (task, demo) pairs → "
+                f"{n_train_demos} train / {len(unique_demo_keys) - n_train_demos} val. "
+                f"Train chunks: {len(train_indices)}, val chunks: {len(val_indices)}."
+            )
+
+    # Train-only image augmentation. Build a SEPARATE augmenting dataset for the
+    # train Subset (identical file glob + index as `dataset`, so train_indices /
+    # sampler weights stay valid); val keeps the clean (augment=False) dataset.
+    # Disabled in overfit mode (we want exact memorization, no aug noise).
+    use_aug = bool(cfg.get("augment", False)) and overfit_demo is None
+    if use_aug:
+        print("[augment] train-only image augmentation ON (RRC + color jitter)")
+        train_dataset = LiberoDataset(
+            hdf5_dir=cfg.data.dataset.hdf5_dir,
+            max_action_tokens=max_action_tokens,
+            max_lang_tokens=max_lang_tokens,
+            img_size=cfg.data.dataset.get("img_size", cfg.img_size),
+            use_state_prediction=use_state_prediction,
+            augment=True,
         )
-
-    train_set = torch.utils.data.Subset(dataset, train_indices)
+    else:
+        train_dataset = dataset
+    train_set = torch.utils.data.Subset(train_dataset, train_indices)
     val_set = torch.utils.data.Subset(dataset, val_indices)
 
     # In overfit mode, keep every sample each epoch — drop_last=True could
@@ -443,6 +536,8 @@ def run(cfg):
         max_lang_tokens=max_lang_tokens,
         proprio_dim=proprio_dim,
         use_state_prediction=use_state_prediction,
+        # One STATE_QUERY token per future horizon (multi-horizon SP).
+        state_pred_horizons=n_sp_horizons,
         # Mirror the encoder-side projector's norm choice — paper Section 3
         # says the predictor projector has the "same implementation as the
         # one used for the encoder", so when the encoder projector is BN
@@ -489,7 +584,9 @@ def run(cfg):
     # Resolve the budget here:
     #   - If trainer.max_steps is set → use it directly.
     #   - Else → estimate from max_epochs × len(train_loader).
-    # Warmup is 2% of total steps, capped at 2K (rough rule for VLA-scale runs).
+    # Warmup is 4% of total steps, capped at 4K. Raised from 2%/2K alongside the
+    # depth 6->10 bump: a deeper + longer-sequence (pool_grid=16) stack has more
+    # brittle early attention/residual dynamics, so warmup should scale with it.
     trainer_cfg_sched = cfg.get("trainer", {}) or {}
     cfg_max_steps = int(trainer_cfg_sched.get("max_steps", -1))
     if cfg_max_steps > 0:
@@ -499,23 +596,61 @@ def run(cfg):
         steps_per_epoch = max(1, len(train))
         epochs_budget = int(trainer_cfg_sched.get("max_epochs", 1))
         sched_max_steps = max(1, steps_per_epoch * epochs_budget)
-    sched_warmup = max(1, min(2000, int(0.02 * sched_max_steps)))
+    sched_warmup = max(1, min(4000, int(0.04 * sched_max_steps)))
     print(
         f"[scheduler] LinearWarmupCosineAnnealingLR: max_steps={sched_max_steps}, "
         f"warmup_steps={sched_warmup}, interval=step"
     )
-    optimizers = {
-        "model_opt": {
-            "modules": "model",
-            "optimizer": dict(cfg.optimizer),
-            "scheduler": {
-                "type": "LinearWarmupCosineAnnealingLR",
-                "max_steps": sched_max_steps,
-                "warmup_steps": sched_warmup,
-            },
-            "interval": "step",
-        },
+    # spt's "optimizer" dict forwards EVERY key to torch.optim.<type>(**kwargs),
+    # so it must NOT contain custom keys (encoder_lr would crash AdamW). "modules"
+    # is a START-ANCHORED REGEX over named_modules() qualified names; the JEPA is
+    # stored as self.model, so all params are prefixed "model." (encoder =
+    # model.encoder.*). When the visual encoder is finetuned (freeze_encoder=False)
+    # AND a distinct lower encoder_lr is requested, split into TWO optimizer
+    # entries (encoder at encoder_lr, everything else at lr). spt uses manual
+    # optimization and steps EVERY optimizer on the one joint loss, so this is
+    # just two AdamW param groups descending the same backward, each with its own
+    # warmup-cosine schedule annealing to its own peak.
+    sched_cfg = {
+        "type": "LinearWarmupCosineAnnealingLR",
+        "max_steps": sched_max_steps,
+        "warmup_steps": sched_warmup,
     }
+    opt_base = {k: v for k, v in dict(cfg.optimizer).items() if k != "encoder_lr"}
+    encoder_lr = cfg.optimizer.get("encoder_lr", None)
+    base_lr = float(opt_base.get("lr", 0.0))
+    use_disc_lr = (
+        (not freeze_encoder) and encoder_lr is not None and float(encoder_lr) != base_lr
+    )
+    if use_disc_lr:
+        print(
+            f"[optimizer] discriminative LR: encoder={float(encoder_lr)} "
+            f"(model.encoder.*) / rest={base_lr}. Check the spt param-split log "
+            "table on the first run to confirm the encoder/rest split is correct."
+        )
+        optimizers = {
+            "encoder_opt": {
+                "modules": r"^model\.encoder($|\.)",
+                "optimizer": {**opt_base, "lr": float(encoder_lr)},
+                "scheduler": dict(sched_cfg),
+                "interval": "step",
+            },
+            "rest_opt": {
+                "modules": r"^model\.(?!encoder($|\.)).*",
+                "optimizer": dict(opt_base),
+                "scheduler": dict(sched_cfg),
+                "interval": "step",
+            },
+        }
+    else:
+        optimizers = {
+            "model_opt": {
+                "modules": "model",
+                "optimizer": dict(opt_base),
+                "scheduler": dict(sched_cfg),
+                "interval": "step",
+            },
+        }
 
     data_module = spt.data.DataModule(train=train, val=val)
 

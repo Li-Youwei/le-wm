@@ -108,23 +108,27 @@ def build_model(device: torch.device) -> torch.nn.Module:
         }
     )
     encoder, hidden_dim, freeze_encoder = build_visual_encoder(enc_cfg, spt)
-    embed_dim = 192
+    embed_dim = 384
 
     predictor = ARPredictor(
         embed_dim=embed_dim,
         max_action_tokens=80,
         max_lang_tokens=25,
         proprio_dim=9,
-        # dropout=0.2 mirrors config/train/lewm.yaml (the frozen baseline's
-        # actual training value). Eval mode is no-op for nn.Dropout, so this
-        # has no inference effect, but it keeps the constructor call honest
-        # and stops future maintainers from chasing a phantom mismatch when
-        # they cross-reference eval and training code.
-        depth=6,
+        # depth/dropout mirror config/train/lewm.yaml's current default (depth
+        # 12, dropout 0.15). depth sets the block count, which MUST match the
+        # checkpoint for the state_dict to load; dropout is a no-op at eval.
+        # This build_model path reconstructs the simple CLS-only architecture
+        # only — pool_grid (multi-token visual), MoT, and state-prediction are
+        # NOT rebuilt here, so any pool_grid>0 / MoT / SP / non-DINOv2-base
+        # checkpoint must be eval'd via its _object.ckpt instead.
+        # residual_scale_init is omitted: it only affects init, which the
+        # loaded weights overwrite, so it has no effect on eval.
+        depth=12,
         heads=16,
         dim_head=64,
         mlp_dim=2048,
-        dropout=0.2,
+        dropout=0.15,
         emb_dropout=0.0,
     )
     projector = MLP(
@@ -397,6 +401,7 @@ def _execute_chunk_closed_loop(
     pos_scale: float,
     rot_scale: float,
     frames: list[np.ndarray] | None,
+    n_steps: int | None = None,
 ) -> tuple[dict, float, bool, dict]:
     """Execute an anchor-relative action chunk in closed-loop against the env.
 
@@ -430,8 +435,12 @@ def _execute_chunk_closed_loop(
     reward = 0.0
     done = False
     info: dict = {}
+    # Receding horizon: execute only the first n_steps of the H-step chunk, then
+    # let the caller re-observe and re-predict. n_steps=None executes the whole
+    # chunk (legacy execute-then-replan behavior).
     H = chunk.shape[0]
-    for h in range(H):
+    n_exec = H if n_steps is None else max(1, min(int(n_steps), H))
+    for h in range(n_exec):
         # Anchor-relative target derived from the predicted displacement
         target_pos = anchor_pos + chunk[h, 0:3]
         R_step_delta = R.from_rotvec(chunk[h, 3:6])
@@ -490,15 +499,26 @@ def evaluate_task(
     task_name: str = "",
     max_video_episodes: int = 999,
     num_warmup_steps: int = 10,
+    exec_steps: int | None = None,
 ) -> tuple[int, int]:
     """Run episodes and count successes.
 
     Each episode runs ``num_warmup_steps`` no-op env steps after reset to let
     the scene physically settle, then up to ``max_steps`` policy-driven steps.
     The warmup steps are NOT counted toward ``max_steps`` (the policy horizon).
+
+    Receding horizon: when ``exec_steps`` is set (< chunk_size), each predicted
+    H-step chunk is executed for only the first ``exec_steps`` steps, then the
+    policy re-observes and re-predicts — tighter closed loop, less drift /
+    chunk-boundary jitter. ``exec_steps=None`` (or >= chunk_size) keeps the
+    legacy execute-the-whole-chunk-then-replan behavior.
     """
     successes = 0
-    max_chunks = max_steps // chunk_size
+    eff_exec = (
+        chunk_size
+        if (exec_steps is None or exec_steps <= 0)
+        else min(int(exec_steps), chunk_size)
+    )
 
     # Read OSC scales once per task from the running controller (not hardcoded).
     pos_scale, rot_scale = _read_osc_scales(env)
@@ -537,7 +557,8 @@ def evaluate_task(
 
         reward = 0.0
         done = False
-        for _ in range(max_chunks):
+        steps_done = 0
+        while steps_done < max_steps:
             # Preprocess observation (dual-view + proprio)
             pixels_agent, pixels_hand, proprio = preprocess_obs(obs, img_size, device)
 
@@ -573,6 +594,11 @@ def evaluate_task(
             #   [3:6] = anchor-relative rot delta (rad, axis-angle)
             #   [6]   = gripper cmd (unchanged)
 
+            # Clamp the last window so total executed steps never exceed
+            # max_steps (the episode horizon cap), even when eff_exec does not
+            # divide max_steps under receding-horizon. Without this the policy
+            # would get up to eff_exec-1 extra steps vs the protocol.
+            this_exec = min(eff_exec, max_steps - steps_done)
             obs, reward, done, _ = _execute_chunk_closed_loop(
                 env,
                 obs,
@@ -580,7 +606,9 @@ def evaluate_task(
                 pos_scale,
                 rot_scale,
                 frames,
+                n_steps=this_exec,
             )
+            steps_done += this_exec
             if done:
                 break
 
@@ -683,6 +711,15 @@ def main():
         default=10,
         help="No-op env steps to settle the scene before the policy acts "
         "(not counted toward --max-steps).",
+    )
+    parser.add_argument(
+        "--exec-steps",
+        type=int,
+        default=None,
+        help="Receding-horizon: execute only the first N steps of each predicted "
+        "H-step (=chunk_size) chunk, then re-observe and re-predict. None or "
+        ">=chunk_size = legacy execute-whole-chunk-then-replan. Try 5-8 for a "
+        "tighter loop / less drift. Inference-only; no retrain needed.",
     )
     parser.add_argument(
         "--camera-size",
@@ -817,6 +854,7 @@ def main():
                 num_episodes=args.num_episodes,
                 max_steps=max_steps,
                 num_warmup_steps=args.num_warmup_steps,
+                exec_steps=args.exec_steps,
                 device=device,
                 temperature=args.temperature,
                 save_videos=args.save_videos,

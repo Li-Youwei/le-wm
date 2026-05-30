@@ -316,22 +316,25 @@ class ARPredictor(nn.Module):
     Baseline (use_state_prediction=False) processes the unified sequence:
         [l_1...l_n, z_agent, z_hand, z_proprio, BOS, T_1...T_k, PAD...]
 
-    With state prediction enabled (use_state_prediction=True), three query
-    tokens are appended at the end during training:
+    With state prediction enabled (use_state_prediction=True), one STATE_QUERY
+    token PER horizon (K = state_pred_horizons) is appended at the end during
+    training:
         [l_1...l_n, z_agent, z_hand, z_proprio, BOS, T_1...T_k, PAD...,
-         Q_ag, Q_hd, Q_pr]
+         Q_h1, Q_h2, ..., Q_hK]
 
-    The Q tokens read out predicted future latents (z_ag_{t+H}, z_hd_{t+H})
-    and predicted raw future proprio (s_pr_{t+H}, 9d).
+    Each Q_hk is read by the 3 SHARED heads (state_pred_head_ag/hd/pr) to
+    predict that horizon's future agent-image latents, hand-image latents, and
+    raw future proprio (9d). K=1 = single-horizon SP.
 
     Attention mask is prefix-bidirectional + action-causal + query-isolated:
     - Perception prefix (lang + visual + proprio): bidirectional among real tokens
     - Action tokens (BOS + T_1...T_k): see all real prefix, causal within action group
     - PAD tokens: attend to nothing, no other token attends to them
-    - STATE_QUERY tokens (Q_ag, Q_hd, Q_pr): see all real prefix + real action zone
-      (BOS + real T) + themselves only. The three queries DO NOT attend to each
-      other — this preserves three-way independence of the predictions and
-      prevents one head from copying another's hidden state.
+    - STATE_QUERY tokens (Q_h1..Q_hK): see all real prefix + real action zone
+      (BOS + real T) + themselves only. The horizon queries DO NOT attend to
+      each other — each must re-derive its future from the prefix (no copying a
+      neighbor's hidden state), which is what pressures the encoder/prefix
+      representation.
 
     Inference (`generate()`) does NOT construct STATE_QUERY tokens regardless
     of the flag, so eval_libero.py flow `[lang, z_ag, z_hd, z_pr, BOS] →
@@ -353,9 +356,11 @@ class ARPredictor(nn.Module):
         emb_dropout: float = 0.0,
         use_state_prediction: bool = False,
         state_head_norm_type: str = "layer",
+        state_pred_horizons: int = 1,
         n_visual_tokens_per_view: int = 1,
         visual_pool_grid: int = 0,
         use_mot: bool = False,
+        residual_scale_init: bool = False,
     ):
         super().__init__()
         self.embed_dim = embed_dim
@@ -363,7 +368,15 @@ class ARPredictor(nn.Module):
         self.max_lang_tokens = max_lang_tokens
         self.proprio_dim = proprio_dim
         self.use_state_prediction = use_state_prediction
-        self.n_state_query = 3 if use_state_prediction else 0
+        # Multi-horizon state prediction: one STATE_QUERY token PER future
+        # horizon (the user's figure: Q_t+5, Q_t+10, Q_t+15, Q_t+20), each read
+        # by the SAME 3 shared heads (ag/hd/pr) to predict that horizon's future
+        # agent-image + hand-image + proprio latents. state_pred_horizons=1
+        # recovers single-horizon SP (one query token, 3 shared heads). The
+        # horizon identity is carried by the per-horizon query embedding, so the
+        # heads stay horizon-agnostic decoders (parameter-tying = regularizer).
+        self.state_pred_horizons = max(1, int(state_pred_horizons))
+        self.n_state_query = self.state_pred_horizons if use_state_prediction else 0
 
         # Mixture-of-Transformers (Meta MoT) — when True the FFN in each
         # transformer block routes BOTH its attention projections (QKV/O +
@@ -467,19 +480,18 @@ class ARPredictor(nn.Module):
                     f"'{state_head_norm_type}'"
                 )
 
-            # 3 learnable query tokens: Q_ag, Q_hd, Q_pr (one per stream).
-            self.state_query_embeddings = nn.Parameter(torch.randn(3, embed_dim))
-            # Per-stream projector: matches the encoder-side projector
-            # signature (LeWM paper Sec. 3 + upstream pattern).
-            # NB (Bug #2 fix): for multi-token visual prefix (nv > 1), the
-            # visual SP heads predict ALL nv target tokens in one shot, with
-            # output dim = embed_dim * nv. forward() reshapes to (B, nv, D)
-            # before the MSE. This routes SP gradient to every source visual
-            # patch (Q_ag attends to all source patches, and must encode
-            # spatial info about all nv targets — so patches that carry
-            # useful spatial info get direct gradient flow).
-            # For nv = 1 (CLS-only legacy) the output dim collapses to D
-            # and behavior matches the original frozen baseline bit-by-bit.
+            # One learnable query token PER horizon (Q_t+h1, ..., Q_t+hK).
+            # Each is read by all 3 shared heads below; horizon identity is
+            # encoded by the per-horizon embedding. K=1 = single-horizon SP.
+            self.state_query_embeddings = nn.Parameter(
+                torch.randn(self.state_pred_horizons, embed_dim)
+            )
+            # 3 SHARED per-stream heads, reused across horizons. Each matches
+            # the encoder-side projector signature (LeWM paper Sec. 3).
+            # The visual heads predict ALL nv target tokens in one shot
+            # (output dim = embed_dim * nv); forward() reshapes to
+            # (B, n_horizons, nv, D). This routes SP gradient to every source
+            # visual patch. For nv = 1 the visual output collapses to D.
             self.state_pred_head_ag = MLP(
                 embed_dim,
                 2048,
@@ -517,6 +529,47 @@ class ARPredictor(nn.Module):
         )
         self.norm = nn.LayerNorm(embed_dim)
         self.dropout = nn.Dropout(emb_dropout)
+
+        # Depth-aware residual init (GPT-2/Llama style, opt-in). Scales every
+        # block's residual output projection by 1/sqrt(2*depth) so the
+        # residual-stream variance stays ~constant as depth grows — needed for
+        # the deeper (depth>6) + long-sequence (V17 / full-patch pool_grid=16)
+        # regime, since this module otherwise has NO depth-aware init (pre-norm
+        # with elementwise_affine=False, no LayerScale/rezero, std-1 pos/query
+        # params). Off by default → the baseline (use_mot=false, depth=6) stays
+        # bit-identical to 7008f15.
+        self.residual_scale_init = bool(residual_scale_init)
+        if self.residual_scale_init:
+            self._apply_residual_scale_init(depth)
+
+    def _apply_residual_scale_init(self, depth: int) -> None:
+        """Scale residual-branch output projections by 1/sqrt(2*depth).
+
+        With `depth` blocks each adding TWO residual branches (attention +
+        FFN), scaling every branch's output projection by 1/sqrt(2*depth)
+        keeps the residual stream's variance from growing linearly with depth
+        (GPT-2/Llama trick). Pure re-scaling of the existing init — no new
+        params, no change to the forward pass. Covers both the shared
+        (Attention / FeedForward) and MoT (MoTAttention / MoTFeedForward)
+        paths. Weights only (biases are default near-zero and negligible).
+        """
+        scale = (2.0 * max(1, depth)) ** -0.5
+        for block in self.blocks:
+            attn, mlp = block.attn, block.mlp
+            # Attention output projection (residual branch).
+            if isinstance(attn, MoTAttention):
+                for to_out in attn.to_outs:
+                    if isinstance(to_out, nn.Sequential):
+                        to_out[0].weight.data.mul_(scale)
+            elif isinstance(attn, Attention) and isinstance(attn.to_out, nn.Sequential):
+                attn.to_out[0].weight.data.mul_(scale)
+            # FFN second linear (residual branch). FeedForward.net =
+            # [LayerNorm, Linear, GELU, Dropout, Linear, Dropout] → index 4.
+            if isinstance(mlp, MoTFeedForward):
+                for expert in mlp.experts:
+                    expert.net[4].weight.data.mul_(scale)
+            elif isinstance(mlp, FeedForward):
+                mlp.net[4].weight.data.mul_(scale)
 
     def _build_attn_mask(
         self,
@@ -743,12 +796,13 @@ class ARPredictor(nn.Module):
             When ``use_state_prediction is False`` (baseline):
                 action_logits: (B, 1+max_action_tokens, 1026) logits at BOS + action positions.
 
-            When ``use_state_prediction is True``:
+            When ``use_state_prediction is True`` (K = state_pred_horizons,
+            nv = n_visual_per_view):
                 Tuple ``(action_logits, pred_ag, pred_hd, pred_pr)`` where
                   - action_logits: same shape as baseline,
-                  - pred_ag: (B, embed_dim) predicted future agentview latent,
-                  - pred_hd: (B, embed_dim) predicted future hand-cam latent,
-                  - pred_pr: (B, proprio_dim) predicted RAW future proprio.
+                  - pred_ag: (B, K, nv, embed_dim) predicted future agentview latents,
+                  - pred_hd: (B, K, nv, embed_dim) predicted future hand-cam latents,
+                  - pred_pr: (B, K, proprio_dim) predicted RAW future proprio.
         """
         B = z_agent.size(0)
         device = z_agent.device
@@ -812,13 +866,13 @@ class ARPredictor(nn.Module):
             [prefix, action_emb], dim=1
         )  # (B, n_prefix + 1 + max_action_tokens, D)
 
-        # 4b. (Optional) Append STATE_QUERY tokens at the very end. Each
-        # query is a learnable embedding plus the type embedding (index 4).
-        # Index 4 only exists when use_state_prediction is True (n_type=5).
+        # 4b. (Optional) Append one STATE_QUERY token per horizon at the very
+        # end. Each query is a learnable per-horizon embedding plus the type
+        # embedding (index 4, only present when use_state_prediction, n_type=5).
         if self.use_state_prediction:
-            # state_query_embeddings: (3, D) → (1, 3, D) → (B, 3, D)
+            # state_query_embeddings: (K, D) → (1, K, D) → (B, K, D), K=horizons
             q_base = self.state_query_embeddings.unsqueeze(0).expand(B, -1, -1)
-            q_emb = q_base + self.type_embedding.weight[4]  # broadcast over (B, 3, D)
+            q_emb = q_base + self.type_embedding.weight[4]  # broadcast over (B, K, D)
             x = torch.cat([x, q_emb], dim=1)
 
         L = x.size(1)
@@ -854,22 +908,23 @@ class ARPredictor(nn.Module):
         if not self.use_state_prediction:
             return action_logits
 
-        # 9. Read out the three STATE_QUERY positions and run them through
-        #    their respective heads. Q_ag/Q_hd predict per-token visual
-        #    latents at t+H, shape (B, nv, D) — collapses to (B, 1, D) ≡
-        #    (B, D) for legacy CLS-only mode. Q_pr predicts the raw 9d
-        #    proprio vector at t+H (NOT an embedding — the target is the
-        #    un-encoded proprio so the loss is in physical units).
+        # 9. Read out the K STATE_QUERY positions (one per horizon) and run
+        #    EACH through the 3 SHARED heads. Q_t+h predicts that horizon's
+        #    future agent/hand visual latents (B, nv, D) and raw proprio (B, 9).
+        #    Batched over horizons via a (B*K, D) reshape.
         query_start = n_prefix + 1 + self.max_action_tokens
-        q_out = x[:, query_start : query_start + 3]  # (B, 3, D)
+        K = self.state_pred_horizons
         nv = self.n_visual_per_view
-        pred_ag = self.state_pred_head_ag(q_out[:, 0]).reshape(
-            B, nv, self.embed_dim
-        )  # (B, nv, D)
-        pred_hd = self.state_pred_head_hd(q_out[:, 1]).reshape(
-            B, nv, self.embed_dim
-        )  # (B, nv, D)
-        pred_pr = self.state_pred_head_pr(q_out[:, 2])  # (B, proprio_dim)
+        q_out = x[:, query_start : query_start + K].reshape(B * K, self.embed_dim)
+        pred_ag = self.state_pred_head_ag(q_out).reshape(
+            B, K, nv, self.embed_dim
+        )  # (B, K, nv, D)
+        pred_hd = self.state_pred_head_hd(q_out).reshape(
+            B, K, nv, self.embed_dim
+        )  # (B, K, nv, D)
+        pred_pr = self.state_pred_head_pr(q_out).reshape(
+            B, K, self.proprio_dim
+        )  # (B, K, proprio_dim)
 
         return action_logits, pred_ag, pred_hd, pred_pr
 

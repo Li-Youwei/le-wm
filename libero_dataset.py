@@ -15,6 +15,7 @@ Expected HDF5 structure (one file per task):
 """
 
 import logging
+import math
 from pathlib import Path
 
 import h5py
@@ -57,6 +58,70 @@ def _preprocess_image(img_uint8: np.ndarray, img_size: int = 224) -> torch.Tenso
     return img
 
 
+def _sample_view_aug_params(
+    h: int,
+    w: int,
+    scale: tuple[float, float] = (0.85, 1.0),
+    ratio: tuple[float, float] = (0.9, 1.1),
+) -> tuple:
+    """Sample ONE RandomResizedCrop box + brightness/contrast/saturation factors
+    for a single camera view.
+
+    The same params are applied to that view's current frame AND all its future
+    SP-target frames so the SP source/target stay in one augmented distribution;
+    agent and hand views are sampled independently. NO horizontal flip / rotation
+    (they would break manipulation left/right + geometry); translation is
+    subsumed by the random crop position. Pure-torch (no torchvision dep).
+    """
+    area = float(h * w)
+    crop = (0, 0, h, w)  # center/full fallback
+    for _ in range(10):
+        target_area = area * float(torch.empty(1).uniform_(scale[0], scale[1]))
+        log_ratio = (math.log(ratio[0]), math.log(ratio[1]))
+        ar = math.exp(float(torch.empty(1).uniform_(log_ratio[0], log_ratio[1])))
+        cw = int(round(math.sqrt(target_area * ar)))
+        ch = int(round(math.sqrt(target_area / ar)))
+        if 0 < cw <= w and 0 < ch <= h:
+            i = int(torch.randint(0, h - ch + 1, (1,)))
+            j = int(torch.randint(0, w - cw + 1, (1,)))
+            crop = (i, j, ch, cw)
+            break
+    b = float(torch.empty(1).uniform_(0.8, 1.2))  # brightness
+    c = float(torch.empty(1).uniform_(0.8, 1.2))  # contrast
+    s = float(torch.empty(1).uniform_(0.8, 1.2))  # saturation
+    return crop, b, c, s
+
+
+def _augment_view(
+    frames_uint8: list, img_size: int, params: tuple
+) -> list[torch.Tensor]:
+    """Apply shared (crop→resize + color-jitter) augmentation to a list of uint8
+    HWC frames from ONE view → list of normalized (3, img_size, img_size) tensors.
+    """
+    (i, j, ch, cw), b, c, s = params
+    out = []
+    for fr in frames_uint8:
+        img = torch.from_numpy(np.ascontiguousarray(fr)).float().div_(255.0)
+        img = img.permute(2, 0, 1)  # (3, H, W) in [0, 1]
+        img = img[:, i : i + ch, j : j + cw]  # random-resized-crop: crop ...
+        img = F.interpolate(
+            img.unsqueeze(0),
+            size=(img_size, img_size),
+            mode="bilinear",
+            align_corners=False,
+        ).squeeze(0)  # ... then resize
+        # Color jitter (brightness, contrast, saturation) on [0, 1].
+        img = img * b
+        mean = img.mean(dim=(-2, -1), keepdim=True)
+        img = (img - mean) * c + mean
+        lum = (0.299 * img[0] + 0.587 * img[1] + 0.114 * img[2]).unsqueeze(0)
+        img = (img - lum) * s + lum
+        img = img.clamp_(0.0, 1.0)
+        img = (img - IMAGENET_MEAN) / IMAGENET_STD
+        out.append(img)
+    return out
+
+
 class LiberoDataset(Dataset):
     """Loads preprocessed LIBERO HDF5 files for VLA baseline training.
 
@@ -78,11 +143,17 @@ class LiberoDataset(Dataset):
         max_lang_tokens: int = 25,
         img_size: int = 224,
         use_state_prediction: bool = False,
+        augment: bool = False,
     ):
         self.max_action_tokens = max_action_tokens
         self.max_lang_tokens = max_lang_tokens
         self.img_size = img_size
         self.use_state_prediction = use_state_prediction
+        # Train-only image augmentation (random-resized-crop + color jitter),
+        # applied per-view consistently across the current frame and its future
+        # SP targets. Build a SEPARATE LiberoDataset(augment=True) for the train
+        # split and keep augment=False for val (see train.py).
+        self.augment = bool(augment)
 
         # Discover all HDF5 files and build a global index
         hdf5_dir = Path(hdf5_dir)
@@ -107,6 +178,13 @@ class LiberoDataset(Dataset):
         # Per-sample demo_idx cache — avoids re-opening every HDF5 in train.py
         # for the train/val split. Same length as self._index, aligned 1:1.
         self._demo_ids: list[int] = []
+        # Multi-horizon SP offsets (raw-step offsets from the anchor), read from
+        # the HDF5 `sp_horizons` attr below. None until populated, and stays None
+        # when use_state_prediction is False. train.py asserts this matches
+        # cfg.loss.state_pred_horizons (count + order + values) so a config/data
+        # horizon mismatch fails loudly instead of silently binding each horizon
+        # query to the wrong future frame.
+        self.sp_horizons: list[int] | None = None
         # Counters for the 3-level balanced WeightedRandomSampler.
         self.n_demos_per_task: dict[Path, int] = {}
         self.n_chunks_per_demo: dict[tuple[Path, int], int] = {}
@@ -144,6 +222,12 @@ class LiberoDataset(Dataset):
                             f"future fields: {missing}. Re-run preprocess_libero.py "
                             "to regenerate (it will add the t+H frames)."
                         )
+                    # Capture the multi-horizon offsets (preprocess --sp-horizons)
+                    # from the first SP file; train.py cross-checks against the
+                    # config. Counts alone aren't enough — a reordering would
+                    # silently bind each horizon query to the wrong future frame.
+                    if self.sp_horizons is None and "sp_horizons" in f.attrs:
+                        self.sp_horizons = [int(x) for x in f.attrs["sp_horizons"]]
 
                 # demo_idx is always written by preprocess_libero.py. Read it
                 # once per file here so train.py can split by (file, demo)
@@ -208,14 +292,44 @@ class LiberoDataset(Dataset):
         fpath, local_idx = self._index[idx]
         f = self._get_file(fpath)
 
-        # Images: uint8 HWC → float32 CHW (3, 224, 224) ImageNet-normalized.
-        # Existence of both keys was checked in __init__.
-        img_agent = _preprocess_image(f["image_agent"][local_idx], self.img_size)
+        # Images: uint8 HWC → float32 CHW, ImageNet-normalized. When self.augment,
+        # each view's current frame + its future SP targets (if any) share ONE
+        # random crop + color jitter (agent/hand independent), keeping the SP
+        # source/target in the same augmented distribution. Future frames are
+        # gathered here (before processing) so the shared params cover them too.
         if "image_hand" not in f:
             raise KeyError(
                 f"No 'image_hand' dataset in {fpath}. Re-run preprocess_libero.py."
             )
-        img_hand = _preprocess_image(f["image_hand"][local_idx], self.img_size)
+        ag_frames = [f["image_agent"][local_idx]]  # [current, future_0 .. future_{K-1}]
+        hd_frames = [f["image_hand"][local_idx]]
+        if self.use_state_prediction:
+            ag_fut = f["image_agent_future"][local_idx]  # (K, H_img, W_img, 3)
+            hd_fut = f["image_hand_future"][local_idx]  # (K, H_img, W_img, 3)
+            if ag_fut.ndim != 4:
+                raise ValueError(
+                    f"image_agent_future[{local_idx}] has ndim {ag_fut.ndim}, "
+                    "expected 4 (K, H_img, W_img, 3). This dataset was preprocessed "
+                    "with the OLD single-horizon format; re-run preprocess_libero.py "
+                    "(--sp-horizons 5,10,15,20) for multi-horizon state prediction."
+                )
+            ag_frames += [ag_fut[k] for k in range(len(ag_fut))]
+            hd_frames += [hd_fut[k] for k in range(len(hd_fut))]
+
+        if self.augment:
+            hh, ww = ag_frames[0].shape[:2]
+            ag_proc = _augment_view(
+                ag_frames, self.img_size, _sample_view_aug_params(hh, ww)
+            )
+            hd_proc = _augment_view(
+                hd_frames, self.img_size, _sample_view_aug_params(hh, ww)
+            )
+        else:
+            ag_proc = [_preprocess_image(fr, self.img_size) for fr in ag_frames]
+            hd_proc = [_preprocess_image(fr, self.img_size) for fr in hd_frames]
+
+        img_agent = ag_proc[0]  # (3, 224, 224)
+        img_hand = hd_proc[0]  # (3, 224, 224)
 
         # Proprioception: (9,) float64 → float32 tensor
         # [ee_pos(3) + xyzw_quat(4) + gripper_raw(2)] — see preprocess_libero.py
@@ -256,20 +370,19 @@ class LiberoDataset(Dataset):
         item["lang_input_ids"] = lang_ids  # (max_lang_tokens,)
         item["lang_attention_mask"] = lang_mask  # (max_lang_tokens,)
 
-        # Future-frame state-prediction targets (only when enabled).
-        # Existence was asserted in __init__; here we just read them.
+        # Multi-horizon future-frame SP targets (only when enabled). The future
+        # frames were gathered + (optionally) augmented with the per-view params
+        # above; here we just stack the future slice and read proprio (K, 9).
         if self.use_state_prediction:
-            item["pixels_agent_future"] = _preprocess_image(
-                f["image_agent_future"][local_idx],
-                self.img_size,
-            )
-            item["pixels_hand_future"] = _preprocess_image(
-                f["image_hand_future"][local_idx],
-                self.img_size,
-            )
+            item["pixels_agent_future"] = torch.stack(
+                ag_proc[1:], dim=0
+            )  # (K,3,224,224)
+            item["pixels_hand_future"] = torch.stack(
+                hd_proc[1:], dim=0
+            )  # (K,3,224,224)
             item["proprio_future"] = torch.from_numpy(
                 np.array(f["proprio_future"][local_idx], dtype=np.float32),
-            )
+            )  # (K, 9)
 
         return item
 
