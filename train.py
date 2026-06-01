@@ -1,3 +1,4 @@
+import os
 from functools import partial
 from pathlib import Path
 
@@ -215,7 +216,16 @@ def lejepa_forward(self, batch, stage, cfg):
         output["sigreg_loss"] = self.sigreg(sigreg_input)
         total_loss = total_loss + sigreg_weight * output["sigreg_loss"]
 
-    output["loss"] = total_loss
+    # Gradient accumulation: spt accumulates grads over `frequency` micro-batches
+    # but does NOT rescale the loss, so the summed gradient would be N x too
+    # large. Divide the loss handed to backward (output["loss"]) by N so the
+    # effective update matches a single batch of (micro_batch * N). Only in the
+    # fit stage (val never backwards). N=1 is a no-op. Logging below uses the
+    # UNDIVIDED total_loss so curves stay comparable across accum settings.
+    accum = max(1, int(cfg.get("accumulate_grad_batches", 1)))
+    output["loss"] = (
+        total_loss / accum if (stage == "fit" and accum > 1) else total_loss
+    )
 
     # 8. Token accuracy (diagnostic)
     with torch.no_grad():
@@ -228,7 +238,9 @@ def lejepa_forward(self, batch, stage, cfg):
     # 9. Logging
     log_dict = {
         f"{stage}/ce_loss": output["ce_loss"].detach(),
-        f"{stage}/total_loss": output["loss"].detach(),
+        # Undivided total (output["loss"] may be /accum for backward) so curves
+        # stay comparable across accumulate_grad_batches settings.
+        f"{stage}/total_loss": total_loss.detach(),
         f"{stage}/token_accuracy": output["token_accuracy"],
     }
     if "pred_loss" in output:
@@ -288,6 +300,30 @@ def run(cfg):
     pl.seed_everything(cfg.seed, workers=True)
 
     rnd_gen = torch.Generator().manual_seed(cfg.seed)
+
+    # --- Single source of truth for DDP topology (used by the BN guard, the
+    # sampler shard, and the DDP/accum wiring — these MUST agree). ---
+    # World size is derived from cfg.trainer.devices, NOT os.environ['WORLD_SIZE']:
+    # under Lightning's subprocess DDP launcher, WORLD_SIZE is set in the CHILD
+    # ranks but NOT in the rank-0 PARENT at the time run() builds the sampler
+    # (the launcher only exports it from inside trainer.fit()). Reading env there
+    # would make the parent build a full-size sampler while children build
+    # sharded ones → mismatched epoch lengths → DDP hang. cfg.trainer.devices is
+    # known identically on every process at run() time (run_all4 sets it to
+    # $NUM_GPU). 'auto'/-1 are treated as potentially-multi and REJECTED for the
+    # SIGReg/BN path (can't know the count up front); pass an explicit int.
+    _dev = cfg.trainer.get("devices", "auto")
+    if isinstance(_dev, int) and _dev >= 1:
+        ddp_world = _dev
+        ddp_devices_known = True
+    elif isinstance(_dev, (list, tuple)):
+        ddp_world = len(_dev)
+        ddp_devices_known = True
+    else:  # "auto" | -1 | None → count not statically known
+        ddp_world = 1
+        ddp_devices_known = False
+    ddp_rank = int(os.environ.get("LOCAL_RANK", os.environ.get("RANK", "0")))
+    multi_gpu = ddp_world > 1
 
     # Single source of truth for max_action_tokens and max_lang_tokens
     max_action_tokens = cfg.data.dataset.get("max_action_tokens", 80)
@@ -351,20 +387,28 @@ def run(cfg):
     # costs more than this guard. Setting devices=1 (or [N]) is the safe
     # path; SyncBatchNorm conversion is not yet auto-applied.
     if projector_norm == "batch":
-        devices_cfg = cfg.trainer.get("devices", "auto")
-        is_explicit_single_gpu = devices_cfg == 1 or (
-            isinstance(devices_cfg, list) and len(devices_cfg) == 1
-        )
-        if not is_explicit_single_gpu:
+        sync_bn = bool(cfg.trainer.get("sync_batchnorm", False))
+        # Reject a non-statically-known device count ('auto'/-1): it can silently
+        # resolve to >1 GPU with plain per-rank BatchNorm. Require an explicit int.
+        if not ddp_devices_known:
             raise ValueError(
-                f"projector.norm_type='batch' is unsafe with cfg.trainer.devices="
-                f"{devices_cfg!r}. BatchNorm without "
-                "torch.nn.SyncBatchNorm.convert_sync_batchnorm gives per-GPU "
-                "statistics → silent divergence across ranks. Either: "
-                "(a) set trainer.devices=1, or (b) wrap the model in "
-                "SyncBatchNorm before training (not yet auto-applied). "
-                "'auto' is also rejected because it can resolve to >1 GPUs "
-                "without warning."
+                f"projector.norm_type='batch' with cfg.trainer.devices="
+                f"{cfg.trainer.get('devices', 'auto')!r}: the device count must be "
+                "an explicit int (or list) so the BN/SIGReg multi-GPU safety can "
+                "be checked. Set trainer.devices=1 (single-GPU) or =N (multi-GPU "
+                "with trainer.sync_batchnorm=true). 'auto'/-1 are rejected."
+            )
+        # Multi-GPU is allowed IFF sync_batchnorm=true: Lightning then converts
+        # every BatchNorm to SyncBatchNorm at setup (works under manual
+        # optimization), and our SIGReg is DDP-aware (broadcasts A + all-reduces
+        # its moments).
+        if multi_gpu and not sync_bn:
+            raise ValueError(
+                f"projector.norm_type='batch' is unsafe with trainer.devices="
+                f"{ddp_world} and sync_batchnorm=False. Plain BatchNorm gives "
+                "per-GPU statistics → silent divergence across ranks. Set "
+                "trainer.sync_batchnorm=true (Lightning converts BN→SyncBatchNorm; "
+                "SIGReg all-reduces its moments) for multi-GPU."
             )
 
     from libero_dataset import LiberoDataset
@@ -488,11 +532,31 @@ def run(cfg):
 
         all_weights = dataset.get_sampler_weights()
         train_weights = all_weights[train_indices]
+        # DDP-correctness: Lightning's default use_distributed_sampler=True would
+        # SILENTLY replace this WeightedRandomSampler with a DistributedSampler,
+        # destroying the 3-level balancing (no error). So under multi-GPU we (a)
+        # build a PER-RANK weighted sampler over a 1/world_size shard and (b)
+        # pass use_distributed_sampler=False to the Trainer (set below). Each
+        # rank with replacement=True + a rank-distinct seed draws an independent
+        # balanced sample; together they cover ~world_size× data per step.
+        # ddp_world/ddp_rank are the resolved-topology values from the top of
+        # run() (from cfg.trainer.devices, NOT env — see note there).
+        if multi_gpu:
+            sampler_num = max(1, len(train_weights) // ddp_world)
+            sampler_gen = torch.Generator().manual_seed(int(cfg.seed) + ddp_rank)
+            print(
+                f"[DDP] rank {ddp_rank}/{ddp_world}: per-rank WeightedRandomSampler "
+                f"num_samples={sampler_num} "
+                "(Trainer use_distributed_sampler=False keeps it unreplaced)."
+            )
+        else:
+            sampler_num = len(train_weights)
+            sampler_gen = rnd_gen
         train_sampler = WeightedRandomSampler(
             weights=train_weights,
-            num_samples=len(train_weights),
+            num_samples=sampler_num,
             replacement=True,
-            generator=rnd_gen,
+            generator=sampler_gen,
         )
         # cfg.loader has no `shuffle` key (verified in lewm.yaml), so passing
         # both **cfg.loader and sampler=... is safe. WeightedRandomSampler is
@@ -574,6 +638,11 @@ def run(cfg):
         lang_proj=lang_proj,
         visual_pool_grid=visual_pool_grid,
         freeze_encoder=freeze_encoder,
+        # Recompute encoder activations in backward (memory lever for batch>=32
+        # on one GPU). No-op when the encoder is frozen.
+        gradient_checkpointing=bool(
+            cfg.vision_encoder.get("gradient_checkpointing", False)
+        ),
     )
 
     # Cosine-annealing scheduler with explicit warmup_steps / max_steps.
@@ -616,6 +685,18 @@ def run(cfg):
         "max_steps": sched_max_steps,
         "warmup_steps": sched_warmup,
     }
+    # Gradient accumulation = per-optimizer step "frequency": spt's manual-opt
+    # training_step skips optimizer.step()+zero_grad() until (batch_idx+1)%freq==0
+    # (grads accumulate). We set it as the PER-ENTRY "frequency" key, which spt's
+    # configure_optimizers reads (it populates _optimizer_frequencies[name] =
+    # entry.get("frequency", 1) for EVERY optimizer BEFORE on_train_start). This
+    # is the robust path: poking trainer.accumulate_grad_batches_ would be IGNORED
+    # for these named optimizers (on_train_start only fills a freq for names NOT
+    # already set, and configure_optimizers already set them to 1). With accum>1,
+    # both encoder_opt and rest_opt step on the SAME boundary, and global_step
+    # ticks once per boundary → max_steps/warmup are in OPTIMIZER steps. The loss
+    # is divided by N in lejepa_forward so the effective LR matches a big batch.
+    accum = max(1, int(cfg.get("accumulate_grad_batches", 1)))
     opt_base = {k: v for k, v in dict(cfg.optimizer).items() if k != "encoder_lr"}
     encoder_lr = cfg.optimizer.get("encoder_lr", None)
     base_lr = float(opt_base.get("lr", 0.0))
@@ -634,12 +715,14 @@ def run(cfg):
                 "optimizer": {**opt_base, "lr": float(encoder_lr)},
                 "scheduler": dict(sched_cfg),
                 "interval": "step",
+                "frequency": accum,
             },
             "rest_opt": {
                 "modules": r"^model\.(?!encoder($|\.)).*",
                 "optimizer": dict(opt_base),
                 "scheduler": dict(sched_cfg),
                 "interval": "step",
+                "frequency": accum,
             },
         }
     else:
@@ -649,6 +732,7 @@ def run(cfg):
                 "optimizer": dict(opt_base),
                 "scheduler": dict(sched_cfg),
                 "interval": "step",
+                "frequency": accum,
             },
         }
 
@@ -730,13 +814,48 @@ def run(cfg):
         print_every = int(cfg.get("overfit_print_every", 100))
         callbacks.append(PeriodicPrintCallback(every_n_epochs=print_every))
 
+    trainer_kwargs = dict(cfg.trainer)
+    # Multi-GPU (DDP): when >1 device, (a) keep our custom weighted sampler
+    # unreplaced (use_distributed_sampler=False; we sharded it per-rank above)
+    # and (b) use DDP. find_unused_parameters=True is needed because the SP
+    # heads / MoT experts can be absent from a given step's autograd graph
+    # (training-only heads, zero-weighted terms) → DDP would otherwise error.
+    # multi_gpu/ddp_world are the resolved-topology values from the top of run()
+    # (from cfg.trainer.devices — same value the BN guard and sampler used).
+    if multi_gpu:
+        from lightning.pytorch.strategies import DDPStrategy
+
+        trainer_kwargs["use_distributed_sampler"] = False
+        trainer_kwargs["strategy"] = DDPStrategy(find_unused_parameters=True)
+        print(
+            f"[DDP] multi-GPU run (devices={ddp_world}): "
+            f"use_distributed_sampler=False, sync_batchnorm="
+            f"{trainer_kwargs.get('sync_batchnorm', False)}, "
+            "DDPStrategy(find_unused_parameters=True)."
+        )
+
     trainer = pl.Trainer(
-        **cfg.trainer,
+        **trainer_kwargs,
         callbacks=callbacks,
         num_sanity_val_steps=1,
         logger=logger,
         enable_checkpointing=True,
     )
+
+    # Gradient accumulation is wired via the per-optimizer "frequency"=accum keys
+    # set in the optim dict above (spt's configure_optimizers reads them). NOTE
+    # max_steps/warmup are in OPTIMIZER steps (global_step ticks once per accum
+    # boundary), so an accum=N run consumes N× the micro-batches/wall-clock for
+    # the same max_steps — the # of weight updates is unchanged.
+    if accum > 1:
+        eff = int(cfg.loader.batch_size) * accum * max(1, ddp_world)
+        print(
+            f"[accum] gradient accumulation = {accum} micro-batches/optimizer step "
+            f"(effective optimizer batch = {cfg.loader.batch_size} * {accum} * "
+            f"{max(1, ddp_world)} = {eff}). Loss divided by N in lejepa_forward; "
+            "BN/SIGReg still see one micro-batch per forward (accumulation does "
+            "NOT raise their batch). max_steps/warmup are in OPTIMIZER steps."
+        )
 
     manager = spt.Manager(
         trainer=trainer,

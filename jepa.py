@@ -14,6 +14,7 @@ class JEPA(nn.Module):
         lang_proj=None,
         visual_pool_grid: int = 0,
         freeze_encoder: bool = False,
+        gradient_checkpointing: bool = False,
     ):
         super().__init__()
 
@@ -36,6 +37,41 @@ class JEPA(nn.Module):
             self.encoder.eval()
             for p in self.encoder.parameters():
                 p.requires_grad_(False)
+
+        # Gradient checkpointing on the visual encoder: recompute encoder
+        # activations in backward instead of storing them (the single biggest
+        # activation-memory lever for the finetuned DINOv2, letting one GPU fit
+        # batch>=32 for SIGReg/BN). No-op for a frozen encoder (no activations
+        # stored for grad). HF backbones expose gradient_checkpointing_enable();
+        # the spt_vit ViT may not, so guard and warn rather than crash.
+        if gradient_checkpointing and not self.freeze_encoder:
+            enabled = self._enable_encoder_grad_ckpt()
+            if not enabled:
+                import warnings
+
+                warnings.warn(
+                    "gradient_checkpointing=True but the visual encoder exposes "
+                    "no gradient_checkpointing_enable() — running without it. "
+                    "(HF DINOv2 supports it; the legacy spt_vit ViT may not.)",
+                    stacklevel=2,
+                )
+
+    def _enable_encoder_grad_ckpt(self) -> bool:
+        """Turn on gradient checkpointing on the underlying encoder if it
+        supports the HF API. Returns True if enabled.
+
+        HFVisionBackbone wraps the real model as ``.model``; bare HF models
+        expose the method directly. Use non-reentrant checkpointing (works with
+        DDP and avoids the reentrant-autograd pitfalls)."""
+        kwargs = {"gradient_checkpointing_kwargs": {"use_reentrant": False}}
+        for mod in (getattr(self.encoder, "model", None), self.encoder):
+            if mod is not None and hasattr(mod, "gradient_checkpointing_enable"):
+                try:
+                    mod.gradient_checkpointing_enable(**kwargs)
+                except TypeError:
+                    mod.gradient_checkpointing_enable()
+                return True
+        return False
 
     def train(self, mode=True):
         """Override to keep T5 encoder frozen in eval mode.

@@ -5,7 +5,16 @@ from einops import rearrange
 
 
 class SIGReg(torch.nn.Module):
-    """Sketch Isotropic Gaussian Regularizer (single-GPU!)"""
+    """Sketch Isotropic Gaussian Regularizer.
+
+    DDP-aware: under multi-GPU the Epps-Pulley characteristic-function moments
+    (cos/sin means) are all-reduced across ranks so the normality test sees the
+    GLOBAL batch (per-GPU micro-batch * world_size), and every rank uses the
+    SAME random projection directions (rank-0's A is BROADCAST each call — robust
+    to any per-rank RNG-state or call-count divergence, unlike a local counter).
+    Single-GPU (or when distributed is not initialized) is bit-identical to the
+    original single-GPU implementation.
+    """
 
     def __init__(self, knots=17, num_proj=1024):
         super().__init__()
@@ -23,13 +32,39 @@ class SIGReg(torch.nn.Module):
         """
         proj: (T, B, D)
         """
-        # sample random projections
+        import torch.distributed as dist
+
+        ddp = (
+            dist.is_available() and dist.is_initialized() and dist.get_world_size() > 1
+        )
+
+        # Random projection directions. Single-GPU draws on-device exactly as the
+        # original (bit-identical). Under DDP every rank MUST use the SAME A so
+        # the all-reduced moments are measured on identical slices — broadcast
+        # rank-0's A. A carries no gradient, so a plain broadcast is correct and
+        # this is robust to any per-rank RNG / call-count divergence (a local
+        # counter could silently desync ranks → garbage statistic / collective
+        # hang).
         A = torch.randn(proj.size(-1), self.num_proj, device=proj.device)
+        if ddp:
+            dist.broadcast(A, src=0)
         A = A.div_(A.norm(p=2, dim=0))
-        # compute the epps-pulley statistic
+
+        # compute the epps-pulley statistic (moments over the batch dim, -3)
         x_t = (proj @ A).unsqueeze(-1) * self.t
-        err = (x_t.cos().mean(-3) - self.phi).square() + x_t.sin().mean(-3).square()
-        statistic = (err @ self.weights) * proj.size(-2)
+        cos_mean = x_t.cos().mean(-3)
+        sin_mean = x_t.sin().mean(-3)
+        n = proj.size(-2)  # per-rank batch
+        if ddp:
+            # Differentiable cross-rank average of the moments → global-batch
+            # statistic. all_reduce(AVG) keeps gradients (torch.distributed.nn).
+            from torch.distributed.nn.functional import all_reduce as nn_all_reduce
+
+            cos_mean = nn_all_reduce(cos_mean, op=dist.ReduceOp.AVG)
+            sin_mean = nn_all_reduce(sin_mean, op=dist.ReduceOp.AVG)
+            n = n * dist.get_world_size()
+        err = (cos_mean - self.phi).square() + sin_mean.square()
+        statistic = (err @ self.weights) * n
         return statistic.mean()  # average over projections and time
 
 

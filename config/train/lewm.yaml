@@ -45,13 +45,40 @@ vision_encoder:
   freeze: false
   local_files_only: true # set false for the first download (then cache hit); honors HF_HUB_OFFLINE
   trust_remote_code: false
+  # Gradient checkpointing on the (finetuned) DINOv2 encoder: recompute encoder
+  # activations in the backward pass instead of storing them. ~30% slower but
+  # roughly halves encoder activation memory — the lever that lets a SINGLE GPU
+  # fit batch>=32, REQUIRED because SIGReg + the BatchNorm projector compute
+  # statistics PER FORWARD (gradient accumulation does NOT enlarge the
+  # per-forward batch). On by default since the finetuned encoder is the memory
+  # bottleneck; set false to trade memory for speed. No-op when freeze=true.
+  gradient_checkpointing: true
+
+# Gradient accumulation: run N micro-batches summing grads, then ONE optimizer
+# step — effective optimizer batch = loader.batch_size * N * num_gpus. NOTE:
+# accumulation grows the OPTIMIZER batch only; BN/SIGReg still see one
+# micro-batch per forward, so it does NOT help the batch>=32 BN/SIGReg floor
+# (use gradient_checkpointing and/or multi-GPU SyncBN for that). train.py
+# divides the loss by N so the effective LR matches a single large batch, and
+# wires it into spt as the per-optimizer step frequency. max_steps/warmup are
+# counted in OPTIMIZER steps (post-accumulation). 1 = disabled.
+accumulate_grad_batches: 1
 
 trainer:
   max_epochs: 100
-  devices: auto
+  # Explicit int (NOT 'auto'): train.py derives the DDP world size from this on
+  # every rank at sampler-build time (env WORLD_SIZE isn't set in the rank-0
+  # parent yet). 'auto'/-1 are rejected under the SIGReg BatchNorm projector
+  # (can't know the count up front). run_all4.sh overrides to $NUM_GPU.
+  devices: 1
   accelerator: gpu
   precision: bf16
   gradient_clip_val: 1.0
+  # Multi-GPU: with devices>1 + strategy=ddp, SyncBatchNorm is REQUIRED for the
+  # SIGReg BatchNorm projector (else per-GPU BN stats silently diverge). When
+  # sync_batchnorm=true, train.py also makes SIGReg DDP-aware (all-reduce its
+  # moments) and shards the weighted sampler. Set true for multi-GPU runs.
+  sync_batchnorm: false
 
 loader:
   batch_size: 128

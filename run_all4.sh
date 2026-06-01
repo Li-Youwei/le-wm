@@ -42,8 +42,22 @@ SEED="${SEED:-3072}"
 MAX_STEPS="${MAX_STEPS:-100000}"
 VAL_INTERVAL="${VAL_INTERVAL:-4000}"
 WARMUP_STEPS="${WARMUP_STEPS:-4000}"       # informational only — effective warmup is computed in train.py as min(4000, 0.04*max_steps)
-BATCH_SIZE="${BATCH_SIZE:-128}"
+BATCH_SIZE="${BATCH_SIZE:-128}"           # PER-GPU micro-batch (lower to what fits, e.g. 16/32; BN+SIGReg need the per-forward batch >=32 → use GRAD_CKPT and/or NUM_GPU)
 NUM_WORKERS="${NUM_WORKERS:-6}"            # dataloader workers; raise on many-core hosts to keep the GPU fed
+
+# --- Batch/memory/multi-GPU knobs (added for the finetuned-encoder retrain) ---
+# The finetuned DINOv2 + D384/depth12 model OOMs above ~16/GPU. To hit
+# effective batch 64/128 while satisfying the BN/SIGReg per-forward batch>=32:
+#   1 GPU : GRAD_CKPT=true raises the per-forward batch to >=32; ACCUM grows the
+#           effective optimizer batch (ACCUM does NOT help BN/SIGReg).
+#   >=2 GPU: SYNC_BN syncs BN across ranks + SIGReg all-reduces → per-forward
+#           batch = BATCH_SIZE*NUM_GPU; ACCUM multiplies the optimizer batch.
+NUM_GPU="${NUM_GPU:-1}"                    # trainer.devices; >1 enables DDP (auto sync_batchnorm)
+ACCUM="${ACCUM:-1}"                        # accumulate_grad_batches (effective opt batch = BATCH_SIZE*ACCUM*NUM_GPU)
+GRAD_CKPT="${GRAD_CKPT:-true}"            # gradient checkpointing on the finetuned encoder (memory↓, ~30% slower)
+# SyncBatchNorm: required for the SIGReg BatchNorm projector under DDP. Auto-on
+# when NUM_GPU>1; override SYNC_BN to force.
+if [[ "$NUM_GPU" -gt 1 ]]; then SYNC_BN="${SYNC_BN:-true}"; else SYNC_BN="${SYNC_BN:-false}"; fi
 
 # Architecture toggles. Defaults: full 16x16 visual patch grid, shared
 # predictor (override USE_MOT=true for MoT), frozen DINOv2-base backbone.
@@ -139,7 +153,10 @@ python train.py \
     loss.pred_weight="$PRED" \
     loss.sigreg_weight="$SIGREG" \
     projector.norm_type="$NORM" \
-    trainer.devices=1 \
+    trainer.devices="$NUM_GPU" \
+    trainer.sync_batchnorm="$SYNC_BN" \
+    accumulate_grad_batches="$ACCUM" \
+    vision_encoder.gradient_checkpointing="$GRAD_CKPT" \
     +trainer.max_steps="$MAX_STEPS" \
     trainer.max_epochs=999 \
     +trainer.val_check_interval="$VAL_INTERVAL" \
