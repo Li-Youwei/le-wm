@@ -115,8 +115,39 @@ def lejepa_forward(self, batch, stage, cfg):
         reduction="none",
     ).reshape(B, num_action_positions)
     valid_mask = (targets != -100).float()
-    n_valid_total = valid_mask.sum().clamp(min=1)
-    output["ce_loss"] = (ce_per_token * valid_mask).sum() / n_valid_total
+    n_valid_local = valid_mask.sum()
+    ce_sum_local = (ce_per_token * valid_mask).sum()
+    # Token-mean CE that is EXACT across GPU counts (for accumulate_grad_batches
+    # == 1). The naive per-rank sum/local-count then DDP-averaged is NOT equal to
+    # a single big-batch token-mean when ranks have unequal valid-token counts
+    # (FAST seqs vary in length) — each rank's tokens get weighted by 1/n_local
+    # instead of the global 1/n_global. Fix: normalize by the GLOBAL token count
+    # (SUM-reduced across ranks, non-differentiable) and multiply by world_size
+    # to cancel DDP's gradient averaging (÷W). Single-GPU (W=1, n_global=n_local)
+    # is bit-identical to the original sum/count. Stage="fit" only — val keeps
+    # the plain per-batch mean (no backward, comparable per-task numbers).
+    # CAVEAT: under gradient accumulation (accum>1) each micro-batch is
+    # normalized by ITS OWN n_global (the streaming accumulator can't know the
+    # window's total token count up front), so the token-mean is APPROXIMATE
+    # along the accumulation axis — same ~1-4% variance as the cross-GPU case,
+    # and no worse than the old code (which was approximate on both axes). Exact
+    # only at accum=1. The *world factor assumes DDP syncs gradients every
+    # micro-batch (spt's manual-opt training_step does manual_backward without a
+    # no_sync() wrapper, so this holds).
+    import torch.distributed as _dist
+
+    if (
+        stage == "fit"
+        and _dist.is_available()
+        and _dist.is_initialized()
+        and _dist.get_world_size() > 1
+    ):
+        world = _dist.get_world_size()
+        n_global = n_valid_local.detach().clone()
+        _dist.all_reduce(n_global, op=_dist.ReduceOp.SUM)
+        output["ce_loss"] = ce_sum_local * world / n_global.clamp(min=1)
+    else:
+        output["ce_loss"] = ce_sum_local / n_valid_local.clamp(min=1)
     # Per-sample mean (each sample weighted equally regardless of token count).
     n_valid_per_sample = valid_mask.sum(dim=1).clamp(min=1)
     output["ce_per_sample"] = (
