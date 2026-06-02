@@ -309,7 +309,17 @@ def lejepa_forward(self, batch, stage, cfg):
                     ce_per_sample[mask].mean(),
                     on_step=False,
                     on_epoch=True,
-                    sync_dist=True,
+                    # sync_dist=False is REQUIRED under DDP: the set of task_ids
+                    # present differs per rank/batch, so sync_dist=True would emit
+                    # a per-rank-VARIABLE number of all_reduce collectives → the
+                    # ranks desync (mismatched collective fingerprints) and NCCL
+                    # hangs at the next collective. The val loader is unsharded
+                    # (use_distributed_sampler=False) so every rank already sees
+                    # the FULL val set; rank-0's local per-task CE is the global
+                    # value, and TaskBalancedCEMetric reads it from callback_metrics
+                    # (then logs ce_loss_taskbal once with sync_dist=True — a single
+                    # fixed collective, safe).
+                    sync_dist=False,
                 )
 
     return output
@@ -868,7 +878,13 @@ def run(cfg):
     trainer = pl.Trainer(
         **trainer_kwargs,
         callbacks=callbacks,
-        num_sanity_val_steps=1,
+        # 0 (not 1): under DDP the pre-train sanity val runs the custom
+        # lejepa_forward (manual SIGReg/CE collectives) interleaved with
+        # Lightning's own setup collectives (dataloader-length reduce, etc.),
+        # and the two ranks scramble collective order → NCCL desync/hang before
+        # the first train step. Skipping the sanity check avoids it; periodic
+        # validation is fine (per-task CE log is sync_dist=False — see above).
+        num_sanity_val_steps=0,
         logger=logger,
         enable_checkpointing=True,
     )

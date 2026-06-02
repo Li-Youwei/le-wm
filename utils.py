@@ -192,7 +192,15 @@ class TaskBalancedCEMetric(Callback):
             mean_ce,
             on_step=False,
             on_epoch=True,
-            sync_dist=True,
+            # sync_dist=False is REQUIRED: this log runs INSIDE the
+            # `if not trainer.is_global_zero: return` guard above, so only rank 0
+            # reaches it. sync_dist=True would make ONLY rank 0 issue an
+            # all_reduce that the other ranks never join → NCCL collective
+            # mismatch (Float value/Long count vs the other ranks' next
+            # collective) → DDP hang. The val loader is unsharded
+            # (use_distributed_sampler=False) so rank 0 already aggregated the
+            # FULL val set's per-task CE; its local value IS the global one.
+            sync_dist=False,
         )
 
 
