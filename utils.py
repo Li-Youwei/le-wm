@@ -58,6 +58,8 @@ class ModelObjectCallBack(Callback):
         epoch_interval: int | None = 1,
         step_interval: int | None = None,
         top_k: int = 3,
+        keep_all: bool = False,
+        save_on_train_step: bool = False,
     ):
         super().__init__()
         self.dirpath = Path(dirpath)
@@ -65,8 +67,11 @@ class ModelObjectCallBack(Callback):
         self.epoch_interval = epoch_interval
         self.step_interval = step_interval
         self.top_k = max(1, int(top_k))
+        self.keep_all = bool(keep_all)
+        self.save_on_train_step = bool(save_on_train_step)
         # (score, step, path) — kept sorted by score ascending; lower CE = better.
         self._top_k_heap: list[tuple[float, int, Path]] = []
+        self._saved_steps: set[int] = set()
 
     def on_train_epoch_end(self, trainer, pl_module):
         super().on_train_epoch_end(trainer, pl_module)
@@ -105,8 +110,29 @@ class ModelObjectCallBack(Callback):
             score_val = metrics.get("validate/ce_loss_epoch")
         score = float(score_val) if score_val is not None else float("inf")
 
+        self._save_step_checkpoint(score, step, pl_module.model)
+
+    def on_train_batch_end(self, trainer, pl_module, outputs, batch, batch_idx):
+        if not self.save_on_train_step or self.step_interval is None:
+            return
+        if not trainer.is_global_zero:
+            return
+        step = int(trainer.global_step)
+        if step == 0 or step in self._saved_steps:
+            return
+        if step % int(self.step_interval) != 0:
+            return
+        self._save_step_checkpoint(float(step), step, pl_module.model)
+
+    def _save_step_checkpoint(self, score: float, step: int, model) -> None:
+        if step in self._saved_steps:
+            return
         path = self.dirpath / f"{self.filename}_step_{step}_object.ckpt"
-        self._dump_model(pl_module.model, path)
+        self._dump_model(model, path)
+        self._saved_steps.add(step)
+        if self.keep_all:
+            self._refresh_latest_link_to(path)
+            return
         self._update_top_k(score, step, path)
         # Re-point `lewm_latest_object.ckpt` at the highest-step file still on
         # disk after eviction. Previously the symlink was always set to the
@@ -159,6 +185,15 @@ class ModelObjectCallBack(Callback):
         most_recent = max(self._top_k_heap, key=lambda triple: triple[1])
         target = most_recent[2]
         try:
+            latest_link.symlink_to(target.name)
+        except OSError:
+            pass
+
+    def _refresh_latest_link_to(self, target: Path) -> None:
+        latest_link = self.dirpath / f"{self.filename}_latest_object.ckpt"
+        try:
+            if latest_link.exists() or latest_link.is_symlink():
+                latest_link.unlink()
             latest_link.symlink_to(target.name)
         except OSError:
             pass

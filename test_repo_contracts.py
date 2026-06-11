@@ -59,12 +59,81 @@ class RepositoryContractsTest(unittest.TestCase):
     def test_run_all4_forwards_warmup_steps_to_hydra(self) -> None:
         script_text = (ROOT / "run_all4.sh").read_text()
         self.assertIn("scheduler.warmup_steps", script_text)
+        self.assertIn('+ckpt_top_k="$CKPT_TOP_K"', script_text)
+        self.assertIn('list_full_ckpts()', script_text)
+        self.assertIn('eval_checkpoint "final"', script_text)
         self.assertIn('--num-episodes "$EVAL_EPISODES"', script_text)
         self.assertIn('--camera-size "$CAMERA_SIZE"', script_text)
         self.assertIn(
             'CKPT_DIR="${CKPT_ROOT}/all4_${ARM}${ARCH_SUFFIX}_split${SPLIT_MODE}_seed${SEED}"',
             script_text,
         )
+
+    def test_pretrained_all4_script_matches_paper_grid_contract(self) -> None:
+        script_text = (ROOT / "run_all4_pretrained_vision.sh").read_text()
+        self.assertIn("all4_sp_sigreg_dinov2_frozen_visual17_patch_sp_mot)", script_text)
+        self.assertIn("STATE_ARCH_DEFAULT=mot", script_text)
+        self.assertIn("POOL_GRID_DEFAULT=4", script_text)
+        self.assertIn("PATCH_SP_DEFAULT=true", script_text)
+        self.assertIn('SPLIT_MODE="${SPLIT_MODE:-demo_90_10}"', script_text)
+        self.assertIn('CKPT_TOP_K="${CKPT_TOP_K:-6}"', script_text)
+        self.assertIn(
+            'CKPT_DIR="${CKPT_ROOT}/${ARM}_split${SPLIT_MODE}_seed${SEED}"',
+            script_text,
+        )
+        self.assertIn("split_mode=\"$SPLIT_MODE\"", script_text)
+        self.assertIn('+ckpt_top_k="$CKPT_TOP_K"', script_text)
+        self.assertIn('--top-k "$CKPT_TOP_K"', script_text)
+        self.assertIn('list_full_ckpts()', script_text)
+        self.assertIn('eval_checkpoint "final"', script_text)
+        self.assertIn('"$RANK"', script_text)
+
+    def test_full_split_saves_periodic_step_checkpoints_for_eval(self) -> None:
+        train_source = (ROOT / "train.py").read_text()
+        utils_source = (ROOT / "utils.py").read_text()
+        self.assertIn("save_on_train_step=val is None", train_source)
+        self.assertIn("keep_all=val is None", train_source)
+        self.assertIn("def on_train_batch_end", utils_source)
+        self.assertIn("if self.keep_all:", utils_source)
+
+    def test_full_split_disables_lightning_validation_loop(self) -> None:
+        train_source = (ROOT / "train.py").read_text()
+        self.assertIn("trainer_kwargs = OmegaConf.to_container", train_source)
+        self.assertIn('trainer_kwargs.pop("val_check_interval", None)', train_source)
+        self.assertIn('trainer_kwargs.pop("check_val_every_n_epoch", None)', train_source)
+        self.assertIn('trainer_kwargs["limit_val_batches"] = 0', train_source)
+
+    def test_paper_grid_launcher_runs_four_single_gpu_experiments(self) -> None:
+        script_text = (ROOT / "launch_paper_baseline_grid.sh").read_text()
+        self.assertIn("all4_sp_sigreg_dinov2_frozen_visual17_patch_sp", script_text)
+        self.assertIn("all4_sp_sigreg_dinov2_frozen_visual17_patch_sp_mot", script_text)
+        self.assertIn("demo_90_10", script_text)
+        self.assertIn("full", script_text)
+        for gpu in ("0", "1", "2", "3"):
+            self.assertIn(f"CUDA_VISIBLE_DEVICES={gpu}", script_text)
+
+    def test_paper_grid_launcher_accepts_hf_repo_id_vision_encoder(self) -> None:
+        script_text = (ROOT / "launch_paper_baseline_grid.sh").read_text()
+        self.assertIn('VISION_ENCODER="${VISION_ENCODER:-facebook/dinov2-base}"', script_text)
+        self.assertIn("AutoConfig.from_pretrained(sys.argv[1], local_files_only=True)", script_text)
+        self.assertNotIn('[[ -d "$VISION_ENCODER" ]] || { echo "ERROR: VISION_ENCODER missing', script_text)
+
+    def test_server_pipeline_launches_paper_grid_after_data_prep(self) -> None:
+        script_text = (ROOT / "server_paper_baseline_pipeline.sh").read_text()
+        self.assertIn("models--facebook--dinov2-base", script_text)
+        self.assertIn('AutoModel.from_pretrained("facebook/dinov2-base"', script_text)
+        self.assertIn("bash launch_paper_baseline_grid.sh", script_text)
+        self.assertNotIn(
+            'bash run_all4.sh 2>&1 | tee "$LOG_DIR/04_train_eval_all4.log"',
+            script_text,
+        )
+
+    def test_server_pipeline_copies_local_dinov2_into_fresh_root(self) -> None:
+        script_text = (ROOT / "server_paper_baseline_pipeline.sh").read_text()
+        self.assertIn('LOCAL_VISION_ENCODER_SOURCE="${LOCAL_VISION_ENCODER_SOURCE:-/Data/lyw/hf_models/facebook-dinov2-base}"', script_text)
+        self.assertIn('VISION_ENCODER="${VISION_ENCODER:-$DATA_ROOT/hf_models/facebook-dinov2-base}"', script_text)
+        self.assertIn('cp -a "$LOCAL_VISION_ENCODER_SOURCE" "$vision_parent/"', script_text)
+        self.assertIn('AutoModel.from_pretrained(os.environ["VISION_ENCODER"], local_files_only=True)', script_text)
 
     def test_run_suite_policy_script_exists_and_uses_suite_eval_protocol(self) -> None:
         script_text = (ROOT / "run_suite_policy.sh").read_text()

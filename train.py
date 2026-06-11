@@ -727,9 +727,7 @@ def run(cfg):
     max_steps_cfg = int(trainer_cfg.get("max_steps", -1))
     val_check_int = trainer_cfg.get("val_check_interval", None)
     step_save_interval = (
-        int(val_check_int)
-        if (val is not None and max_steps_cfg > 0 and val_check_int is not None)
-        else None
+        int(val_check_int) if (max_steps_cfg > 0 and val_check_int is not None) else None
     )
     object_dump_callback = ModelObjectCallBack(
         dirpath=run_dir,
@@ -737,6 +735,8 @@ def run(cfg):
         epoch_interval=None if val is None else 1,
         step_interval=step_save_interval,
         top_k=int(cfg.get("ckpt_top_k", 3)),
+        keep_all=val is None,
+        save_on_train_step=val is None,
     )
 
     callbacks = [object_dump_callback]
@@ -771,8 +771,17 @@ def run(cfg):
         print_every = int(cfg.get("overfit_print_every", 100))
         callbacks.append(PeriodicPrintCallback(every_n_epochs=print_every))
 
+    trainer_kwargs = OmegaConf.to_container(cfg.trainer, resolve=True)
+    if val is None:
+        # Full-data training has no held-out val loader. Keep step checkpointing
+        # via ModelObjectCallBack, but prevent Lightning from constructing its
+        # validation loop for stable_pretraining's DataModule(val=None).
+        trainer_kwargs.pop("val_check_interval", None)
+        trainer_kwargs.pop("check_val_every_n_epoch", None)
+        trainer_kwargs["limit_val_batches"] = 0
+
     trainer = pl.Trainer(
-        **cfg.trainer,
+        **trainer_kwargs,
         callbacks=callbacks,
         num_sanity_val_steps=0 if val is None else 1,
         logger=logger,
