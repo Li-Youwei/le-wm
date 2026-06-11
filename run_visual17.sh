@@ -15,6 +15,8 @@ SEED="${SEED:-3072}"
 MAX_STEPS="${MAX_STEPS:-50000}"
 VAL_INTERVAL="${VAL_INTERVAL:-2000}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
+EVAL_EPISODES="${EVAL_EPISODES:-50}"
+CAMERA_SIZE="${CAMERA_SIZE:-224}"
 POOL_GRID="${POOL_GRID:-4}"
 
 SPATIAL_DIR="${SPATIAL_DIR:-/Data/lyw/libero_processed_v5/libero_spatial}"
@@ -89,8 +91,8 @@ python eval_libero.py \
     --tokenizer "$TOKENIZER" \
     --processed-dir "$SPATIAL_DIR" \
     --suite libero_spatial \
-    --num-episodes 20 \
-    --max-steps 300 \
+    --num-episodes "$EVAL_EPISODES" \
+    --camera-size "$CAMERA_SIZE" \
     --device cuda \
     --seed "$SEED" \
     2>&1 | tee "$EVAL_LOG"

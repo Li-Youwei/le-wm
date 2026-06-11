@@ -9,17 +9,17 @@ Usage:
     python eval_libero.py \
         --checkpoint /Data/lyw/stable-wm/lewm_weights.ckpt \
         --tokenizer /Data/lyw/fast_tokenizer \
-        --processed-dir /Data/lyw/libero_processed/libero_90 \
+        --processed-dir /Data/lyw/libero_processed_v5/libero_spatial \
         --suite libero_spatial --task-id 0 \
-        --num-episodes 20
+        --num-episodes 50
 
     # All tasks in a suite
     python eval_libero.py \
         --checkpoint /Data/lyw/stable-wm/lewm_weights.ckpt \
         --tokenizer /Data/lyw/fast_tokenizer \
-        --processed-dir /Data/lyw/libero_processed/libero_90 \
+        --processed-dir /Data/lyw/libero_processed_v5/libero_spatial \
         --suite libero_spatial \
-        --num-episodes 20
+        --num-episodes 50
 """
 
 from __future__ import annotations
@@ -45,6 +45,15 @@ from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
 from fast_utils import denormalize_actions, fast_decode, load_fast_processor
+from libero_baseline_protocol import (
+    DEFAULT_CAMERA_SIZE,
+    DEFAULT_EVAL_EPISODES,
+    DEFAULT_NUM_STEPS_WAIT,
+    DUMMY_ACTION,
+    SUITE_MAX_STEPS,
+    get_suite_max_steps,
+    rotate_image_180,
+)
 from libero_dataset import _preprocess_image
 from preprocess_libero import normalize_proprio
 
@@ -313,12 +322,15 @@ def preprocess_obs(
         pixels_hand: (1, 3, img_size, img_size) hand tensor.
         proprio: (1, 9) proprioceptive state tensor.
     """
-    # Agentview image
-    img_agent = _preprocess_image(obs["agentview_image"], img_size)
+    # Agentview image — OpenVLA / WorldVLA rotate LIBERO camera images by 180 deg.
+    img_agent = _preprocess_image(rotate_image_180(obs["agentview_image"]), img_size)
     pixels_agent = img_agent.unsqueeze(0).to(device)
 
-    # Eye-in-hand image
-    img_hand = _preprocess_image(obs["robot0_eye_in_hand_image"], img_size)
+    # Eye-in-hand image — same rotation as training preprocessing.
+    img_hand = _preprocess_image(
+        rotate_image_180(obs["robot0_eye_in_hand_image"]),
+        img_size,
+    )
     pixels_hand = img_hand.unsqueeze(0).to(device)
 
     # 9D proprio — no averaging / no abs on the gripper.
@@ -392,6 +404,22 @@ def _read_osc_scales(env: OffScreenRenderEnv) -> tuple[float, float]:
     return pos_scale, rot_scale
 
 
+def _seed_env(env: OffScreenRenderEnv, seed: int) -> None:
+    """Best-effort seed for LIBERO / robosuite env variants."""
+    for candidate in (env, getattr(env, "env", None)):
+        if candidate is None or not hasattr(candidate, "seed"):
+            continue
+        try:
+            candidate.seed(seed)
+        except TypeError:
+            try:
+                candidate.seed(seed=seed)
+            except Exception:
+                continue
+        except Exception:
+            continue
+
+
 def _execute_chunk_closed_loop(
     env: OffScreenRenderEnv,
     obs: dict,
@@ -399,7 +427,9 @@ def _execute_chunk_closed_loop(
     pos_scale: float,
     rot_scale: float,
     frames: list[np.ndarray] | None,
-) -> tuple[dict, float, bool, dict]:
+    *,
+    max_chunk_steps: int | None = None,
+) -> tuple[dict, float, bool, dict, int]:
     """Execute an anchor-relative action chunk in closed-loop against the env.
 
     Args:
@@ -413,10 +443,14 @@ def _execute_chunk_closed_loop(
         pos_scale, rot_scale: robosuite OSC output_max[0] / [3], read once
             per task via `_read_osc_scales`.
         frames: optional list to append agentview images to for video capture.
+        max_chunk_steps: optional cap on raw env steps for this chunk. Used at
+            the end of an episode so evaluation never steps past
+            max_steps + num_steps_wait.
 
     Returns:
-        obs, reward (scalar), done (bool), info dict — the values returned by
-        the last env.step inside the chunk (or the first one that reports done).
+        obs, reward (scalar), done (bool), info dict, steps_executed — the
+        values returned by the last env.step inside the chunk (or the first one
+        that reports done).
 
     Closed-loop logic: for each step k we compute the target pose relative to
     the snapshotted anchor, then read the robot's current pose from the env and
@@ -433,6 +467,9 @@ def _execute_chunk_closed_loop(
     done = False
     info: dict = {}
     H = chunk.shape[0]
+    if max_chunk_steps is not None:
+        H = min(H, max(0, int(max_chunk_steps)))
+    steps_executed = 0
     for h in range(H):
         # Anchor-relative target derived from the predicted displacement
         target_pos = anchor_pos + chunk[h, 0:3]
@@ -460,12 +497,13 @@ def _execute_chunk_closed_loop(
         ).astype(np.float32)
 
         obs, reward, done, info = env.step(action_input)
+        steps_executed += 1
         if frames is not None:
             frames.append(obs["agentview_image"])
         if done:
             break
 
-    return obs, reward, done, info
+    return obs, reward, done, info, steps_executed
 
 
 @torch.no_grad()
@@ -481,9 +519,10 @@ def evaluate_task(
     action_dim: int,
     language_instruction: str,
     *,
-    num_episodes: int = 20,
+    num_episodes: int = DEFAULT_EVAL_EPISODES,
     max_steps: int = 300,
-    img_size: int = 224,
+    num_steps_wait: int = DEFAULT_NUM_STEPS_WAIT,
+    img_size: int = DEFAULT_CAMERA_SIZE,
     max_lang_tokens: int = 25,
     device: torch.device = torch.device("cuda"),
     temperature: float = 0.0,
@@ -495,7 +534,7 @@ def evaluate_task(
 ) -> tuple[int, int]:
     """Run episodes and count successes."""
     successes = 0
-    max_chunks = max_steps // chunk_size
+    total_step_budget = int(max_steps) + int(num_steps_wait)
 
     # Read OSC scales once per task from the running controller (not hardcoded).
     pos_scale, rot_scale = _read_osc_scales(env)
@@ -512,90 +551,128 @@ def evaluate_task(
     else:
         lang_ids, lang_mask = None, None
 
+    if temperature > 0:
+        print(
+            f"  Sampling decode enabled: temperature={temperature}, "
+            "seed controlled by --seed."
+        )
+
     for ep in range(num_episodes):
-        # Reset with deterministic initial state
-        env.reset()
-        init_idx = ep % len(init_states)
-        obs = env.set_init_state(init_states[init_idx])
-
-        # Collect frames for video (first N episodes only)
-        recording = save_videos and ep < max_video_episodes
-        frames: list[np.ndarray] | None = [] if recording else None
-        if recording:
-            frames.append(obs["agentview_image"])
-
-        reward = 0.0
         done = False
-        for _ in range(max_chunks):
-            # Preprocess observation (dual-view + proprio)
-            pixels_agent, pixels_hand, proprio = preprocess_obs(obs, img_size, device)
+        frames: list[np.ndarray] | None = None
+        recording = save_videos and ep < max_video_episodes
+        exception_msg: str | None = None
+        try:
+            if ep >= len(init_states):
+                raise IndexError(
+                    f"LIBERO init_states has {len(init_states)} entries, "
+                    f"but episode {ep} requires init_states[{ep}]"
+                )
 
-            # Encode visual + language
-            z_agent, z_hand, lang_embeds, lang_lengths = model.encode(
-                pixels_agent,
-                pixels_hand,
-                lang_ids,
-                lang_mask,
-            )
+            # Reset with deterministic benchmark initial state: episode i uses
+            # initial_states[i], with no modulo or additional randomization.
+            env.reset()
+            obs = env.set_init_state(init_states[ep])
 
-            # Generate FAST action tokens
-            tokens, lengths = model.predict_actions(
-                z_agent,
-                z_hand,
-                proprio,
-                lang_embeds,
-                lang_lengths,
-                temperature=temperature,
-            )
+            # Collect frames for video (first N episodes only)
+            frames = [] if recording else None
+            if recording:
+                frames.append(obs["agentview_image"])
 
-            # Decode tokens → normalized → physical anchor-relative displacements
-            actions_norm = fast_decode(
-                tokens,
-                lengths,
-                processor,
-                time_horizon=chunk_size,
-                action_dim=action_dim,
-            )
-            actions_phys = denormalize_actions(actions_norm, action_low, action_high)
-            # actions_phys[0] is (H, 7) in physical units:
-            #   [0:3] = anchor-relative pos delta (m)
-            #   [3:6] = anchor-relative rot delta (rad, axis-angle)
-            #   [6]   = gripper cmd (unchanged)
+            t = 0
+            for _ in range(num_steps_wait):
+                obs, _reward, done, _info = env.step(
+                    np.asarray(DUMMY_ACTION, dtype=np.float32)
+                )
+                t += 1
+                if frames is not None:
+                    frames.append(obs["agentview_image"])
+                if done:
+                    break
 
-            # Gripper aux override: when the model was trained with the
-            # auxiliary gripper-command head, bypass FAST for dim 6 and
-            # take the direct regression head's output instead. This
-            # addresses the libero_object 0% failure where FAST joint BPE
-            # diluted the gripper signal — see CLAUDE.md diagnostic notes.
-            if getattr(model.predictor, "use_gripper_aux", False):
-                pred_grip = model.predict_gripper_aux(
+            while not done and t < total_step_budget:
+                remaining = total_step_budget - t
+                # Preprocess observation (dual-view + proprio)
+                pixels_agent, pixels_hand, proprio = preprocess_obs(
+                    obs,
+                    img_size,
+                    device,
+                )
+
+                # Encode visual + language
+                z_agent, z_hand, lang_embeds, lang_lengths = model.encode(
+                    pixels_agent,
+                    pixels_hand,
+                    lang_ids,
+                    lang_mask,
+                )
+
+                # Generate FAST action tokens
+                tokens, lengths = model.predict_actions(
                     z_agent,
                     z_hand,
                     proprio,
                     lang_embeds,
                     lang_lengths,
-                )  # (B=1, H)
-                actions_phys[0, :, 6] = _denormalize_gripper_aux(
-                    pred_grip[0].detach().cpu().numpy(),
-                    action_low,
-                    action_high,
+                    temperature=temperature,
                 )
 
-            obs, reward, done, _ = _execute_chunk_closed_loop(
-                env,
-                obs,
-                actions_phys[0],
-                pos_scale,
-                rot_scale,
-                frames,
-            )
-            if done:
-                break
+                # Decode tokens → normalized → physical anchor-relative displacements
+                actions_norm = fast_decode(
+                    tokens,
+                    lengths,
+                    processor,
+                    time_horizon=chunk_size,
+                    action_dim=action_dim,
+                )
+                actions_phys = denormalize_actions(actions_norm, action_low, action_high)
+                # actions_phys[0] is (H, 7) in physical units:
+                #   [0:3] = anchor-relative pos delta (m)
+                #   [3:6] = anchor-relative rot delta (rad, axis-angle)
+                #   [6]   = gripper cmd (unchanged)
 
-        success = reward > 0
+                # Gripper aux override: when the model was trained with the
+                # auxiliary gripper-command head, bypass FAST for dim 6 and
+                # take the direct regression head's output instead. This
+                # addresses the libero_object 0% failure where FAST joint BPE
+                # diluted the gripper signal — see CLAUDE.md diagnostic notes.
+                if getattr(model.predictor, "use_gripper_aux", False):
+                    pred_grip = model.predict_gripper_aux(
+                        z_agent,
+                        z_hand,
+                        proprio,
+                        lang_embeds,
+                        lang_lengths,
+                    )  # (B=1, H)
+                    actions_phys[0, :, 6] = _denormalize_gripper_aux(
+                        pred_grip[0].detach().cpu().numpy(),
+                        action_low,
+                        action_high,
+                    )
+
+                obs, _reward, done, _info, steps_executed = _execute_chunk_closed_loop(
+                    env,
+                    obs,
+                    actions_phys[0],
+                    pos_scale,
+                    rot_scale,
+                    frames,
+                    max_chunk_steps=remaining,
+                )
+                if steps_executed <= 0:
+                    break
+                t += steps_executed
+        except Exception as exc:  # noqa: BLE001
+            done = False
+            exception_msg = str(exc)
+
+        success = bool(done)
         if success:
             successes += 1
-        print(f"  Episode {ep}: {'SUCCESS' if success else 'FAIL'}")
+        status = "SUCCESS" if success else "FAIL"
+        if exception_msg is not None:
+            status = f"{status} (exception: {exception_msg})"
+        print(f"  Episode {ep}: {status}")
 
         # Save video
         if recording and frames and video_dir is not None:
@@ -663,7 +740,6 @@ def main():
             "libero_object",
             "libero_goal",
             "libero_10",
-            "libero_90",
         ],
         help="LIBERO task suite",
     )
@@ -674,18 +750,32 @@ def main():
         help="Single task index (0-9). Omit to run all tasks in suite",
     )
     parser.add_argument(
-        "--num-episodes", type=int, default=20, help="Episodes per task"
+        "--num-episodes",
+        type=int,
+        default=DEFAULT_EVAL_EPISODES,
+        help="Episodes per task (50 gives 500 trials per suite).",
     )
     parser.add_argument(
-        "--max-steps", type=int, default=300, help="Max raw steps per episode"
+        "--max-steps",
+        type=int,
+        default=None,
+        help=(
+            "Max raw policy steps per episode. Defaults by suite: "
+            f"{SUITE_MAX_STEPS}."
+        ),
+    )
+    parser.add_argument(
+        "--num-steps-wait",
+        type=int,
+        default=DEFAULT_NUM_STEPS_WAIT,
+        help="Initial dummy-action settling steps before policy rollout.",
     )
     parser.add_argument(
         "--camera-size",
         type=int,
-        default=128,
+        default=DEFAULT_CAMERA_SIZE,
         help="LIBERO camera resolution (env render size). "
-        "Must match the resolution of images stored in preprocessed "
-        "training HDF5 (LIBERO default: 128).",
+        "Must match this model's input resolution (default: 224).",
     )
     parser.add_argument("--device", type=str, default="cuda")
     parser.add_argument(
@@ -726,6 +816,21 @@ def main():
 
     device = torch.device(args.device)
     np.random.seed(args.seed)
+    torch.manual_seed(args.seed)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(args.seed)
+    effective_max_steps = (
+        get_suite_max_steps(args.suite) if args.max_steps is None else int(args.max_steps)
+    )
+    if args.temperature <= 0:
+        print("Decoding: greedy (temperature=0.0), deterministic for fixed init states.")
+    else:
+        print(f"Decoding: sampling (temperature={args.temperature}, seed={args.seed}).")
+    print(
+        f"Eval protocol: suite={args.suite}, episodes/task={args.num_episodes}, "
+        f"max_steps={effective_max_steps}, wait={args.num_steps_wait}, "
+        f"camera={args.camera_size}"
+    )
 
     # Load model — two formats supported:
     #   _weights.ckpt  = Lightning state_dict (from spt.Manager)
@@ -799,6 +904,7 @@ def main():
             camera_heights=args.camera_size,
             camera_widths=args.camera_size,
         )
+        _seed_env(env, args.seed)
         init_states = task_suite.get_task_init_states(task_id)
 
         try:
@@ -814,7 +920,9 @@ def main():
                 action_dim,
                 language_instruction,
                 num_episodes=args.num_episodes,
-                max_steps=args.max_steps,
+                max_steps=effective_max_steps,
+                num_steps_wait=args.num_steps_wait,
+                img_size=args.camera_size,
                 device=device,
                 temperature=args.temperature,
                 save_videos=args.save_videos,
@@ -848,6 +956,8 @@ def main():
         )
     if total_episodes > 0:
         overall = total_successes / total_episodes * 100
+        sr = total_successes / total_episodes
+        print(f"\n  SR: {total_successes}/{total_episodes} = {sr:.4f}")
         print(f"\n  Overall: {total_successes}/{total_episodes} ({overall:.1f}%)")
 
 

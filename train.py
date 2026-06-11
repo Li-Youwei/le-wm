@@ -478,21 +478,41 @@ def run(cfg):
         train_indices = overfit_indices
         val_indices = list(overfit_indices)
     else:
+        split_mode = str(cfg.get("split_mode", "demo_90_10"))
         unique_demo_keys = sorted(set(demo_keys))
-        n_train_demos = int(len(unique_demo_keys) * cfg.train_split)
-        perm = torch.randperm(len(unique_demo_keys), generator=rnd_gen).tolist()
-        train_demo_set = {unique_demo_keys[perm[i]] for i in range(n_train_demos)}
+        if split_mode == "full":
+            train_indices = list(range(len(dataset)))
+            val_indices = None
+            print(
+                f"[Split] full: using all {len(unique_demo_keys)} unique "
+                f"(task, demo) pairs for training. Train chunks: "
+                f"{len(train_indices)}. No held-out validation loader."
+            )
+        elif split_mode == "demo_90_10":
+            n_train_demos = int(len(unique_demo_keys) * cfg.train_split)
+            perm = torch.randperm(len(unique_demo_keys), generator=rnd_gen).tolist()
+            train_demo_set = {unique_demo_keys[perm[i]] for i in range(n_train_demos)}
 
-        train_indices = [i for i, k in enumerate(demo_keys) if k in train_demo_set]
-        val_indices = [i for i, k in enumerate(demo_keys) if k not in train_demo_set]
-        print(
-            f"[Split] {len(unique_demo_keys)} unique (task, demo) pairs → "
-            f"{n_train_demos} train / {len(unique_demo_keys) - n_train_demos} val. "
-            f"Train chunks: {len(train_indices)}, val chunks: {len(val_indices)}."
-        )
+            train_indices = [i for i, k in enumerate(demo_keys) if k in train_demo_set]
+            val_indices = [i for i, k in enumerate(demo_keys) if k not in train_demo_set]
+            print(
+                f"[Split] demo_90_10: {len(unique_demo_keys)} unique "
+                f"(task, demo) pairs → {n_train_demos} train / "
+                f"{len(unique_demo_keys) - n_train_demos} val. Train chunks: "
+                f"{len(train_indices)}, val chunks: {len(val_indices)}."
+            )
+        else:
+            raise ValueError(
+                "split_mode must be 'demo_90_10' or 'full', got "
+                f"{split_mode!r}"
+            )
 
     train_set = torch.utils.data.Subset(dataset, train_indices)
-    val_set = torch.utils.data.Subset(dataset, val_indices)
+    val_set = (
+        None
+        if val_indices is None
+        else torch.utils.data.Subset(dataset, val_indices)
+    )
 
     # In overfit mode, keep every sample each epoch — drop_last=True could
     # discard the only batch when the sample count is smaller than batch_size.
@@ -528,8 +548,12 @@ def run(cfg):
             drop_last=train_drop_last,
             generator=rnd_gen,
         )
-    val = torch.utils.data.DataLoader(
-        val_set, **cfg.loader, shuffle=False, drop_last=False
+    val = (
+        None
+        if val_set is None
+        else torch.utils.data.DataLoader(
+            val_set, **cfg.loader, shuffle=False, drop_last=False
+        )
     )
 
     ##############################
@@ -704,25 +728,26 @@ def run(cfg):
     val_check_int = trainer_cfg.get("val_check_interval", None)
     step_save_interval = (
         int(val_check_int)
-        if (max_steps_cfg > 0 and val_check_int is not None)
+        if (val is not None and max_steps_cfg > 0 and val_check_int is not None)
         else None
     )
     object_dump_callback = ModelObjectCallBack(
         dirpath=run_dir,
         filename=cfg.output_model_name,
-        epoch_interval=1,
+        epoch_interval=None if val is None else 1,
         step_interval=step_save_interval,
         top_k=int(cfg.get("ckpt_top_k", 3)),
     )
 
     callbacks = [object_dump_callback]
 
-    # Task-balanced val CE metric — aggregates per-task scalars logged in
-    # lejepa_forward and writes validate/ce_loss_taskbal at val end. Used by
-    # pick_best_ckpt.py for ckpt selection under joint 4-suite training.
-    from utils import TaskBalancedCEMetric
+    if val is not None:
+        # Task-balanced val CE metric — aggregates per-task scalars logged in
+        # lejepa_forward and writes validate/ce_loss_taskbal at val end. Used by
+        # pick_best_ckpt.py for ckpt selection under joint 4-suite training.
+        from utils import TaskBalancedCEMetric
 
-    callbacks.append(TaskBalancedCEMetric())
+        callbacks.append(TaskBalancedCEMetric())
 
     # Online health probe at step 20K (Stage A: full 40-rollout breadth sweep).
     # Disabled by default; opt in via cfg.probe.enabled=true on the CLI.
@@ -749,7 +774,7 @@ def run(cfg):
     trainer = pl.Trainer(
         **cfg.trainer,
         callbacks=callbacks,
-        num_sanity_val_steps=1,
+        num_sanity_val_steps=0 if val is None else 1,
         logger=logger,
         enable_checkpointing=True,
     )

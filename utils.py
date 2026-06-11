@@ -55,7 +55,7 @@ class ModelObjectCallBack(Callback):
         self,
         dirpath,
         filename: str = "model_object",
-        epoch_interval: int = 1,
+        epoch_interval: int | None = 1,
         step_interval: int | None = None,
         top_k: int = 3,
     ):
@@ -71,7 +71,7 @@ class ModelObjectCallBack(Callback):
     def on_train_epoch_end(self, trainer, pl_module):
         super().on_train_epoch_end(trainer, pl_module)
         # In step-based mode, skip the per-epoch save (we save on val end instead).
-        if self.step_interval is not None:
+        if self.step_interval is not None or self.epoch_interval is None:
             return
 
         output_path = (
@@ -114,6 +114,19 @@ class ModelObjectCallBack(Callback):
         # evicted that file (e.g., when the latest step had the worst val CE
         # — typical near the end of an overfit run).
         self._refresh_latest_link()
+
+    def on_train_end(self, trainer, pl_module):
+        if not trainer.is_global_zero:
+            return
+        path = self.dirpath / f"{self.filename}_final_object.ckpt"
+        self._dump_model(pl_module.model, path)
+        latest_link = self.dirpath / f"{self.filename}_latest_object.ckpt"
+        try:
+            if latest_link.exists() or latest_link.is_symlink():
+                latest_link.unlink()
+            latest_link.symlink_to(path.name)
+        except OSError:
+            pass
 
     def _update_top_k(self, score: float, step: int, path: Path) -> None:
         self._top_k_heap.append((score, step, path))

@@ -41,14 +41,14 @@ instruction):
 
 | Input | Source | Encoder | Output | Frozen? |
 |-------|--------|---------|--------|---------|
-| Agentview image | `agentview_rgb` stored at 128×128 | ViT (LeWM encoder, patch_size=14) | `z_agent` (D,) | No, end-to-end |
-| Eye-in-hand image | `eye_in_hand_rgb` stored at 128×128 | Same ViT (shared weights) | `z_hand` (D,) | No, end-to-end |
+| Agentview image | `agentview_rgb` regenerated at 224×224 and rotated 180° | ViT (LeWM encoder, patch_size=14) | `z_agent` (D,) | No, end-to-end |
+| Eye-in-hand image | `eye_in_hand_rgb` regenerated at 224×224 and rotated 180° | Same ViT (shared weights) | `z_hand` (D,) | No, end-to-end |
 | Proprioception | Base-frame EE position(3) + base-frame EE orientation quaternion(4) + gripper state(2) = 9d | MLP → D | `z_proprio` (D,) | No |
 | Language instruction | Task description string | T5-small encoder | `l_1...l_n` (n, D) | **Yes, frozen** |
 
 `D` = embed_dim = 192 (LeWM default for ViT-Tiny). Two image views share the same ViT encoder (weight sharing). T5-small outputs are projected to D via a learned linear layer.
 
-**Image resolution chain**: Raw LIBERO images are 128×128. The ViT uses `patch_size=14`, which requires the input to be divisible by 14. The dataset transform must **resize 128→224** (matching LeWM's original training resolution of 224×224, where 224/14=16 patches per side). Do NOT feed 128×128 directly to the ViT — it won't divide evenly.
+**Image resolution chain**: For OpenVLA/WorldVLA-aligned LIBERO runs, raw official HDF5 demos are replayed in the simulator and re-rendered directly at the model input resolution, **224×224** (`camera_heights = camera_widths = 224`). The ViT uses `patch_size=14`, so 224 gives 16×16 patches. Both agentview and eye-in-hand images are rotated 180° via `img[::-1, ::-1]` during preprocessing and evaluation.
 
 **Proprioception rules (9d, verified):**
 - **Source keys**: `obs/ee_pos` (3d position, meters, base frame) + `robot_states[5:9]` (4d xyzw quaternion, verified against `scipy.from_rotvec(obs/ee_ori)` at 2e-16 precision) + `obs/gripper_states[0:2]` (2d raw finger positions) → 9d total.
@@ -602,6 +602,7 @@ for reference only, never imported by the VLA baseline.
 | Predictor dropout | 0.2 | Config overrides the class default of 0.1 |
 | `emb_dropout` | 0.0 | |
 | Proprio input dim | 9 | `ee_pos(3) + xyzw_quat(4) + gripper_raw(2)` |
+| Image resolution | 224×224 | Simulator renders directly at 224 for filtered data and eval; no post-render resize in the baseline protocol. |
 | Projector | `MLP(hidden_dim→2048→D)` with `LayerNorm` | Explicitly **not** BatchNorm — avoids train/eval statistics mismatch. Switch via `cfg.projector.norm_type='batch'`; **required** when `cfg.loss.sigreg_weight > 0` (LeWM paper Section 3). See "Known caveats of switching to BatchNorm projector". |
 | T5 variant | `t5-small`, fully frozen | 512-dim hidden, projected to D via trainable `lang_proj` |
 | Optimizer | `AdamW`, lr=5e-5, weight_decay=0.05 | `LinearWarmupCosineAnnealingLR` on epoch interval |
@@ -610,11 +611,29 @@ for reference only, never imported by the VLA baseline.
 | Precision | `bf16` mixed | |
 | Gradient clip | 1.0 | |
 | Label smoothing (CE) | 0.1 | Configurable via `cfg.label_smoothing`; 0 disables. CE floor ≈ 1.02 on a 1026-way vocab — read training curves against this floor, not zero. |
-| Train / val split | 0.9 / 0.1 | **Demo-level** (see `train.py`: reads `demo_idx` per file and partitions whole demos, not individual chunks) |
+| Train / val split | `split_mode=demo_90_10` default | **Demo-level** 0.9 / 0.1. Set `split_mode=full` to train on every filtered demo for OpenVLA/WorldVLA alignment ablations; evaluate `lewm_final_object.ckpt` / latest instead of best-val. |
 | Logging | TensorBoard | `lightning.pytorch.loggers.TensorBoardLogger`, view with `tensorboard --logdir <run_dir>/tb_logs` |
 | `loss.pred_weight` | 0.0 | > 0 enables state prediction (3 STATE_QUERY tokens + 3 MSE losses). Paper-default starting point: `1.0`. See "State-Prediction Extension". |
 | `loss.sigreg_weight` | 0.0 | > 0 enables SIGReg anti-collapse on encoder outputs. Paper default: `0.1` (Section 3). Forces `projector.norm_type='batch'`. |
 | `loss.sigreg.kwargs` | `knots=17, num_proj=1024` | Paper defaults; safe to leave alone (paper Fig. 15: barely sensitive to either). |
+
+## LIBERO Baseline Evaluation Protocol
+
+Final LIBERO evaluation follows the OpenVLA/WorldVLA protocol implemented in
+`eval_libero.py`:
+
+- **Scale**: 10 tasks × 50 rollouts = 500 trials per suite; SR = successes / 500.
+- **Initial states**: episode `i` uses `task_suite.get_task_init_states(task_id)[i]`.
+  No modulo and no extra randomization.
+- **Step caps**: `libero_spatial=220`, `libero_object=280`, `libero_goal=300`,
+  `libero_10=520`, excluding the initial settling wait.
+- **Settling wait**: 10 dummy actions `[0, 0, 0, 0, 0, 0, -1]`; rollout stops at
+  `t < max_steps + 10`.
+- **Rendering**: `camera_heights = camera_widths = 224`, matching model input.
+- **Success**: `env.step(...)` returning `done=True` is success and ends the
+  rollout. Timeout or rollout exception is failure.
+- **Decoding**: `temperature=0.0` is greedy/deterministic; sampling runs must
+  report temperature and seed.
 
 ## Ablation Modes
 
@@ -706,7 +725,7 @@ that case (`z_ag_t`, `z_hd_t`).
 
 ## Key Details
 
-- **Data layout**: training HDF5 under `${STABLEWM_HOME}/libero/`; per-suite preprocessed output under `${DATA_ROOT}/libero_processed/<suite>/` (one `.h5` per task — the **directory** is what `LiberoDataset` consumes for joint training, not individual files). Frozen baseline checkpoint lives at `/Data/lyw/checkpoints/multitask_ln_100ep/lewm_weights.ckpt` (single ckpt joint-trained on the suite). 4-suite joint training uses a flat-symlink dir `${DATA_ROOT}/libero_processed_v5/all4_flat/` so `LiberoDataset` can glob all 40 `.h5` from one root — see `run_all4.sh`.
+- **Data layout**: official LIBERO HDF5 lives under `/nas_data_new/caz/data_ssd/libero/`; OpenVLA-style regenerated/no-noop HDF5 defaults to `/Data/lyw/libero_filtered_224/<suite>/`; per-suite preprocessed output defaults to `/Data/lyw/libero_processed_v5/<suite>/` (one `.h5` per task — the **directory** is what `LiberoDataset` consumes for joint training, not individual files). 4-suite joint training uses a flat-symlink dir `${DATA_ROOT}/libero_processed_v5/all4_flat/` so `LiberoDataset` can glob all 40 `.h5` from one root — see `run_all4.sh`.
 - **FAST tokens**: variable-length int32 (`h5py.vlen_dtype`) per sample; each preprocessed HDF5 stores its own `action_low` / `action_high` percentile bounds (for inverse normalization at eval time), `chunk_size`, `chunk_stride`, and `language_instruction` in the file attrs.
 - **Device handling**: no hardcoded `cuda` — tensor device is inferred from inputs; the caller moves `JEPA` to the target device.
 - **Checkpoint formats**:

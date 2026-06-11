@@ -51,8 +51,8 @@ CKPT_DIR="${DATA_ROOT}/stable-wm/${ARM_TAG}"
 RESULTS_LOG="${DATA_ROOT}/${ARM_TAG}_results.txt"
 EVAL_LOG="${DATA_ROOT}/${ARM_TAG}_eval.log"
 
-NUM_EPISODES=20
-MAX_STEPS=300
+NUM_EPISODES=50
+CAMERA_SIZE=224
 CHUNK_SIZE=20
 CHUNK_STRIDE=1
 MAX_EPOCHS=100
@@ -171,7 +171,7 @@ if ! python eval_libero.py \
     --processed-dir "$PROCESSED_DIR" \
     --suite libero_spatial \
     --num-episodes "$NUM_EPISODES" \
-    --max-steps "$MAX_STEPS" \
+    --camera-size "$CAMERA_SIZE" \
     --device cuda 2>&1 | tee "$EVAL_LOG" | tail -50; then
     err "eval FAILED — see $EVAL_LOG"
     exit 1

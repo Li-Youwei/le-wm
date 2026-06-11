@@ -44,6 +44,9 @@ MAX_STEPS="${MAX_STEPS:-100000}"
 VAL_INTERVAL="${VAL_INTERVAL:-4000}"
 WARMUP_STEPS="${WARMUP_STEPS:-2000}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
+SPLIT_MODE="${SPLIT_MODE:-demo_90_10}"
+EVAL_EPISODES="${EVAL_EPISODES:-50}"
+CAMERA_SIZE="${CAMERA_SIZE:-224}"
 STATE_ARCH="${STATE_ARCH:-$STATE_ARCH_DEFAULT}"
 ARCH_SUFFIX=""
 if [[ "$STATE_ARCH" != "shared" && "$ARM" != *"_${STATE_ARCH}"* ]]; then
@@ -54,7 +57,7 @@ FLAT_DIR="${FLAT_DIR:-/Data/lyw/libero_processed_v5/all4_flat}"
 TOKENIZER="${TOKENIZER:-/Data/lyw/fast_tokenizer_all4}"
 PROCESSED_ROOT="${PROCESSED_ROOT:-/Data/lyw/libero_processed_v5}"
 CKPT_ROOT="${CKPT_ROOT:-/Data/lyw/stable-wm}"
-CKPT_DIR="${CKPT_ROOT}/all4_${ARM}${ARCH_SUFFIX}_seed${SEED}"
+CKPT_DIR="${CKPT_ROOT}/all4_${ARM}${ARCH_SUFFIX}_split${SPLIT_MODE}_seed${SEED}"
 
 # Set GPU explicitly via CUDA_VISIBLE_DEVICES; default GPU 0.
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-0}"
@@ -68,6 +71,7 @@ conda activate vla
 
 echo "=========================================================="
 echo "[run_all4] ARM=$ARM STATE_ARCH=$STATE_ARCH SEED=$SEED MAX_STEPS=$MAX_STEPS"
+echo "[run_all4] SPLIT_MODE=$SPLIT_MODE EVAL_EPISODES=$EVAL_EPISODES CAMERA_SIZE=$CAMERA_SIZE"
 echo "[run_all4] FLAT_DIR=$FLAT_DIR"
 echo "[run_all4] TOKENIZER=$TOKENIZER"
 echo "[run_all4] CKPT_DIR=$CKPT_DIR"
@@ -108,6 +112,7 @@ python train.py \
     predictor.state_prediction_arch="$STATE_ARCH" \
     projector.norm_type="$NORM" \
     scheduler.warmup_steps="$WARMUP_STEPS" \
+    split_mode="$SPLIT_MODE" \
     trainer.devices=1 \
     +trainer.max_steps="$MAX_STEPS" \
     trainer.max_epochs=999 \
@@ -127,20 +132,27 @@ python train.py \
 echo "[run_all4] training done"
 
 # ====================================================================
-# Phase 5b — Pick best ckpt by validate/ce_loss_taskbal
+# Phase 5b — Select ckpt
 # ====================================================================
-PICK_OUT=$(python pick_best_ckpt.py --ckpt-dir "$CKPT_DIR" --top-k 3)
-echo "[run_all4] pick_best_ckpt output:"
-echo "$PICK_OUT"
-BEST_CKPT=$(echo "$PICK_OUT" | python -c "import sys, json; d=json.load(sys.stdin); print(d.get('top_1') or '')")
+if [[ "$SPLIT_MODE" == "full" ]]; then
+    BEST_CKPT="${CKPT_DIR}/lewm_final_object.ckpt"
+    if [[ ! -f "$BEST_CKPT" ]]; then
+        BEST_CKPT="${CKPT_DIR}/lewm_latest_object.ckpt"
+    fi
+else
+    PICK_OUT=$(python pick_best_ckpt.py --ckpt-dir "$CKPT_DIR" --top-k 3)
+    echo "[run_all4] pick_best_ckpt output:"
+    echo "$PICK_OUT"
+    BEST_CKPT=$(echo "$PICK_OUT" | python -c "import sys, json; d=json.load(sys.stdin); print(d.get('top_1') or '')")
+fi
 if [[ -z "$BEST_CKPT" || ! -f "$BEST_CKPT" ]]; then
-    echo "ERROR: pick_best_ckpt returned no usable ckpt" >&2
+    echo "ERROR: no usable ckpt found for SPLIT_MODE=$SPLIT_MODE" >&2
     exit 2
 fi
 echo "[run_all4] best ckpt: $BEST_CKPT"
 
 # ====================================================================
-# Phase 5c — Per-suite eval × 4 (~30 min/suite for 10 task × 20 ep)
+# Phase 5c — Per-suite eval × 4 (10 tasks × 50 rollouts = 500 trials/suite)
 # ====================================================================
 for suite in libero_spatial libero_object libero_goal libero_10; do
     EVAL_LOG="${CKPT_DIR}/eval_${suite}.log"
@@ -151,8 +163,8 @@ for suite in libero_spatial libero_object libero_goal libero_10; do
         --tokenizer "$TOKENIZER" \
         --processed-dir "$PROC_DIR" \
         --suite "$suite" \
-        --num-episodes 20 \
-        --max-steps 300 \
+        --num-episodes "$EVAL_EPISODES" \
+        --camera-size "$CAMERA_SIZE" \
         --device cuda \
         --seed "$SEED" \
         2>&1 | tee "$EVAL_LOG"

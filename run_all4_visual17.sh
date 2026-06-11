@@ -32,6 +32,8 @@ SEED="${SEED:-3072}"
 MAX_STEPS="${MAX_STEPS:-100000}"
 VAL_INTERVAL="${VAL_INTERVAL:-4000}"
 BATCH_SIZE="${BATCH_SIZE:-128}"
+EVAL_EPISODES="${EVAL_EPISODES:-50}"
+CAMERA_SIZE="${CAMERA_SIZE:-224}"
 STATE_ARCH="${STATE_ARCH:-$STATE_ARCH_DEFAULT}"
 ARCH_SUFFIX=""
 if [[ "$STATE_ARCH" != "shared" && "$ARM" != *"_${STATE_ARCH}"* ]]; then
@@ -113,8 +115,8 @@ for suite in libero_spatial libero_object libero_goal libero_10; do
         --tokenizer "$TOKENIZER" \
         --processed-dir "$PROC_DIR" \
         --suite "$suite" \
-        --num-episodes 20 \
-        --max-steps 300 \
+        --num-episodes "$EVAL_EPISODES" \
+        --camera-size "$CAMERA_SIZE" \
         --device cuda \
         --seed "$SEED" \
         2>&1 | tee "$EVAL_LOG"

@@ -34,8 +34,8 @@ SP_CKPT_DIR="${DATA_ROOT}/stable-wm/sp_libero_spatial_joint_seed${SEED}"
 RESULTS_LOG="${DATA_ROOT}/sp_libero_spatial_joint_seed${SEED}_results.txt"
 EVAL_LOG="${DATA_ROOT}/sp_eval_joint_seed${SEED}.log"
 
-NUM_EPISODES=20
-MAX_STEPS=300
+NUM_EPISODES=50
+CAMERA_SIZE=224
 CHUNK_SIZE=20
 CHUNK_STRIDE=1
 MAX_EPOCHS=100         # match frozen baseline
@@ -178,7 +178,7 @@ if ! python eval_libero.py \
     --processed-dir "$SP_PROCESSED" \
     --suite libero_spatial \
     --num-episodes "$NUM_EPISODES" \
-    --max-steps "$MAX_STEPS" \
+    --camera-size "$CAMERA_SIZE" \
     --device cuda 2>&1 | tee "$EVAL_LOG" | tail -50; then
     err "eval FAILED — see $EVAL_LOG"
     exit 1

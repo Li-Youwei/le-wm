@@ -1,4 +1,4 @@
-"""fit_tokenizer_all4.py — Unified FAST tokenizer over all 4 LIBERO suites + per-task length audit.
+"""fit_tokenizer_all4.py — Unified FAST tokenizer over filtered LIBERO suites.
 
 Option B (per user decision): each task's action chunks are normalized to [-1, 1] using THAT
 task's own (action_low, action_high) percentile bounds. The 40 per-task-normalized chunk
@@ -11,13 +11,14 @@ Output:
 - Audit JSON at $AUDIT_OUT (default: /Data/lyw/libero_processed_v5/audit_token_length.json)
 - Stdout: per-task token-length stats + recommended max_action_tokens
 
-The raw LIBERO HDF5 directory ($RAW_LIBERO_DIR, default /nas_data_new/caz/data_ssd/libero)
-is opened READ-ONLY. We never write into it.
+The input root should be the OpenVLA-style regenerated/filter output, not the
+official raw root, so the tokenizer sees the same no-noop action distribution
+as training.
 
 Usage (on the GPU server):
     HF_HUB_OFFLINE=1 TRANSFORMERS_OFFLINE=1 \\
         python fit_tokenizer_all4.py \\
-            --raw-root /nas_data_new/caz/data_ssd/libero \\
+            --raw-root /Data/lyw/libero_filtered_224 \\
             --tokenizer-out /Data/lyw/fast_tokenizer_all4 \\
             --audit-out /Data/lyw/libero_processed_v5/audit_token_length.json \\
             --chunk-size 20 --stride 1
@@ -148,8 +149,11 @@ def main() -> None:
     parser.add_argument(
         "--raw-root",
         type=Path,
-        default=Path("/nas_data_new/caz/data_ssd/libero"),
-        help="READ-ONLY raw LIBERO root containing libero_{spatial,object,goal,10}/",
+        default=Path("/Data/lyw/libero_filtered_224"),
+        help=(
+            "Filtered/regenerated LIBERO root containing "
+            "libero_{spatial,object,goal,10}/"
+        ),
     )
     parser.add_argument(
         "--tokenizer-out",

@@ -7,6 +7,10 @@ subdir: ${hydra:job.id}
 
 num_workers: 6
 train_split: 0.9
+# demo_90_10 preserves the existing demo-level train/val split and best-val
+# checkpoint selection. full trains on every filtered trajectory for
+# OpenVLA/WorldVLA alignment ablations and should evaluate final/latest ckpt.
+split_mode: demo_90_10
 seed: 3072
 img_size: 224
 patch_size: 14

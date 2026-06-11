@@ -32,8 +32,8 @@ CKPT_DIR="${DATA_ROOT}/stable-wm/${ARM_TAG}"
 VIDEO_DIR="${DATA_ROOT}/abl_videos/${ARM_TAG}"
 EVAL_LOG="${DATA_ROOT}/${ARM_TAG}_eval_videos.log"
 
-NUM_EPISODES=20
-MAX_STEPS=300
+NUM_EPISODES=50
+CAMERA_SIZE=224
 
 export CUDA_VISIBLE_DEVICES="${CUDA_VISIBLE_DEVICES:-1}"
 
@@ -101,7 +101,7 @@ if ! python eval_libero.py \
     --processed-dir "$PROCESSED_DIR" \
     --suite libero_spatial \
     --num-episodes "$NUM_EPISODES" \
-    --max-steps "$MAX_STEPS" \
+    --camera-size "$CAMERA_SIZE" \
     --device cuda \
     --save-videos \
     --video-dir "$VIDEO_DIR" 2>&1 | tee "$EVAL_LOG" | tail -50; then
