@@ -338,7 +338,7 @@ class MLP(nn.Module):
         return self.net(x)
 
 
-# --- FAST token vocabulary constants ---
+# --- Default FAST token vocabulary constants ---
 
 FAST_VOCAB_SIZE = 1024
 BOS_TOKEN_ID = 1024
@@ -410,12 +410,23 @@ class ARPredictor(nn.Module):
         use_gripper_aux: bool = False,
         gripper_chunk_size: int = 20,
         state_prediction_arch: str = "shared",
+        action_vocab_size: int = FAST_VOCAB_SIZE,
     ):
         super().__init__()
         self.embed_dim = embed_dim
         self.max_action_tokens = max_action_tokens
         self.max_lang_tokens = max_lang_tokens
         self.proprio_dim = proprio_dim
+        if int(action_vocab_size) <= 1:
+            raise ValueError(
+                f"action_vocab_size must be > 1, got {action_vocab_size}"
+            )
+        self.action_vocab_size = int(action_vocab_size)
+        self.bos_token_id = self.action_vocab_size
+        self.eos_token_id = self.action_vocab_size + 1
+        self.pad_token_id = self.action_vocab_size + 2
+        self.total_vocab_size = self.action_vocab_size + 3
+        self.action_head_size = self.action_vocab_size + 2
         self.use_state_prediction = use_state_prediction
         self.state_pred_visual_tokens = bool(state_pred_visual_tokens)
         self.n_state_query = 3 if use_state_prediction else 0
@@ -453,10 +464,10 @@ class ARPredictor(nn.Module):
         # Proprioception encoder: proprio_dim (9d for LIBERO) → embed_dim
         self.proprio_encoder = MLP(proprio_dim, embed_dim, embed_dim)
 
-        # Token embeddings for action tokens (FAST vocab + BOS/EOS/PAD)
+        # Token embeddings for action tokens (codec vocab + BOS/EOS/PAD)
         self.action_embedding = nn.Embedding(
-            TOTAL_VOCAB_SIZE, embed_dim
-        )  # 1027 entries
+            self.total_vocab_size, embed_dim
+        )
 
         # Type embeddings: 0=language, 1=visual, 2=proprioception, 3=action,
         # (4=state_query when use_state_prediction is True).
@@ -480,8 +491,8 @@ class ARPredictor(nn.Module):
         # Positional encoding (learnable, 1D over the unified sequence)
         self.pos_embedding = nn.Parameter(torch.randn(1, self.max_seq_len, embed_dim))
 
-        # Action classification head: predict vocab 0..1025 (PAD excluded from targets)
-        self.action_head = nn.Linear(embed_dim, ACTION_HEAD_SIZE)
+        # Action classification head: predict action ids + BOS/EOS; PAD excluded.
+        self.action_head = nn.Linear(embed_dim, self.action_head_size)
 
         # Auxiliary gripper-command head. When enabled, predicts a (H,)
         # gripper sequence directly from the BOS hidden state via a small MLP,
@@ -588,6 +599,25 @@ class ARPredictor(nn.Module):
             self.norm = nn.LayerNorm(embed_dim)
         self.dropout = nn.Dropout(emb_dropout)
 
+    def _ensure_action_vocab_attrs(self) -> None:
+        """Populate action vocab attrs for old pickled object checkpoints."""
+        if not hasattr(self, "action_vocab_size"):
+            self.action_vocab_size = FAST_VOCAB_SIZE
+        if not hasattr(self, "bos_token_id"):
+            self.bos_token_id = int(self.action_vocab_size)
+        if not hasattr(self, "eos_token_id"):
+            self.eos_token_id = int(self.action_vocab_size) + 1
+        if not hasattr(self, "pad_token_id"):
+            self.pad_token_id = int(self.action_vocab_size) + 2
+        if not hasattr(self, "total_vocab_size"):
+            self.total_vocab_size = int(self.action_vocab_size) + 3
+        if not hasattr(self, "action_head_size"):
+            self.action_head_size = int(self.action_vocab_size) + 2
+
+    def __setstate__(self, state):
+        super().__setstate__(state)
+        self._ensure_action_vocab_attrs()
+
     def _build_attn_mask(
         self,
         n_lang: int,
@@ -601,13 +631,14 @@ class ARPredictor(nn.Module):
         Args:
             n_lang: number of language token positions (0 when language disabled).
             lang_lengths: (B,) real language token count per sample, or None when n_lang==0.
-            action_tokens: (B, max_action_tokens) with PAD_TOKEN_ID for padding.
+            action_tokens: (B, max_action_tokens) with self.pad_token_id for padding.
             L: total sequence length.
             device: target device.
 
         Returns:
             (B, 1, L, L) bool mask. True = attend, False = mask out.
         """
+        self._ensure_action_vocab_attrs()
         B = action_tokens.size(0)
         # Prefix layout: lang(n_lang) + agent(nv) + hand(nv) + proprio(1) = n_lang + 2*nv + 1
         # where nv = self.n_visual_per_view (1 by default, 17 for CLS+4x4 pool).
@@ -637,7 +668,7 @@ class ARPredictor(nn.Module):
         # Action tokens: real if not PAD
         action_end = action_start + self.max_action_tokens
         if action_end <= L:
-            is_real[:, action_start:action_end] = action_tokens != PAD_TOKEN_ID
+            is_real[:, action_start:action_end] = action_tokens != self.pad_token_id
 
         # STATE_QUERY tokens (Q_ag, Q_hd, Q_pr) are always real when present.
         query_start = action_end
@@ -852,12 +883,13 @@ class ARPredictor(nn.Module):
             lang_embeds: (B, max_lang_tokens, D) projected language embeddings,
                 or None for language-ablation runs.
             lang_lengths: (B,) real language token count per sample, or None.
-            action_tokens: (B, max_action_tokens) FAST token ids padded with PAD_TOKEN_ID.
-            action_lengths: (B,) number of real FAST tokens per sample.
+            action_tokens: (B, max_action_tokens) action token ids padded with
+                self.pad_token_id.
+            action_lengths: (B,) number of real action tokens per sample.
 
         Returns:
             When ``use_state_prediction is False`` (baseline):
-                action_logits: (B, 1+max_action_tokens, 1026) logits at BOS + action positions.
+                action_logits: (B, 1+max_action_tokens, action_head_size) logits at BOS + action positions.
 
             When ``use_state_prediction is True``:
                 Tuple ``(action_logits, pred_ag, pred_hd, pred_pr)`` where
@@ -868,6 +900,7 @@ class ARPredictor(nn.Module):
                     state_pred_visual_tokens=True, predicted future hand-cam latent(s),
                   - pred_pr: (B, proprio_dim) predicted RAW future proprio.
         """
+        self._ensure_action_vocab_attrs()
         B = z_agent.size(0)
         device = z_agent.device
         n_lang = lang_embeds.size(1) if lang_embeds is not None else 0
@@ -937,7 +970,7 @@ class ARPredictor(nn.Module):
             )  # (B, 2*nv + 1, D)
 
         # 3. Build action embeddings (BOS + action tokens) with type embedding
-        bos = torch.full((B, 1), BOS_TOKEN_ID, dtype=torch.long, device=device)
+        bos = torch.full((B, 1), self.bos_token_id, dtype=torch.long, device=device)
         bos_action = torch.cat([bos, action_tokens], dim=1)  # (B, 1+max_action_tokens)
         action_emb = self.action_embedding(bos_action) + self.type_embedding.weight[3]
 
@@ -987,7 +1020,7 @@ class ARPredictor(nn.Module):
         ]  # (B, 1+max_action_tokens, D)
         action_logits = self.action_head(
             action_output
-        )  # (B, 1+max_action_tokens, ACTION_HEAD_SIZE)
+        )  # (B, 1+max_action_tokens, action_head_size)
 
         # 8b. Optional gripper-aux read-out from BOS hidden state.
         # x[:, n_prefix] is BOS — under our causal mask it only attends to the
@@ -1034,7 +1067,7 @@ class ARPredictor(nn.Module):
         max_len: int = 80,
         temperature: float = 0.0,
     ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Autoregressively generate FAST action tokens.
+        """Autoregressively generate action codec tokens.
 
         Sequence grows as [lang..., z_ag, z_hd, z_pr, BOS, T_1, T_2, ...]
         (language segment absent when lang_embeds is None).
@@ -1042,9 +1075,10 @@ class ARPredictor(nn.Module):
         Stops at EOS or max_len.
 
         Returns:
-            tokens: (B, gen_len) clean FAST action token ids (EOS/PAD stripped).
+            tokens: (B, gen_len) clean action token ids (EOS/PAD stripped).
             lengths: (B,) number of real tokens per sample.
         """
+        self._ensure_action_vocab_attrs()
         B = z_agent.size(0)
         device = z_agent.device
         n_lang = lang_embeds.size(1) if lang_embeds is not None else 0
@@ -1096,7 +1130,7 @@ class ARPredictor(nn.Module):
             prefix = torch.cat([vis_agent, vis_hand, proprio_emb], dim=1)
 
         # 2. BOS token
-        bos_ids = torch.full((B, 1), BOS_TOKEN_ID, dtype=torch.long, device=device)
+        bos_ids = torch.full((B, 1), self.bos_token_id, dtype=torch.long, device=device)
         bos_emb = self.action_embedding(bos_ids) + self.type_embedding.weight[3]
 
         # 3. Initial sequence: prefix + BOS (base embeddings without pos encoding)
@@ -1125,12 +1159,12 @@ class ARPredictor(nn.Module):
             x = self._run_blocks(x, attn_mask, modality_ids)
 
             # Logits at last position
-            logits = self.action_head(x[:, -1])  # (B, ACTION_HEAD_SIZE)
+            logits = self.action_head(x[:, -1])  # (B, action_head_size)
 
             # Prevent BOS from being sampled — it's a start marker, not a valid
-            # action token.  Without this mask the model could (rarely) emit 1024
-            # which the FAST BPE decoder doesn't expect.
-            logits[:, BOS_TOKEN_ID] = -float("inf")
+            # action token. Without this mask the model could emit the codec's
+            # start marker, which no action decoder expects.
+            logits[:, self.bos_token_id] = -float("inf")
 
             if temperature <= 0:
                 next_token = logits.argmax(dim=-1)
@@ -1140,12 +1174,12 @@ class ARPredictor(nn.Module):
 
             # Force PAD for already-finished samples
             next_token = torch.where(
-                finished, torch.tensor(PAD_TOKEN_ID, device=device), next_token
+                finished, torch.tensor(self.pad_token_id, device=device), next_token
             )
             generated.append(next_token)
 
             # Track EOS
-            finished = finished | (next_token == EOS_TOKEN_ID)
+            finished = finished | (next_token == self.eos_token_id)
             if finished.all():
                 break
 
@@ -1158,7 +1192,7 @@ class ARPredictor(nn.Module):
 
         if not generated:
             return (
-                torch.full((B, 1), PAD_TOKEN_ID, dtype=torch.long, device=device),
+                torch.full((B, 1), self.pad_token_id, dtype=torch.long, device=device),
                 torch.zeros(B, dtype=torch.long, device=device),
             )
 
@@ -1167,15 +1201,15 @@ class ARPredictor(nn.Module):
         # Compute lengths: count tokens before first EOS
         lengths = torch.full((B,), raw_tokens.size(1), dtype=torch.long, device=device)
         for i in range(B):
-            eos_pos = (raw_tokens[i] == EOS_TOKEN_ID).nonzero(as_tuple=True)[0]
+            eos_pos = (raw_tokens[i] == self.eos_token_id).nonzero(as_tuple=True)[0]
             if len(eos_pos) > 0:
                 lengths[i] = eos_pos[0].item()
 
-        # Strip EOS/PAD: return only real FAST action tokens
+        # Strip EOS/PAD: return only real action tokens
         max_len_actual = lengths.max().item() if lengths.numel() > 0 else 0
         max_len_actual = max(max_len_actual, 1)
         tokens = torch.full(
-            (B, max_len_actual), PAD_TOKEN_ID, dtype=torch.long, device=device
+            (B, max_len_actual), self.pad_token_id, dtype=torch.long, device=device
         )
         for i in range(B):
             k = lengths[i].item()
@@ -1207,6 +1241,7 @@ class ARPredictor(nn.Module):
                 "predict_gripper_aux() called but use_gripper_aux=False."
             )
 
+        self._ensure_action_vocab_attrs()
         B = z_agent.size(0)
         device = z_agent.device
         n_lang = lang_embeds.size(1) if lang_embeds is not None else 0
@@ -1255,7 +1290,7 @@ class ARPredictor(nn.Module):
         else:
             prefix = torch.cat([vis_agent, vis_hand, proprio_emb], dim=1)
 
-        bos_ids = torch.full((B, 1), BOS_TOKEN_ID, dtype=torch.long, device=device)
+        bos_ids = torch.full((B, 1), self.bos_token_id, dtype=torch.long, device=device)
         bos_emb = self.action_embedding(bos_ids) + self.type_embedding.weight[3]
         seq = torch.cat([prefix, bos_emb], dim=1)  # (B, n_prefix+1, D)
 

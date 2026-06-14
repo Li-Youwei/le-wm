@@ -6,6 +6,17 @@ dataset:
   # Action chunk horizon H, in raw LIBERO control steps.
   # Must match preprocess_libero.py --chunk-size and gripper aux head output.
   chunk_size: 20
+  # LIBERO action chunk dimensionality: 3 relative position, 3 relative
+  # rotation, 1 gripper command.
+  action_dim: 7
+  # Action tokenization backend. `fast` preserves the current DCT+BPE path.
+  # `worldvla_bins` uses scalar 256-bin discretization over normalized [-1, 1]
+  # chunks, producing chunk_size * action_dim fixed-width tokens.
+  action_codec:
+    type: fast
+    num_bins: 256
+    bin_min: -1.0
+    bin_max: 1.0
   img_size: 224
   # 9d: ee_pos(3) + xyzw_quat(4) + gripper_states raw(2).
   # Do NOT mean/abs the gripper — fingers are symmetric around 0, averaging

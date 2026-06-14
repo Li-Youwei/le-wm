@@ -6,7 +6,9 @@ Expected HDF5 structure (one file per task):
     /image_agent:         (N, H_img, W_img, 3) uint8 HWC  — agentview at chunk start
     /image_hand:          (N, H_img, W_img, 3) uint8 HWC  — eye-in-hand at chunk start
     /proprio:             (N, 9) float64                   — ee_pos(3)+xyzw_quat(4)+gripper_raw(2)
-    /fast_tokens:         variable-length int32 (h5py vlen_dtype)
+    /action_tokens:       variable-length int32 (h5py vlen_dtype)
+    /action_length:       int32 token counts
+    /fast_tokens:         legacy FAST variable-length int32 fallback
     /continuous_actions:  (N, H, action_dim) float32  [optional, for debug]
     attrs:
         language_instruction: str — task description for T5 encoding
@@ -62,11 +64,11 @@ class LiberoDataset(Dataset):
 
     Supports multiple HDF5 files in a directory (one per task or per split).
     Each file contains chunk-aligned samples with dual-view images, proprioception,
-    and FAST tokens. Language instruction is stored per-file and tokenized at init.
+    and action tokens. Language instruction is stored per-file and tokenized at init.
 
     Args:
         hdf5_dir: directory containing .hdf5/.h5 files.
-        max_action_tokens: pad/truncate FAST tokens to this length.
+        max_action_tokens: pad/truncate action tokens to this length.
         max_lang_tokens: pad/truncate language tokens to this length.
         img_size: resize images to this resolution.
     """
@@ -79,12 +81,16 @@ class LiberoDataset(Dataset):
         img_size: int = 224,
         use_language: bool = True,
         use_state_prediction: bool = False,
+        pad_token_id: int = PAD_TOKEN_ID,
+        action_codec_type: str | None = None,
     ):
         self.max_action_tokens = max_action_tokens
         self.max_lang_tokens = max_lang_tokens
         self.img_size = img_size
         self.use_language = use_language
         self.use_state_prediction = use_state_prediction
+        self.pad_token_id = int(pad_token_id)
+        self.action_codec_type = action_codec_type
 
         # Discover all HDF5 files and build a global index
         hdf5_dir = Path(hdf5_dir)
@@ -126,6 +132,40 @@ class LiberoDataset(Dataset):
                 if "image_agent" not in f:
                     raise KeyError(f"No 'image_agent' in {fpath}")
                 n_samples = f["image_agent"].shape[0]
+                if "action_tokens" in f:
+                    token_key = "action_tokens"
+                elif "fast_tokens" in f:
+                    token_key = "fast_tokens"
+                else:
+                    raise KeyError(
+                        f"No 'action_tokens' or legacy 'fast_tokens' in {fpath}. "
+                        "Re-run preprocessing."
+                    )
+                if f[token_key].shape[0] != n_samples:
+                    raise ValueError(
+                        f"{fpath.name}: {token_key} has {f[token_key].shape[0]} "
+                        f"entries but image_agent has {n_samples}."
+                    )
+                if action_codec_type is not None:
+                    file_codec = f.attrs.get("action_codec_type", None)
+                    if isinstance(file_codec, bytes):
+                        file_codec = file_codec.decode("utf-8")
+                    if file_codec is not None and str(file_codec) != action_codec_type:
+                        raise ValueError(
+                            f"{fpath.name}: action_codec_type={file_codec!r} does "
+                            f"not match requested {action_codec_type!r}."
+                        )
+                    if (
+                        file_codec is None
+                        and token_key == "fast_tokens"
+                        and action_codec_type != "fast"
+                    ):
+                        raise ValueError(
+                            f"{fpath.name}: requested action_codec_type="
+                            f"{action_codec_type!r}, but file only has legacy "
+                            "'fast_tokens'. Re-run preprocessing with "
+                            "--action-codec worldvla_bins."
+                        )
 
                 # When state prediction is enabled, all three future fields
                 # MUST exist in the HDF5 — fail fast with a clear message
@@ -234,12 +274,23 @@ class LiberoDataset(Dataset):
         # [ee_pos(3) + xyzw_quat(4) + gripper_raw(2)] — see preprocess_libero.py
         proprio = torch.from_numpy(np.array(f["proprio"][local_idx], dtype=np.float32))
 
-        # FAST tokens: variable-length → pad to max_action_tokens
-        raw_tokens = f["fast_tokens"][local_idx]
+        # Action tokens: variable-length → pad to max_action_tokens.
+        if "action_tokens" in f:
+            token_key = "action_tokens"
+            length_key = "action_length"
+        elif "fast_tokens" in f:
+            token_key = "fast_tokens"
+            length_key = "fast_length"
+        else:
+            raise KeyError(
+                f"No 'action_tokens' or legacy 'fast_tokens' in {fpath}. "
+                "Re-run preprocess_libero.py."
+            )
+        raw_tokens = f[token_key][local_idx]
         raw_tokens = np.array(raw_tokens, dtype=np.int64)
         if len(raw_tokens) > self.max_action_tokens:
             logger.warning(
-                "Sample %d (file=%s, local=%d): FAST token length %d exceeds "
+                "Sample %d (file=%s, local=%d): action token length %d exceeds "
                 "max_action_tokens=%d, truncating.",
                 idx,
                 fpath.name,
@@ -247,10 +298,25 @@ class LiberoDataset(Dataset):
                 len(raw_tokens),
                 self.max_action_tokens,
             )
+        stored_len = int(f[length_key][local_idx]) if length_key in f else len(raw_tokens)
+        if stored_len != len(raw_tokens):
+            logger.warning(
+                "Sample %d (file=%s, local=%d): %s=%d disagrees with len(%s)=%d; "
+                "using token array length.",
+                idx,
+                fpath.name,
+                local_idx,
+                length_key,
+                stored_len,
+                token_key,
+                len(raw_tokens),
+            )
         token_len = min(len(raw_tokens), self.max_action_tokens)
 
-        fast_tokens = np.full(self.max_action_tokens, PAD_TOKEN_ID, dtype=np.int64)
-        fast_tokens[:token_len] = raw_tokens[:token_len]
+        action_tokens = np.full(
+            self.max_action_tokens, self.pad_token_id, dtype=np.int64
+        )
+        action_tokens[:token_len] = raw_tokens[:token_len]
 
         # Direct gripper-command supervision target — bypasses FAST tokenization
         # to give the gripper dim a clean signal that doesn't get diluted by the
@@ -264,7 +330,10 @@ class LiberoDataset(Dataset):
             "pixels_agent": img_agent,  # (3, 224, 224)
             "pixels_hand": img_hand,  # (3, 224, 224)
             "proprio": proprio,  # (9,)
-            "fast_tokens": torch.from_numpy(fast_tokens),  # (max_action_tokens,)
+            "action_tokens": torch.from_numpy(action_tokens),  # (max_action_tokens,)
+            "action_lengths": torch.tensor(token_len, dtype=torch.long),  # scalar
+            # Backward-compatible aliases for older train/debug utilities.
+            "fast_tokens": torch.from_numpy(action_tokens),  # (max_action_tokens,)
             "fast_lengths": torch.tensor(token_len, dtype=torch.long),  # scalar
             "task_id": torch.tensor(
                 self._file_to_task_id[fpath],

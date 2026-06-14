@@ -11,8 +11,9 @@ from lightning.pytorch.loggers import TensorBoardLogger
 from omegaconf import OmegaConf
 from transformers import T5EncoderModel
 
+from action_codec import WORLDVLA_BINS_CODEC, build_action_codec
 from jepa import JEPA
-from module import ARPredictor, MLP, SIGReg, ACTION_HEAD_SIZE, EOS_TOKEN_ID
+from module import ARPredictor, MLP, SIGReg
 from utils import ModelObjectCallBack, PeriodicPrintCallback
 from vision_backbone import build_visual_encoder
 
@@ -70,8 +71,12 @@ def lejepa_forward(self, batch, stage, cfg):
     pixels_agent = batch["pixels_agent"]  # (B, 3, H, W)
     pixels_hand = batch["pixels_hand"]  # (B, 3, H, W)
     proprio = batch["proprio"]  # (B, 9) ee_pos(3)+xyzw_quat(4)+grip_raw(2)
-    fast_tokens = batch["fast_tokens"]  # (B, max_action_tokens)
-    fast_lengths = batch["fast_lengths"]  # (B,)
+    if "action_tokens" in batch:
+        action_tokens = batch["action_tokens"]
+        action_lengths = batch["action_lengths"]
+    else:
+        action_tokens = batch["fast_tokens"]
+        action_lengths = batch["fast_lengths"]
 
     # Language batch fields may be absent in no-language ablation runs
     lang_ids = batch.get("lang_input_ids", None)  # (B, max_lang_tokens) or None
@@ -92,8 +97,8 @@ def lejepa_forward(self, batch, stage, cfg):
         proprio,
         lang_embeds,
         lang_lengths,
-        fast_tokens,
-        fast_lengths,
+        action_tokens,
+        action_lengths,
     )
     # Unpack predictor output. Shape depends on (use_state_pred, use_gripper_aux):
     #   (F, F) → action_logits
@@ -117,9 +122,9 @@ def lejepa_forward(self, batch, stage, cfg):
         (B, num_action_positions), -100, dtype=torch.long, device=z_agent.device
     )
     for i in range(B):
-        k = fast_lengths[i].item()
-        targets[i, :k] = fast_tokens[i, :k]  # T_1, T_2, ..., T_k
-        targets[i, k] = EOS_TOKEN_ID  # EOS after last real token
+        k = action_lengths[i].item()
+        targets[i, :k] = action_tokens[i, :k]  # T_1, T_2, ..., T_k
+        targets[i, k] = self.model.predictor.eos_token_id
 
     # 5. L_CE (always). Computed with reduction="none" so we can aggregate
     # two ways from a single forward:
@@ -134,7 +139,7 @@ def lejepa_forward(self, batch, stage, cfg):
     label_smoothing = float(cfg.get("label_smoothing", 0.1))
     output = {}
     ce_per_token = F.cross_entropy(
-        action_logits.reshape(-1, ACTION_HEAD_SIZE),
+        action_logits.reshape(-1, self.model.predictor.action_head_size),
         targets.reshape(-1),
         ignore_index=-100,
         label_smoothing=label_smoothing,
@@ -348,7 +353,23 @@ def run(cfg):
     max_action_tokens = cfg.data.dataset.get("max_action_tokens", 80)
     max_lang_tokens = cfg.data.dataset.get("max_lang_tokens", 25)
     proprio_dim = cfg.data.dataset.get("proprio_dim", 9)
+    chunk_size = int(cfg.data.dataset.get("chunk_size", 20))
+    action_dim = int(cfg.data.dataset.get("action_dim", 7))
     use_language = cfg.data.dataset.get("use_language", True)
+    action_codec = build_action_codec(cfg.data.dataset.get("action_codec", None))
+    if action_codec.name == WORLDVLA_BINS_CODEC:
+        expected_tokens = chunk_size * action_dim
+        if int(max_action_tokens) != expected_tokens:
+            raise ValueError(
+                "worldvla_bins requires max_action_tokens == "
+                f"chunk_size * action_dim ({chunk_size} * {action_dim} = "
+                f"{expected_tokens}), got {max_action_tokens}."
+            )
+    print(
+        f"[action_codec] type={action_codec.name}, "
+        f"vocab_size={action_codec.vocab_size}, "
+        f"max_action_tokens={max_action_tokens}"
+    )
 
     # Loss-weight-driven feature toggles. State prediction needs the
     # extra HDF5 fields (image_*_future, proprio_future) and the 3
@@ -443,6 +464,8 @@ def run(cfg):
         img_size=cfg.data.dataset.get("img_size", cfg.img_size),
         use_language=use_language,
         use_state_prediction=use_state_prediction,
+        pad_token_id=action_codec.pad_token_id,
+        action_codec_type=action_codec.name,
     )
 
     # Demo-level split: avoid leaking chunks from the same demo into both train and val.
@@ -545,12 +568,13 @@ def run(cfg):
     # output dim matches batch["gripper_seq"].shape[1]. We treat it as
     # immutable (H=20 across the project); pull from data config to surface
     # mismatches loudly.
-    gripper_chunk_size = int(cfg.data.dataset.get("chunk_size", 20))
+    gripper_chunk_size = chunk_size
     predictor = ARPredictor(
         embed_dim=embed_dim,
         max_action_tokens=max_action_tokens,
         max_lang_tokens=max_lang_tokens,
         proprio_dim=proprio_dim,
+        action_vocab_size=action_codec.vocab_size,
         use_state_prediction=use_state_prediction,
         # Mirror the encoder-side projector's norm choice — paper Section 3
         # says the predictor projector has the "same implementation as the
@@ -623,6 +647,8 @@ def run(cfg):
         visual_pool_grid=visual_pool_grid,
         freeze_encoder=freeze_visual_encoder,
     )
+    world_model.action_codec_type = action_codec.name
+    world_model.action_vocab_size = action_codec.vocab_size
 
     # Cosine-annealing scheduler with explicit warmup_steps / max_steps.
     # spt's smart-defaults factory pulls these from `trainer.estimated_stepping_batches`,

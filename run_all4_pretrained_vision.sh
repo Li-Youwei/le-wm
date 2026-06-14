@@ -81,6 +81,16 @@ CKPT_SELECT_TOP_K="${CKPT_SELECT_TOP_K:-3}"
 LIGHT_EVAL_EPISODES="${LIGHT_EVAL_EPISODES:-5}"
 LIGHT_EVAL_MAX_STEPS="${LIGHT_EVAL_MAX_STEPS:-300}"
 FINAL_EVAL_EPISODES="${FINAL_EVAL_EPISODES:-20}"
+ACTION_CODEC="${ACTION_CODEC:-fast}"
+NUM_ACTION_BINS="${NUM_ACTION_BINS:-256}"
+ACTION_DIM="${ACTION_DIM:-7}"
+if [[ -z "${MAX_ACTION_TOKENS+x}" ]]; then
+    if [[ "$ACTION_CODEC" == "worldvla_bins" ]]; then
+        MAX_ACTION_TOKENS=$((20 * ACTION_DIM))
+    else
+        MAX_ACTION_TOKENS=80
+    fi
+fi
 
 FLAT_DIR="${FLAT_DIR:-/Data/lyw/libero_processed_v5/all4_flat}"
 TOKENIZER="${TOKENIZER:-/Data/lyw/fast_tokenizer_all4}"
@@ -108,10 +118,17 @@ echo "[all4_pretrained_vision] VISION_ENCODER=$VISION_ENCODER"
 echo "[all4_pretrained_vision] CKPT_DIR=$CKPT_DIR"
 echo "[all4_pretrained_vision] CUDA_VISIBLE_DEVICES=$CUDA_VISIBLE_DEVICES"
 echo "[all4_pretrained_vision] CKPT_SELECT_TOP_K=$CKPT_SELECT_TOP_K LIGHT_EVAL_EPISODES=$LIGHT_EVAL_EPISODES FINAL_EVAL_EPISODES=$FINAL_EVAL_EPISODES"
+echo "[all4_pretrained_vision] ACTION_CODEC=$ACTION_CODEC NUM_ACTION_BINS=$NUM_ACTION_BINS MAX_ACTION_TOKENS=$MAX_ACTION_TOKENS"
 echo "=========================================================="
 
 [[ -d "$FLAT_DIR" ]] || { echo "ERROR: FLAT_DIR missing: $FLAT_DIR" >&2; exit 1; }
-[[ -d "$TOKENIZER" ]] || { echo "ERROR: TOKENIZER missing: $TOKENIZER" >&2; exit 1; }
+if [[ "$ACTION_CODEC" != "fast" && "$ACTION_CODEC" != "worldvla_bins" ]]; then
+    echo "ERROR: ACTION_CODEC must be fast or worldvla_bins, got: $ACTION_CODEC" >&2
+    exit 1
+fi
+if [[ "$ACTION_CODEC" == "fast" ]]; then
+    [[ -d "$TOKENIZER" ]] || { echo "ERROR: TOKENIZER missing: $TOKENIZER" >&2; exit 1; }
+fi
 [[ -d "$VISION_ENCODER" ]] || {
     echo "ERROR: VISION_ENCODER missing: $VISION_ENCODER" >&2
     echo "Download/copy a HuggingFace vision model there first." >&2
@@ -126,9 +143,18 @@ fi
 mkdir -p "$CKPT_DIR"
 TRAIN_LOG="${CKPT_DIR}/train.log"
 
+EVAL_CODEC_ARGS=(--action-codec "$ACTION_CODEC" --num-action-bins "$NUM_ACTION_BINS")
+if [[ "$ACTION_CODEC" == "fast" ]]; then
+    EVAL_CODEC_ARGS+=(--tokenizer "$TOKENIZER")
+fi
+
 python train.py \
     data=libero \
     data.dataset.hdf5_dir="$FLAT_DIR" \
+    data.dataset.max_action_tokens="$MAX_ACTION_TOKENS" \
+    data.dataset.action_dim="$ACTION_DIM" \
+    data.dataset.action_codec.type="$ACTION_CODEC" \
+    data.dataset.action_codec.num_bins="$NUM_ACTION_BINS" \
     vision_encoder.source=hf \
     vision_encoder.model_name_or_path="$VISION_ENCODER" \
     vision_encoder.freeze=true \
@@ -193,13 +219,13 @@ for candidate_ckpt in "${CANDIDATE_CKPTS[@]}"; do
         echo "[all4_pretrained_vision] light eval $suite -> $EVAL_LOG"
         python eval_libero.py \
             --checkpoint "$candidate_ckpt" \
-            --tokenizer "$TOKENIZER" \
             --processed-dir "$PROC_DIR" \
             --suite "$suite" \
             --num-episodes "$LIGHT_EVAL_EPISODES" \
             --max-steps "$LIGHT_EVAL_MAX_STEPS" \
             --device cuda \
             --seed "$SEED" \
+            "${EVAL_CODEC_ARGS[@]}" \
             2>&1 | tee "$EVAL_LOG"
     done
 done
@@ -225,13 +251,13 @@ for suite in libero_spatial libero_object libero_goal libero_10; do
     echo "[all4_pretrained_vision] eval $suite -> $EVAL_LOG"
     python eval_libero.py \
         --checkpoint "$BEST_CKPT" \
-        --tokenizer "$TOKENIZER" \
         --processed-dir "$PROC_DIR" \
         --suite "$suite" \
         --num-episodes "$FINAL_EVAL_EPISODES" \
         --max-steps 300 \
         --device cuda \
         --seed "$SEED" \
+        "${EVAL_CODEC_ARGS[@]}" \
         2>&1 | tee "$EVAL_LOG"
 done
 

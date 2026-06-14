@@ -44,7 +44,14 @@ os.environ.setdefault("MUJOCO_GL", "egl")
 from libero.libero import benchmark, get_libero_path
 from libero.libero.envs import OffScreenRenderEnv
 
-from fast_utils import denormalize_actions, fast_decode, load_fast_processor
+from action_codec import (
+    FAST_CODEC,
+    WORLDVLA_BINS_CODEC,
+    action_codecs_compatible,
+    build_action_codec,
+    build_action_codec_from_attrs,
+)
+from fast_utils import denormalize_actions, load_fast_processor
 from libero_dataset import _preprocess_image
 from preprocess_libero import normalize_proprio
 
@@ -54,7 +61,12 @@ from preprocess_libero import normalize_proprio
 # ---------------------------------------------------------------------------
 
 
-def build_model(device: torch.device, use_language: bool = True) -> torch.nn.Module:
+def build_model(
+    device: torch.device,
+    use_language: bool = True,
+    action_vocab_size: int = 1024,
+    max_action_tokens: int = 80,
+) -> torch.nn.Module:
     """Build the JEPA model with the same architecture as train.py.
 
     Args:
@@ -80,9 +92,10 @@ def build_model(device: torch.device, use_language: bool = True) -> torch.nn.Mod
 
     predictor = ARPredictor(
         embed_dim=embed_dim,
-        max_action_tokens=80,
+        max_action_tokens=max_action_tokens,
         max_lang_tokens=25,
         proprio_dim=9,
+        action_vocab_size=action_vocab_size,
         # dropout=0.2 mirrors config/train/lewm.yaml (the frozen baseline's
         # actual training value). Eval mode is no-op for nn.Dropout, so this
         # has no inference effect, but it keeps the constructor call honest
@@ -262,10 +275,36 @@ def load_action_stats(h5_path: Path) -> tuple[np.ndarray, np.ndarray, int, int]:
     return action_low, action_high, chunk_size, action_dim
 
 
+def load_action_codec(h5_path: Path, fallback) -> object:
+    """Read action codec metadata from preprocessed HDF5 attrs."""
+    with h5py.File(h5_path, "r") as f:
+        return build_action_codec_from_attrs(f.attrs, fallback=fallback)
+
+
 def load_language_instruction(h5_path: Path) -> str:
     """Read language instruction from preprocessed HDF5."""
     with h5py.File(h5_path, "r") as f:
         return f.attrs.get("language_instruction", "")
+
+
+def infer_action_codec_from_model(model: torch.nn.Module):
+    codec_type = getattr(model, "action_codec_type", None)
+    predictor = getattr(model, "predictor", None)
+    vocab_size = getattr(predictor, "action_vocab_size", None)
+    if codec_type is not None:
+        cfg = {"type": codec_type}
+        if str(codec_type) == WORLDVLA_BINS_CODEC and vocab_size is not None:
+            cfg["num_bins"] = int(vocab_size)
+        return build_action_codec(cfg)
+    if vocab_size is None:
+        return None
+    if int(vocab_size) == 1024:
+        return build_action_codec({"type": FAST_CODEC})
+    if int(vocab_size) == 256:
+        return build_action_codec({"type": WORLDVLA_BINS_CODEC, "num_bins": 256})
+    return build_action_codec(
+        {"type": WORLDVLA_BINS_CODEC, "num_bins": int(vocab_size)}
+    )
 
 
 def _denormalize_gripper_aux(
@@ -471,6 +510,7 @@ def _execute_chunk_closed_loop(
 @torch.no_grad()
 def evaluate_task(
     model: torch.nn.Module,
+    action_codec,
     processor,
     t5_tokenizer: T5Tokenizer | None,
     env: OffScreenRenderEnv,
@@ -538,7 +578,7 @@ def evaluate_task(
                 lang_mask,
             )
 
-            # Generate FAST action tokens
+            # Generate action tokens
             tokens, lengths = model.predict_actions(
                 z_agent,
                 z_hand,
@@ -549,10 +589,10 @@ def evaluate_task(
             )
 
             # Decode tokens → normalized → physical anchor-relative displacements
-            actions_norm = fast_decode(
+            actions_norm = action_codec.decode(
                 tokens,
                 lengths,
-                processor,
+                processor=processor,
                 time_horizon=chunk_size,
                 action_dim=action_dim,
             )
@@ -645,8 +685,20 @@ def main():
     parser.add_argument(
         "--tokenizer",
         type=str,
-        required=True,
-        help="Path to saved FAST tokenizer directory",
+        default=None,
+        help="Path to saved FAST tokenizer directory. Required for action_codec=fast.",
+    )
+    parser.add_argument(
+        "--action-codec",
+        choices=["auto", FAST_CODEC, WORLDVLA_BINS_CODEC],
+        default="auto",
+        help="Action token codec. auto reads HDF5/checkpoint metadata.",
+    )
+    parser.add_argument(
+        "--num-action-bins",
+        type=int,
+        default=256,
+        help="Scalar bin count when --action-codec=worldvla_bins.",
     )
     parser.add_argument(
         "--processed-dir",
@@ -727,6 +779,42 @@ def main():
     device = torch.device(args.device)
     np.random.seed(args.seed)
 
+    # Get task suite and infer action metadata before building weights checkpoints.
+    task_suite = benchmark.get_benchmark_dict()[args.suite]()
+    num_tasks = task_suite.n_tasks
+    if args.task_id is not None:
+        task_ids = [args.task_id]
+    else:
+        task_ids = list(range(num_tasks))
+
+    first_h5 = None
+    first_chunk_size = None
+    first_action_dim = None
+    for task_id in task_ids:
+        task = task_suite.get_task(task_id)
+        first_h5 = find_processed_h5(args.processed_dir, task.name)
+        if first_h5 is not None:
+            _low, _high, first_chunk_size, first_action_dim = load_action_stats(first_h5)
+            break
+    if args.action_codec == "auto" and first_h5 is not None:
+        action_codec = load_action_codec(first_h5, fallback={"type": FAST_CODEC})
+    else:
+        action_codec = build_action_codec(
+            {
+                "type": FAST_CODEC if args.action_codec == "auto" else args.action_codec,
+                "num_bins": args.num_action_bins,
+                "bin_min": -1.0,
+                "bin_max": 1.0,
+            }
+        )
+    if action_codec.name == WORLDVLA_BINS_CODEC:
+        if first_chunk_size is None or first_action_dim is None:
+            max_action_tokens = 20 * 7
+        else:
+            max_action_tokens = int(first_chunk_size) * int(first_action_dim)
+    else:
+        max_action_tokens = 80
+
     # Load model — two formats supported:
     #   _weights.ckpt  = Lightning state_dict (from spt.Manager)
     #   _object.ckpt   = torch.save(model) pickle (from ModelObjectCallBack)
@@ -737,25 +825,39 @@ def main():
         model = torch.load(args.checkpoint, map_location=device, weights_only=False)
     else:
         # Lightning checkpoint: build architecture then load state_dict.
-        model = build_model(device, use_language=use_language)
+        model = build_model(
+            device,
+            use_language=use_language,
+            action_vocab_size=action_codec.vocab_size,
+            max_action_tokens=max_action_tokens,
+        )
         load_checkpoint(model, args.checkpoint, device)
     model.eval()
 
-    # Load FAST tokenizer
-    print(f"Loading FAST tokenizer from {args.tokenizer}")
-    processor = load_fast_processor(args.tokenizer)
+    model_codec = infer_action_codec_from_model(model)
+    if model_codec is not None:
+        if args.action_codec == "auto":
+            action_codec = model_codec
+        elif not action_codecs_compatible(model_codec, action_codec):
+            raise ValueError(
+                f"Checkpoint action codec {model_codec.name} "
+                f"(vocab_size={model_codec.vocab_size}) does not match requested "
+                f"codec {action_codec.name} (vocab_size={action_codec.vocab_size})."
+            )
+
+    processor = None
+    if action_codec.name == FAST_CODEC:
+        if args.tokenizer is None:
+            raise ValueError("--tokenizer is required when action_codec=fast")
+        print(f"Loading FAST tokenizer from {args.tokenizer}")
+        processor = load_fast_processor(args.tokenizer)
+    print(
+        f"Using action codec: {action_codec.name} "
+        f"(vocab_size={action_codec.vocab_size})"
+    )
 
     # Load T5 tokenizer for language (skipped in no-language mode)
     t5_tokenizer = T5Tokenizer.from_pretrained("t5-small") if use_language else None
-
-    # Get task suite
-    task_suite = benchmark.get_benchmark_dict()[args.suite]()
-    num_tasks = task_suite.n_tasks
-
-    if args.task_id is not None:
-        task_ids = [args.task_id]
-    else:
-        task_ids = list(range(num_tasks))
 
     # Run evaluation
     total_successes = 0
@@ -777,6 +879,13 @@ def main():
         print(f"  Preprocessed data: {h5_path}")
 
         action_low, action_high, chunk_size, action_dim = load_action_stats(h5_path)
+        h5_codec = load_action_codec(h5_path, fallback={"type": FAST_CODEC})
+        if not action_codecs_compatible(h5_codec, action_codec):
+            raise ValueError(
+                f"{h5_path} action codec {h5_codec.name} "
+                f"(vocab_size={h5_codec.vocab_size}) does not match model/eval "
+                f"codec {action_codec.name} (vocab_size={action_codec.vocab_size})."
+            )
         language_instruction = load_language_instruction(h5_path)
         if use_language and not str(language_instruction).strip():
             raise ValueError(
@@ -804,6 +913,7 @@ def main():
         try:
             successes, n_eps = evaluate_task(
                 model,
+                action_codec,
                 processor,
                 t5_tokenizer,
                 env,

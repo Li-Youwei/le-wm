@@ -1,6 +1,6 @@
 """
 preprocess_libero.py — Convert LIBERO HDF5 demos into chunk-level samples with
-anchor-relative action chunks and FAST tokenization.
+anchor-relative action chunks and configurable action tokenization.
 
 LIBERO stores demonstration data in robomimic-style HDF5:
     data/demo_0/actions            (T, 7)         — raw OSC_POSE controller inputs
@@ -20,15 +20,17 @@ This script:
   4. Builds **9D proprio**: ee_pos(3) + xyzw quat(4) + gripper_states raw(2).
      NEVER apply mean/abs to the gripper fingers — it destroys half the info.
   5. Normalizes chunk dims to [-1, 1] using 1st/99th percentile per dim, then
-     runs the FAST tokenizer (DCT + BPE).
+     runs the configured action codec (FAST DCT+BPE or WorldVLA-style bins).
 
 Output HDF5 layout:
     image_agent        (N, H_img, W_img, 3) uint8  — agentview at chunk start (raw step t)
     image_hand         (N, H_img, W_img, 3) uint8  — eye-in-hand at chunk start
     proprio            (N, 9) float64               — ee_pos(3)+ee_quat(4)+gripper(2)
     continuous_actions (N, chunk_size, 7) float32   — anchor-relative, normalized to [-1,1]
-    fast_tokens        (N,) vlen(int32)             — FAST token IDs per chunk
-    fast_length        (N,) int32                   — token count per chunk
+    action_tokens      (N,) vlen(int32)             — action token IDs per chunk
+    action_length      (N,) int32                   — token count per chunk
+    fast_tokens        (N,) vlen(int32)             — legacy FAST copy when action_codec=fast
+    fast_length        (N,) int32                   — legacy FAST token count
     demo_idx           (N,) int32                   — source demo index
     chunk_idx          (N,) int32                   — sliding-window offset within demo (raw step)
     attrs:
@@ -63,6 +65,8 @@ from typing import Any
 import h5py
 import numpy as np
 from scipy.spatial.transform import Rotation as R
+
+from action_codec import FAST_CODEC, WORLDVLA_BINS_CODEC, build_action_codec
 
 
 # ---------------------------------------------------------------------------
@@ -379,7 +383,7 @@ def extract_chunks(
 
 
 # ---------------------------------------------------------------------------
-# Step 4: FAST tokenization
+# Step 4: Action tokenization
 # ---------------------------------------------------------------------------
 
 def _patch_saved_tokenizer(save_dir: Path, tokenizer: Any | None = None) -> None:
@@ -524,6 +528,50 @@ def tokenize_actions(
     return tokens_list, tokenizer
 
 
+def encode_action_chunks(
+    action_chunks: np.ndarray,
+    *,
+    action_codec: str = FAST_CODEC,
+    num_action_bins: int = 256,
+    fit: bool = False,
+    save_tokenizer_path: str | None = None,
+    load_tokenizer_path: str | None = None,
+) -> tuple[list[np.ndarray], Any, Any]:
+    """Encode normalized action chunks with the selected action codec."""
+    codec = build_action_codec(
+        {
+            "type": action_codec,
+            "num_bins": num_action_bins,
+            "bin_min": -1.0,
+            "bin_max": 1.0,
+        }
+    )
+    if codec.name == FAST_CODEC:
+        tokens_list, tokenizer = tokenize_actions(
+            action_chunks,
+            fit=fit,
+            save_tokenizer_path=save_tokenizer_path,
+            load_tokenizer_path=load_tokenizer_path,
+        )
+        return tokens_list, tokenizer, codec
+
+    if fit or save_tokenizer_path or load_tokenizer_path:
+        print(
+            "  WARNING: --fit-tokenizer/--save-tokenizer/--load-tokenizer are "
+            f"ignored for action_codec={codec.name}."
+        )
+    print("[Step 4] WorldVLA scalar-bin action tokenization ...")
+    print(f"  Action chunks shape: {action_chunks.shape}")
+    tokens_list = codec.encode(action_chunks)
+    lengths = [len(t) for t in tokens_list]
+    print(
+        f"  Token lengths: min={min(lengths)}, max={max(lengths)}, "
+        f"mean={np.mean(lengths):.1f}, median={np.median(lengths):.0f}, "
+        f"std={np.std(lengths):.1f}"
+    )
+    return tokens_list, None, codec
+
+
 # ---------------------------------------------------------------------------
 # Step 5: Save to output HDF5
 # ---------------------------------------------------------------------------
@@ -633,14 +681,17 @@ def save_hdf5(
     num_demos: int,
     language_instruction: str = "",
     language_source: str = "",
+    action_codec: Any | None = None,
     save_tokenizer_path: str | None = None,
     load_tokenizer_path: str | None = None,
 ) -> None:
     """Write chunk-level samples to output HDF5.
 
-    fast_tokens uses h5py variable-length dataset for ragged token arrays.
+    action_tokens uses h5py variable-length dataset for ragged token arrays.
     Images are stored with chunked layout + gzip compression.
     """
+    if action_codec is None:
+        action_codec = build_action_codec({"type": FAST_CODEC})
     N = len(tokens_list)
     print(f"[Step 5] Saving {N} samples to {output_path} ...")
 
@@ -708,15 +759,22 @@ def save_hdf5(
             dtype=np.float32,
         )
 
-        # --- FAST tokens (variable-length) ---
+        # --- Generic action tokens (variable-length) ---
         vlen_dt = h5py.vlen_dtype(np.int32)
-        ds_tokens = out.create_dataset("fast_tokens", shape=(N,), dtype=vlen_dt)
+        ds_tokens = out.create_dataset("action_tokens", shape=(N,), dtype=vlen_dt)
         for i, tok in enumerate(tokens_list):
             ds_tokens[i] = tok
 
         # --- Token lengths ---
-        fast_lengths = np.array([len(t) for t in tokens_list], dtype=np.int32)
-        out.create_dataset("fast_length", data=fast_lengths)
+        action_lengths = np.array([len(t) for t in tokens_list], dtype=np.int32)
+        out.create_dataset("action_length", data=action_lengths)
+
+        # --- Legacy FAST fields for old training/eval utilities ---
+        if action_codec.name == FAST_CODEC:
+            ds_fast = out.create_dataset("fast_tokens", shape=(N,), dtype=vlen_dt)
+            for i, tok in enumerate(tokens_list):
+                ds_fast[i] = tok
+            out.create_dataset("fast_length", data=action_lengths)
 
         # --- Demo / chunk indices ---
         out.create_dataset("demo_idx", data=np.array(samples["demo_idx"], dtype=np.int32))
@@ -734,6 +792,12 @@ def save_hdf5(
         out.attrs["action_dim"] = action_dim
         out.attrs["language_instruction"] = language_instruction
         out.attrs["language_source"] = language_source
+        codec_attrs = action_codec.hdf5_attrs()
+        out.attrs["action_codec_type"] = codec_attrs["action_codec_type"]
+        out.attrs["action_vocab_size"] = codec_attrs["action_vocab_size"]
+        out.attrs["action_num_bins"] = codec_attrs["action_num_bins"]
+        out.attrs["action_token_min"] = codec_attrs["action_token_min"]
+        out.attrs["action_token_max"] = codec_attrs["action_token_max"]
         # Store tokenizer paths separately to avoid overwrite
         if save_tokenizer_path is not None:
             out.attrs["tokenizer_save_path"] = str(Path(save_tokenizer_path).resolve())
@@ -752,6 +816,7 @@ def print_statistics(
     tokens_list: list[np.ndarray],
     action_low: np.ndarray,
     action_high: np.ndarray,
+    action_codec_name: str = FAST_CODEC,
 ) -> None:
     """Print detailed statistics about the processed dataset."""
     N = len(tokens_list)
@@ -793,7 +858,7 @@ def print_statistics(
 
     # --- Token statistics ---
     lengths = np.array([len(t) for t in tokens_list])
-    print("\n  FAST token lengths:")
+    print(f"\n  {action_codec_name} token lengths:")
     print(f"    min={lengths.min()}, max={lengths.max()}, "
           f"mean={lengths.mean():.1f}, median={np.median(lengths):.0f}, "
           f"std={lengths.std():.1f}")
@@ -821,7 +886,7 @@ def print_statistics(
 
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="Preprocess LIBERO HDF5 demos into chunk-level FAST-tokenized samples."
+        description="Preprocess LIBERO HDF5 demos into chunk-level action-tokenized samples."
     )
     parser.add_argument(
         "--input", required=True,
@@ -854,6 +919,18 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--max-action-tokens", type=int, default=None,
         help="Assert that no token sequence exceeds this length. If None, skip assertion.",
+    )
+    parser.add_argument(
+        "--action-codec",
+        choices=[FAST_CODEC, WORLDVLA_BINS_CODEC],
+        default=FAST_CODEC,
+        help="Action token codec: FAST DCT+BPE or WorldVLA-style scalar bins.",
+    )
+    parser.add_argument(
+        "--num-action-bins",
+        type=int,
+        default=256,
+        help="Number of scalar bins for --action-codec=worldvla_bins.",
     )
     parser.add_argument(
         "--fit-tokenizer", action="store_true",
@@ -911,10 +988,12 @@ def main() -> None:
         for chunk in samples["continuous_actions"]
     ]
 
-    # Step 4: FAST tokenization (on normalized anchor-relative chunks).
+    # Step 4: action tokenization (on normalized anchor-relative chunks).
     all_action_chunks = np.stack(samples["continuous_actions"], axis=0)  # (N, H, 7)
-    tokens_list, _tokenizer = tokenize_actions(
+    tokens_list, _tokenizer, action_codec = encode_action_chunks(
         all_action_chunks,
+        action_codec=args.action_codec,
+        num_action_bins=args.num_action_bins,
         fit=args.fit_tokenizer,
         save_tokenizer_path=args.save_tokenizer,
         load_tokenizer_path=args.load_tokenizer,
@@ -926,7 +1005,7 @@ def main() -> None:
     print(f"  Max observed token length: {max_observed}")
     if args.max_action_tokens is not None and max_observed > args.max_action_tokens:
         sys.exit(
-            f"ERROR: max observed FAST token length ({max_observed}) exceeds "
+            f"ERROR: max observed action token length ({max_observed}) exceeds "
             f"max_action_tokens ({args.max_action_tokens}). Increase max_action_tokens "
             f"in config and rerun."
         )
@@ -942,12 +1021,19 @@ def main() -> None:
         num_demos=len(demo_keys),
         language_instruction=language_instruction,
         language_source=language_source,
+        action_codec=action_codec,
         save_tokenizer_path=args.save_tokenizer,
         load_tokenizer_path=args.load_tokenizer,
     )
 
     # Step 6: Print statistics
-    print_statistics(samples, tokens_list, action_low, action_high)
+    print_statistics(
+        samples,
+        tokens_list,
+        action_low,
+        action_high,
+        action_codec_name=action_codec.name,
+    )
 
     print("Done!")
 

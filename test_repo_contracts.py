@@ -17,6 +17,10 @@ class RepositoryContractsTest(unittest.TestCase):
     def test_libero_config_declares_chunk_size(self) -> None:
         config_text = (ROOT / "config/train/data/libero.yaml").read_text()
         self.assertIn("chunk_size:", config_text)
+        self.assertIn("action_dim:", config_text)
+        self.assertIn("action_codec:", config_text)
+        self.assertIn("type: fast", config_text)
+        self.assertIn("num_bins: 256", config_text)
 
     def test_pretrained_vision_runner_forwards_warmup_steps_to_hydra(self) -> None:
         script_text = (ROOT / "run_all4_pretrained_vision.sh").read_text()
@@ -58,6 +62,28 @@ class RepositoryContractsTest(unittest.TestCase):
         source = (ROOT / "fast_utils.py").read_text()
         self.assertIn("zero_range = half_range < 1e-8", source)
         self.assertIn("np.where(zero_range, mid, restored)", source)
+
+    def test_preprocess_writes_generic_action_token_contract(self) -> None:
+        source = (ROOT / "preprocess_libero.py").read_text()
+        self.assertIn('"action_tokens"', source)
+        self.assertIn('"action_length"', source)
+        self.assertIn('"action_codec_type"', source)
+        self.assertIn('"action_vocab_size"', source)
+        self.assertIn('"action_token_min"', source)
+        self.assertIn('"action_token_max"', source)
+
+    def test_dataset_falls_back_to_legacy_fast_token_fields(self) -> None:
+        source = (ROOT / "libero_dataset.py").read_text()
+        self.assertIn('"action_tokens"', source)
+        self.assertIn('"action_length"', source)
+        self.assertIn('"fast_tokens"', source)
+        self.assertIn('"fast_length"', source)
+
+    def test_preprocess_runner_validates_codec_before_skipping_existing_outputs(self) -> None:
+        source = (ROOT / "preprocess_all4.sh").read_text()
+        self.assertIn("check_existing_codec", source)
+        self.assertIn("action_codec_type", source)
+        self.assertIn("ACTION_CODEC", source)
 
     def test_training_seed_is_used_globally(self) -> None:
         source = (ROOT / "train.py").read_text()
